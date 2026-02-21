@@ -154,6 +154,7 @@ impl<H: CefHost + 'static> AppRuntime<H> {
             } | Intent::ActivateTab { .. }
                 | Intent::SwitchWorkspace { .. }
                 | Intent::SwitchProfile { .. }
+                | Intent::DeleteWorkspace { .. }
         );
         let navigation = match &intent {
             Intent::Navigate { tab_id, url } => {
@@ -169,7 +170,7 @@ impl<H: CefHost + 'static> AppRuntime<H> {
 
         if let Some((tab_id, url)) = navigation {
             self.ensure_single_content_view(tab_id, &url)?;
-        } else if should_sync_active_content {
+        } else if should_sync_active_content && !patch.ops.is_empty() {
             if let Some((tab_id, url)) = self.resolve_active_tab_target() {
                 self.ensure_single_content_view(tab_id, &url)?;
             }
@@ -604,5 +605,51 @@ mod tests {
             .filter(|event| matches!(event, HostEvent::ContentNavigated { .. }))
             .count();
         assert_eq!(content_navigate_count, 2);
+    }
+
+    #[test]
+    fn activate_active_tab_is_noop_for_content_view() {
+        let host = MockCefHost::default();
+        let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
+        let workspace_id = runtime.default_workspace_id();
+
+        runtime
+            .handle_ui_command(UiCommand::NewTab {
+                workspace_id: workspace_id.0,
+                url: Some("https://one.example".to_owned()),
+                make_active: true,
+            })
+            .expect("tab should be created");
+        let active_tab_id = runtime
+            .active_tab_id(workspace_id)
+            .expect("tab should be active");
+        let revision_before = runtime.revision();
+
+        let patch = runtime
+            .handle_ui_command(UiCommand::ActivateTab {
+                tab_id: active_tab_id.0,
+            })
+            .expect("activate active tab should succeed");
+
+        assert!(
+            patch.ops.is_empty(),
+            "activate on already-active tab should no-op"
+        );
+        assert_eq!(runtime.revision(), revision_before);
+
+        let content_create_count = runtime
+            .host()
+            .events()
+            .iter()
+            .filter(|event| matches!(event, HostEvent::ContentViewCreated { .. }))
+            .count();
+        let content_navigate_count = runtime
+            .host()
+            .events()
+            .iter()
+            .filter(|event| matches!(event, HostEvent::ContentNavigated { .. }))
+            .count();
+        assert_eq!(content_create_count, 1);
+        assert_eq!(content_navigate_count, 0);
     }
 }

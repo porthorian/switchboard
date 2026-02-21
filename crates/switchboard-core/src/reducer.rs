@@ -8,6 +8,7 @@ pub enum ReduceError {
     ProfileNotFound(ProfileId),
     WorkspaceNotFound(WorkspaceId),
     TabNotFound(TabId),
+    CannotDeleteLastWorkspace(WorkspaceId),
     CrossProfileMove {
         tab_id: TabId,
         from_profile: ProfileId,
@@ -71,6 +72,70 @@ pub fn apply_intent(state: &mut BrowserState, intent: Intent) -> Result<Vec<Patc
                 .ok_or(ReduceError::WorkspaceNotFound(workspace_id))?;
             workspace.name = name;
             ops.push(PatchOp::UpsertWorkspace(workspace.clone()));
+        }
+        Intent::DeleteWorkspace { workspace_id } => {
+            let workspace = state
+                .workspaces
+                .get(&workspace_id)
+                .cloned()
+                .ok_or(ReduceError::WorkspaceNotFound(workspace_id))?;
+            let profile_id = workspace.profile_id;
+
+            let can_delete = state
+                .profiles
+                .get(&profile_id)
+                .ok_or(ReduceError::ProfileNotFound(profile_id))?
+                .workspace_order
+                .len()
+                > 1;
+            if !can_delete {
+                return Err(ReduceError::CannotDeleteLastWorkspace(workspace_id));
+            }
+
+            let (profile_snapshot, next_workspace_id, active_workspace_changed) = {
+                let profile = state
+                    .profiles
+                    .get_mut(&profile_id)
+                    .ok_or(ReduceError::ProfileNotFound(profile_id))?;
+                profile.workspace_order.retain(|id| *id != workspace_id);
+                let active_workspace_changed = profile.active_workspace_id == Some(workspace_id);
+                if active_workspace_changed {
+                    profile.active_workspace_id = profile.workspace_order.first().copied();
+                }
+                (
+                    profile.clone(),
+                    profile.active_workspace_id,
+                    active_workspace_changed,
+                )
+            };
+
+            for tab_id in workspace.tab_order {
+                if state.tabs.remove(&tab_id).is_some() {
+                    ops.push(PatchOp::RemoveTab {
+                        tab_id,
+                        workspace_id,
+                    });
+                }
+            }
+            state.workspaces.remove(&workspace_id);
+
+            ops.push(PatchOp::RemoveWorkspace {
+                workspace_id,
+                profile_id,
+            });
+            ops.push(PatchOp::UpsertProfile(profile_snapshot));
+
+            if active_workspace_changed {
+                if let Some(next_workspace_id) = next_workspace_id {
+                    ops.push(PatchOp::SetActiveWorkspace {
+                        profile_id,
+                        workspace_id: next_workspace_id,
+                    });
+                }
+                if state.active_profile_id == Some(profile_id) {
+                    ops.push(PatchOp::SetActiveProfile { profile_id });
+                }
+            }
         }
         Intent::SwitchWorkspace { workspace_id } => {
             let profile_id = state
@@ -189,13 +254,33 @@ pub fn apply_intent(state: &mut BrowserState, intent: Intent) -> Result<Vec<Patc
             ops.push(PatchOp::UpsertTab(tab.clone()));
         }
         Intent::ActivateTab { tab_id } => {
-            let (workspace_id, profile_id) = {
+            let (workspace_id, profile_id, runtime_state) = {
                 let tab = state
                     .tabs
                     .get(&tab_id)
                     .ok_or(ReduceError::TabNotFound(tab_id))?;
-                (tab.workspace_id, tab.profile_id)
+                (tab.workspace_id, tab.profile_id, tab.runtime_state)
             };
+            let workspace_active = state
+                .workspaces
+                .get(&workspace_id)
+                .ok_or(ReduceError::WorkspaceNotFound(workspace_id))?
+                .active_tab_id
+                == Some(tab_id);
+            let profile_active_workspace = state
+                .profiles
+                .get(&profile_id)
+                .ok_or(ReduceError::ProfileNotFound(profile_id))?
+                .active_workspace_id
+                == Some(workspace_id);
+            let profile_active = state.active_profile_id == Some(profile_id);
+            if workspace_active
+                && profile_active_workspace
+                && profile_active
+                && runtime_state == TabRuntimeState::Active
+            {
+                return Ok(ops);
+            }
 
             let previous_active = state
                 .workspaces

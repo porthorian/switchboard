@@ -208,4 +208,123 @@ mod tests {
             Err(EngineError::Reduce(crate::reducer::ReduceError::CannotDiscardActiveTab(id))) if id == active_tab_id
         ));
     }
+
+    #[test]
+    fn activate_already_active_tab_is_noop() {
+        let (mut engine, workspace_id) = seeded_engine();
+        engine
+            .dispatch(Intent::NewTab {
+                workspace_id,
+                url: Some("https://example.com".to_owned()),
+                make_active: true,
+            })
+            .expect("tab should be created");
+        let active_tab_id = first_tab_id(&engine, workspace_id);
+        let revision_before = engine.revision();
+
+        let patch = engine
+            .dispatch(Intent::ActivateTab {
+                tab_id: active_tab_id,
+            })
+            .expect("activate active tab should succeed");
+
+        assert!(patch.ops.is_empty(), "activate on already-active tab should no-op");
+        assert_eq!(patch.from_revision, revision_before);
+        assert_eq!(patch.to_revision, revision_before);
+        assert_eq!(engine.revision(), revision_before);
+    }
+
+    #[test]
+    fn cannot_delete_last_workspace() {
+        let (mut engine, workspace_id) = seeded_engine();
+
+        let result = engine.dispatch(Intent::DeleteWorkspace { workspace_id });
+
+        assert!(matches!(
+            result,
+            Err(EngineError::Reduce(
+                crate::reducer::ReduceError::CannotDeleteLastWorkspace(id)
+            )) if id == workspace_id
+        ));
+    }
+
+    #[test]
+    fn delete_active_workspace_promotes_remaining_workspace() {
+        let (mut engine, first_workspace_id) = seeded_engine();
+        let profile_id = engine
+            .state()
+            .active_profile_id
+            .expect("profile should exist");
+
+        engine
+            .dispatch(Intent::NewWorkspace {
+                profile_id,
+                name: "Secondary".to_owned(),
+            })
+            .expect("workspace should be created");
+        let second_workspace_id = engine
+            .state()
+            .profiles
+            .get(&profile_id)
+            .expect("profile should exist")
+            .workspace_order
+            .iter()
+            .copied()
+            .find(|id| *id != first_workspace_id)
+            .expect("second workspace should exist");
+
+        engine
+            .dispatch(Intent::SwitchWorkspace {
+                workspace_id: second_workspace_id,
+            })
+            .expect("switch workspace should succeed");
+        engine
+            .dispatch(Intent::NewTab {
+                workspace_id: second_workspace_id,
+                url: Some("https://two.example".to_owned()),
+                make_active: true,
+            })
+            .expect("tab should be created");
+
+        let removed_tab_ids = engine
+            .state()
+            .workspaces
+            .get(&second_workspace_id)
+            .expect("second workspace should exist")
+            .tab_order
+            .clone();
+
+        let patch = engine
+            .dispatch(Intent::DeleteWorkspace {
+                workspace_id: second_workspace_id,
+            })
+            .expect("delete workspace should succeed");
+
+        assert!(
+            engine.state().workspaces.get(&second_workspace_id).is_none(),
+            "deleted workspace must be removed"
+        );
+        assert_eq!(
+            engine
+                .state()
+                .profiles
+                .get(&profile_id)
+                .expect("profile should exist")
+                .active_workspace_id,
+            Some(first_workspace_id)
+        );
+        for tab_id in &removed_tab_ids {
+            assert!(
+                engine.state().tabs.get(tab_id).is_none(),
+                "tab from deleted workspace must be removed"
+            );
+        }
+        assert!(patch.ops.iter().any(|op| matches!(
+            op,
+            PatchOp::RemoveWorkspace {
+                workspace_id,
+                profile_id: op_profile_id,
+            } if *workspace_id == second_workspace_id && *op_profile_id == profile_id
+        )));
+    }
 }

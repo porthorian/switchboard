@@ -735,6 +735,35 @@ fn parse_ui_prompt_payload(payload: &str) -> Result<UiPromptAction, &'static str
             name: "New Workspace".to_owned(),
         }));
     }
+    if let Some(rest) = trimmed.strip_prefix("rename_workspace ") {
+        let mut parts = rest.trim().splitn(2, ' ');
+        let workspace_id = parts
+            .next()
+            .ok_or("rename_workspace requires workspace id")?
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "rename_workspace requires a numeric workspace id")?;
+        let name = parts
+            .next()
+            .ok_or("rename_workspace requires a name")?
+            .trim();
+        if name.is_empty() {
+            return Err("workspace name cannot be empty");
+        }
+        return Ok(UiPromptAction::Intent(UiCommand::RenameWorkspace {
+            workspace_id,
+            name: name.to_owned(),
+        }));
+    }
+    if let Some(value) = trimmed.strip_prefix("delete_workspace ") {
+        let workspace_id = value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "delete_workspace requires a numeric workspace id")?;
+        return Ok(UiPromptAction::Intent(UiCommand::DeleteWorkspace {
+            workspace_id,
+        }));
+    }
     if let Some(value) = trimmed.strip_prefix("switch_workspace ") {
         let workspace_id = value
             .trim()

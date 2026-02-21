@@ -23,6 +23,10 @@ pub enum PatchOp {
         tab_id: TabId,
         workspace_id: WorkspaceId,
     },
+    RemoveWorkspace {
+        workspace_id: WorkspaceId,
+        profile_id: ProfileId,
+    },
     SetActiveProfile {
         profile_id: ProfileId,
     },

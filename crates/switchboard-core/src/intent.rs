@@ -37,6 +37,9 @@ pub enum Intent {
         workspace_id: WorkspaceId,
         name: String,
     },
+    DeleteWorkspace {
+        workspace_id: WorkspaceId,
+    },
     SwitchWorkspace {
         workspace_id: WorkspaceId,
     },

@@ -20,6 +20,13 @@ pub enum UiCommand {
     NewWorkspace {
         name: String,
     },
+    RenameWorkspace {
+        workspace_id: u64,
+        name: String,
+    },
+    DeleteWorkspace {
+        workspace_id: u64,
+    },
     SwitchWorkspace {
         workspace_id: u64,
     },
@@ -55,6 +62,13 @@ impl UiCommand {
                     "NewWorkspace requires runtime profile resolution before intent dispatch"
                 )
             }
+            Self::RenameWorkspace { workspace_id, name } => Intent::RenameWorkspace {
+                workspace_id: WorkspaceId(workspace_id),
+                name,
+            },
+            Self::DeleteWorkspace { workspace_id } => Intent::DeleteWorkspace {
+                workspace_id: WorkspaceId(workspace_id),
+            },
             Self::SwitchWorkspace { workspace_id } => Intent::SwitchWorkspace {
                 workspace_id: WorkspaceId(workspace_id),
             },

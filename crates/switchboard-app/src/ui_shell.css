@@ -139,6 +139,8 @@ body {
   height: 38px;
   display: flex;
   align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   padding: 0 12px;
   border-bottom: 1px solid #2c3343;
 }
@@ -146,6 +148,30 @@ body {
   font-size: 13px;
   font-weight: 700;
   color: #eef3ff;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.workspace-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.workspace-action {
+  height: 24px;
+  border: 1px solid #424b60;
+  border-radius: 7px;
+  background: #1b2232;
+  color: #b9c8e3;
+  font-size: 11px;
+  padding: 0 8px;
+  cursor: pointer;
+}
+.workspace-action.danger {
+  color: #f3c1c1;
+  border-color: #654145;
+  background: #2e1f22;
 }
 .tab-list {
   flex: 1;
@@ -228,7 +254,8 @@ body {
   cursor: pointer;
 }
 .tab-new:disabled,
-.workspace-new:disabled {
+.workspace-new:disabled,
+.workspace-action:disabled {
   opacity: 0.5;
   cursor: default;
 }

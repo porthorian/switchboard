@@ -7,6 +7,8 @@ const forwardButton = document.getElementById("nav-forward");
 const workspaceList = document.getElementById("workspace-list");
 const workspaceNew = document.getElementById("workspace-new");
 const workspaceTitle = document.getElementById("workspace-title");
+const workspaceRename = document.getElementById("workspace-rename");
+const workspaceDelete = document.getElementById("workspace-delete");
 const tabList = document.getElementById("tab-list");
 const tabNew = document.getElementById("tab-new");
 
@@ -215,6 +217,8 @@ function renderShellState(state) {
   renderWorkspaceRail(orderedWorkspaces, activeWorkspaceId);
   renderTabList(orderedTabs, activeTabId);
   tabNew.disabled = !activeWorkspaceId;
+  workspaceRename.disabled = !activeWorkspaceId;
+  workspaceDelete.disabled = !activeWorkspaceId || orderedWorkspaces.length <= 1;
 
   if (activeTab && activeTab.url && document.activeElement !== input) {
     setActiveUri(normalizeUrl(activeTab.url), false);
@@ -251,6 +255,34 @@ function createWorkspace() {
   queueStateRefresh();
 }
 
+function renameActiveWorkspace() {
+  if (!shellState) return;
+  const { activeWorkspace } = deriveActiveContext(shellState);
+  if (!activeWorkspace) return;
+  const nextName = window.prompt("Rename workspace", activeWorkspace.name || "");
+  if (nextName === null) return;
+  const trimmed = nextName.trim();
+  if (!trimmed || trimmed === activeWorkspace.name) return;
+  send(`rename_workspace ${activeWorkspace.id} ${trimmed}`);
+  queueStateRefresh();
+}
+
+function deleteActiveWorkspace() {
+  if (!shellState) return;
+  const { activeWorkspace, orderedWorkspaces } = deriveActiveContext(shellState);
+  if (!activeWorkspace) return;
+  if (orderedWorkspaces.length <= 1) {
+    window.alert("At least one workspace must remain.");
+    return;
+  }
+  const confirmed = window.confirm(
+    `Delete workspace "${activeWorkspace.name}" and all of its tabs?`
+  );
+  if (!confirmed) return;
+  send(`delete_workspace ${activeWorkspace.id}`);
+  queueStateRefresh();
+}
+
 function createTabInActiveWorkspace() {
   if (!shellState) return;
   const { activeWorkspace } = deriveActiveContext(shellState);
@@ -271,6 +303,7 @@ function handleWorkspaceClick(event) {
 function handleTabClick(event) {
   const target = event.target.closest(".tab-item");
   if (!target) return;
+  if (target.classList.contains("active")) return;
   const tabId = target.dataset.tabId;
   if (!tabId) return;
   const tabUrl = normalizeUrl(target.dataset.tabUrl || "");
@@ -299,6 +332,8 @@ input.addEventListener("keydown", (event) => {
 backButton.addEventListener("click", goBack);
 forwardButton.addEventListener("click", goForward);
 workspaceNew.addEventListener("click", createWorkspace);
+workspaceRename.addEventListener("click", renameActiveWorkspace);
+workspaceDelete.addEventListener("click", deleteActiveWorkspace);
 workspaceList.addEventListener("click", handleWorkspaceClick);
 tabList.addEventListener("click", handleTabClick);
 tabNew.addEventListener("click", createTabInActiveWorkspace);
