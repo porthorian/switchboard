@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target/
+
+# macOS
+.DS_Store
+
+# Editor/IDE state
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local runtime/debug outputs
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
