@@ -12,8 +12,11 @@ pub type cef_errorcode_t = c_int;
 pub type cef_jsdialog_type_t = c_uint;
 pub type cef_scheme_options_t = c_uint;
 pub type cef_string_userfree_t = *mut cef_string_t;
+pub type cef_string_list_t = *mut c_void;
 pub type cef_string_multimap_t = *mut c_void;
 pub type cef_window_handle_t = *mut c_void;
+pub type cef_cursor_handle_t = *mut c_void;
+pub type cef_cursor_type_t = c_uint;
 
 pub const CEF_RUNTIME_STYLE_DEFAULT: cef_runtime_style_t = 0;
 pub const CEF_RUNTIME_STYLE_CHROME: cef_runtime_style_t = 1;
@@ -45,6 +48,13 @@ pub type cef_string_t = cef_string_utf16_t;
 pub struct cef_rect_t {
     pub x: c_int,
     pub y: c_int,
+    pub width: c_int,
+    pub height: c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct cef_size_t {
     pub width: c_int,
     pub height: c_int,
 }
@@ -103,8 +113,111 @@ pub struct cef_dialog_handler_t {
 }
 
 #[repr(C)]
-pub struct cef_display_handler_t {
+pub struct cef_cursor_info_t {
     pub _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct cef_display_handler_t {
+    pub base: cef_base_ref_counted_t,
+    pub on_address_change: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_display_handler_t,
+            browser: *mut cef_browser_t,
+            frame: *mut cef_frame_t,
+            url: *const cef_string_t,
+        ),
+    >,
+    pub on_title_change: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_display_handler_t,
+            browser: *mut cef_browser_t,
+            title: *const cef_string_t,
+        ),
+    >,
+    pub on_favicon_urlchange: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_display_handler_t,
+            browser: *mut cef_browser_t,
+            icon_urls: cef_string_list_t,
+        ),
+    >,
+    pub on_fullscreen_mode_change: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_display_handler_t,
+            browser: *mut cef_browser_t,
+            fullscreen: c_int,
+        ),
+    >,
+    pub on_tooltip: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_display_handler_t,
+            browser: *mut cef_browser_t,
+            text: *mut cef_string_t,
+        ) -> c_int,
+    >,
+    pub on_status_message: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_display_handler_t,
+            browser: *mut cef_browser_t,
+            value: *const cef_string_t,
+        ),
+    >,
+    pub on_console_message: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_display_handler_t,
+            browser: *mut cef_browser_t,
+            level: cef_log_severity_t,
+            message: *const cef_string_t,
+            source: *const cef_string_t,
+            line: c_int,
+        ) -> c_int,
+    >,
+    pub on_auto_resize: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_display_handler_t,
+            browser: *mut cef_browser_t,
+            new_size: *const cef_size_t,
+        ) -> c_int,
+    >,
+    pub on_loading_progress_change: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_display_handler_t,
+            browser: *mut cef_browser_t,
+            progress: f64,
+        ),
+    >,
+    pub on_cursor_change: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_display_handler_t,
+            browser: *mut cef_browser_t,
+            cursor: cef_cursor_handle_t,
+            type_: cef_cursor_type_t,
+            custom_cursor_info: *const cef_cursor_info_t,
+        ) -> c_int,
+    >,
+    pub on_media_access_change: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_display_handler_t,
+            browser: *mut cef_browser_t,
+            has_video_access: c_int,
+            has_audio_access: c_int,
+        ),
+    >,
+    pub on_contents_bounds_change: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_display_handler_t,
+            browser: *mut cef_browser_t,
+            new_bounds: *const cef_rect_t,
+        ) -> c_int,
+    >,
+    pub get_root_window_screen_rect: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_display_handler_t,
+            browser: *mut cef_browser_t,
+            rect: *mut cef_rect_t,
+        ) -> c_int,
+    >,
 }
 
 #[repr(C)]
@@ -212,13 +325,82 @@ pub struct cef_request_handler_t {
 }
 
 #[repr(C)]
-pub struct cef_browser_t {
+pub struct cef_browser_host_t {
     pub _private: [u8; 0],
 }
 
 #[repr(C)]
+pub struct cef_browser_t {
+    pub base: cef_base_ref_counted_t,
+    pub is_valid: Option<unsafe extern "C" fn(self_: *mut cef_browser_t) -> c_int>,
+    pub get_host:
+        Option<unsafe extern "C" fn(self_: *mut cef_browser_t) -> *mut cef_browser_host_t>,
+    pub can_go_back: Option<unsafe extern "C" fn(self_: *mut cef_browser_t) -> c_int>,
+    pub go_back: Option<unsafe extern "C" fn(self_: *mut cef_browser_t)>,
+    pub can_go_forward: Option<unsafe extern "C" fn(self_: *mut cef_browser_t) -> c_int>,
+    pub go_forward: Option<unsafe extern "C" fn(self_: *mut cef_browser_t)>,
+    pub is_loading: Option<unsafe extern "C" fn(self_: *mut cef_browser_t) -> c_int>,
+    pub reload: Option<unsafe extern "C" fn(self_: *mut cef_browser_t)>,
+    pub reload_ignore_cache: Option<unsafe extern "C" fn(self_: *mut cef_browser_t)>,
+    pub stop_load: Option<unsafe extern "C" fn(self_: *mut cef_browser_t)>,
+    pub get_identifier: Option<unsafe extern "C" fn(self_: *mut cef_browser_t) -> c_int>,
+    pub is_same:
+        Option<unsafe extern "C" fn(self_: *mut cef_browser_t, that: *mut cef_browser_t) -> c_int>,
+    pub is_popup: Option<unsafe extern "C" fn(self_: *mut cef_browser_t) -> c_int>,
+    pub has_document: Option<unsafe extern "C" fn(self_: *mut cef_browser_t) -> c_int>,
+    pub get_main_frame: Option<unsafe extern "C" fn(self_: *mut cef_browser_t) -> *mut cef_frame_t>,
+    pub get_focused_frame:
+        Option<unsafe extern "C" fn(self_: *mut cef_browser_t) -> *mut cef_frame_t>,
+    pub get_frame_by_identifier: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_browser_t,
+            identifier: *const cef_string_t,
+        ) -> *mut cef_frame_t,
+    >,
+    pub get_frame_by_name: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_browser_t,
+            name: *const cef_string_t,
+        ) -> *mut cef_frame_t,
+    >,
+    pub get_frame_count: Option<unsafe extern "C" fn(self_: *mut cef_browser_t) -> usize>,
+    pub get_frame_identifiers:
+        Option<unsafe extern "C" fn(self_: *mut cef_browser_t, identifiers: cef_string_list_t)>,
+    pub get_frame_names:
+        Option<unsafe extern "C" fn(self_: *mut cef_browser_t, names: cef_string_list_t)>,
+}
+
+#[repr(C)]
 pub struct cef_frame_t {
-    pub _private: [u8; 0],
+    pub base: cef_base_ref_counted_t,
+    pub is_valid: Option<unsafe extern "C" fn(self_: *mut cef_frame_t) -> c_int>,
+    pub undo: Option<unsafe extern "C" fn(self_: *mut cef_frame_t)>,
+    pub redo: Option<unsafe extern "C" fn(self_: *mut cef_frame_t)>,
+    pub cut: Option<unsafe extern "C" fn(self_: *mut cef_frame_t)>,
+    pub copy: Option<unsafe extern "C" fn(self_: *mut cef_frame_t)>,
+    pub paste: Option<unsafe extern "C" fn(self_: *mut cef_frame_t)>,
+    pub paste_and_match_style: Option<unsafe extern "C" fn(self_: *mut cef_frame_t)>,
+    pub del: Option<unsafe extern "C" fn(self_: *mut cef_frame_t)>,
+    pub select_all: Option<unsafe extern "C" fn(self_: *mut cef_frame_t)>,
+    pub view_source: Option<unsafe extern "C" fn(self_: *mut cef_frame_t)>,
+    pub get_source: Option<
+        unsafe extern "C" fn(self_: *mut cef_frame_t, visitor: *mut c_void),
+    >,
+    pub get_text: Option<unsafe extern "C" fn(self_: *mut cef_frame_t, visitor: *mut c_void)>,
+    pub load_request:
+        Option<unsafe extern "C" fn(self_: *mut cef_frame_t, request: *mut cef_request_t)>,
+    pub load_url:
+        Option<unsafe extern "C" fn(self_: *mut cef_frame_t, url: *const cef_string_t)>,
+    pub execute_java_script: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_frame_t,
+            code: *const cef_string_t,
+            script_url: *const cef_string_t,
+            start_line: c_int,
+        ),
+    >,
+    pub is_main: Option<unsafe extern "C" fn(self_: *mut cef_frame_t) -> c_int>,
+    pub is_focused: Option<unsafe extern "C" fn(self_: *mut cef_frame_t) -> c_int>,
 }
 
 #[repr(C)]
