@@ -6,8 +6,13 @@ version = 4
 name = "switchboard-app"
 version = "0.1.0"
 dependencies = [
+ "switchboard-cef-sys",
  "switchboard-core",
 ]
+
+[[package]]
+name = "switchboard-cef-sys"
+version = "0.1.0"
 
 [[package]]
 name = "switchboard-core"

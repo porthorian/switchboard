@@ -1,34 +1,70 @@
-use switchboard_core::{BrowserState, Engine, Intent, NoopPersistence};
+mod bridge;
+mod host;
+mod runtime;
+
+use bridge::UiCommand;
+use host::DefaultHost;
+#[cfg(target_os = "macos")]
+use host::NativeMacHost;
+use runtime::AppRuntime;
 
 fn main() {
-    let mut state = BrowserState::default();
-    let profile_id = state.add_profile("Default");
-    let workspace_id = state
-        .add_workspace(profile_id, "Workspace 1")
-        .expect("default profile must exist");
+    if let Err(message) = run() {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
+}
 
-    let mut engine = Engine::with_state(NoopPersistence, state, 0);
+fn run() -> Result<(), String> {
+    let host = build_host()?;
+    let mut runtime = AppRuntime::bootstrap(host, "0.1.0-dev")
+        .map_err(|error| format!("switchboard-app: bootstrap failed\n  {error}"))?;
+    let workspace_id = runtime.default_workspace_id();
 
-    let _ = engine
-        .dispatch(Intent::UiReady {
-            ui_version: "0.1.0-dev".to_owned(),
-        })
-        .expect("ui ready intent should succeed");
-
-    let patch = engine
-        .dispatch(Intent::NewTab {
-            workspace_id,
-            url: Some("https://example.com".to_owned()),
+    runtime
+        .handle_ui_command(UiCommand::NewTab {
+            workspace_id: workspace_id.0,
+            url: None,
             make_active: true,
         })
-        .expect("initial tab creation should succeed");
+        .map_err(|error| format!("switchboard-app: failed to create initial tab\n  {error}"))?;
+
+    let tab_id = runtime
+        .active_tab_id(workspace_id)
+        .ok_or_else(|| "switchboard-app: created tab was not active".to_owned())?;
+
+    let patch = runtime
+        .handle_ui_command(UiCommand::Navigate {
+            tab_id: tab_id.0,
+            url: "https://youtube.com".to_owned(),
+        })
+        .map_err(|error| format!("switchboard-app: initial navigation failed\n  {error}"))?;
 
     println!(
-        "bootstrapped revision={} profiles={} workspaces={} tabs={} patch_ops={}",
-        engine.revision(),
-        engine.state().profiles.len(),
-        engine.state().workspaces.len(),
-        engine.state().tabs.len(),
+        "milestone1 revision={} ui_view_id={} profiles={} workspaces={} tabs={} patch_ops={}",
+        runtime.revision(),
+        runtime.ui_view_id().0,
+        runtime.engine().state().profiles.len(),
+        runtime.engine().state().workspaces.len(),
+        runtime.engine().state().tabs.len(),
         patch.ops.len()
     );
+
+    runtime
+        .run()
+        .map_err(|error| format!("switchboard-app: event loop failed\n  {error}"))?;
+    Ok(())
+}
+
+fn build_host() -> Result<DefaultHost, String> {
+    #[cfg(target_os = "macos")]
+    {
+        NativeMacHost::new()
+            .map_err(|error| format!("switchboard-app: host initialization failed\n  {error}"))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(DefaultHost::default())
+    }
 }

@@ -2,6 +2,7 @@
 members = [
   "crates/switchboard-core",
   "crates/switchboard-app",
+  "crates/switchboard-cef-sys",
 ]
 resolver = "2"
 

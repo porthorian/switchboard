@@ -7,3 +7,4 @@ authors.workspace = true
 
 [dependencies]
 switchboard-core = { path = "../switchboard-core" }
+switchboard-cef-sys = { path = "../switchboard-cef-sys" }
