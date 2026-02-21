@@ -7,7 +7,7 @@ use switchboard_core::{
 };
 
 use crate::bridge::UiCommand;
-use crate::host::{CefHost, ContentViewId, UiViewId, WindowId};
+use crate::host::{install_ui_command_handler, CefHost, ContentViewId, UiViewId, WindowId};
 
 const UI_SHELL_URL: &str = "app://ui";
 
@@ -15,6 +15,7 @@ const UI_SHELL_URL: &str = "app://ui";
 pub enum RuntimeError<HError> {
     Host(HError),
     Engine(EngineError<Infallible>),
+    NoActiveTab,
     WorkspaceNotFound(WorkspaceId),
     TabNotFound(TabId),
     BlockedContentNavigation(String),
@@ -35,7 +36,7 @@ pub struct AppRuntime<H: CefHost> {
     content_binding: Option<ContentBinding>,
 }
 
-impl<H: CefHost> AppRuntime<H> {
+impl<H: CefHost + 'static> AppRuntime<H> {
     pub fn bootstrap(mut host: H, ui_version: &str) -> Result<Self, RuntimeError<H::Error>> {
         let mut state = BrowserState::default();
         let profile_id = state.add_profile("Default");
@@ -90,15 +91,35 @@ impl<H: CefHost> AppRuntime<H> {
         &self.host
     }
 
-    pub fn run(self) -> Result<(), RuntimeError<H::Error>> {
-        self.host.run_event_loop().map_err(RuntimeError::Host)
+    pub fn run(mut self) -> Result<(), RuntimeError<H::Error>>
+    where
+        H::Error: Display,
+    {
+        let runtime_ptr: *mut Self = &mut self;
+        install_ui_command_handler(Some(Box::new(move |command| unsafe {
+            if let Err(error) = (*runtime_ptr).handle_ui_command(command) {
+                eprintln!("switchboard-app: UI command failed: {error}");
+            }
+        })));
+
+        let result = self.host.run_event_loop().map_err(RuntimeError::Host);
+        install_ui_command_handler(None);
+        result
     }
 
     pub fn handle_ui_command(
         &mut self,
         command: UiCommand,
     ) -> Result<Patch, RuntimeError<H::Error>> {
-        self.handle_intent(command.into_intent())
+        match command {
+            UiCommand::NavigateActive { url } => {
+                let tab_id = self
+                    .resolve_active_tab_id()
+                    .ok_or(RuntimeError::NoActiveTab)?;
+                self.handle_intent(Intent::Navigate { tab_id, url })
+            }
+            other => self.handle_intent(other.into_intent()),
+        }
     }
 
     pub fn handle_intent(&mut self, intent: Intent) -> Result<Patch, RuntimeError<H::Error>> {
@@ -127,6 +148,13 @@ impl<H: CefHost> AppRuntime<H> {
             .workspaces
             .get(&workspace_id)
             .and_then(|workspace| workspace.active_tab_id)
+    }
+
+    fn resolve_active_tab_id(&self) -> Option<TabId> {
+        let state = self.engine.state();
+        let profile_id = state.active_profile_id?;
+        let workspace_id = state.profiles.get(&profile_id)?.active_workspace_id?;
+        state.workspaces.get(&workspace_id)?.active_tab_id
     }
 
     fn ensure_single_content_view(
@@ -171,6 +199,7 @@ impl<HError: Display> Display for RuntimeError<HError> {
         match self {
             Self::Host(err) => write!(f, "host error: {err}"),
             Self::Engine(err) => write!(f, "engine error: {err:?}"),
+            Self::NoActiveTab => write!(f, "no active tab available for UI navigation"),
             Self::WorkspaceNotFound(workspace_id) => {
                 write!(f, "workspace not found: {workspace_id}")
             }
@@ -282,5 +311,35 @@ mod tests {
             result,
             Err(RuntimeError::BlockedContentNavigation(url)) if url == "app://ui/settings"
         ));
+    }
+
+    #[test]
+    fn navigate_active_targets_current_active_tab() {
+        let host = MockCefHost::default();
+        let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
+        let workspace_id = runtime.default_workspace_id();
+
+        runtime
+            .handle_ui_command(UiCommand::NewTab {
+                workspace_id: workspace_id.0,
+                url: None,
+                make_active: true,
+            })
+            .expect("new tab should succeed");
+
+        runtime
+            .handle_ui_command(UiCommand::NavigateActive {
+                url: "https://example.com".to_owned(),
+            })
+            .expect("navigate active should succeed");
+
+        let content_create_count = runtime
+            .host()
+            .events()
+            .iter()
+            .filter(|event| matches!(event, HostEvent::ContentViewCreated { .. }))
+            .count();
+
+        assert_eq!(content_create_count, 1);
     }
 }

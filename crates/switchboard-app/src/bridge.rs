@@ -14,6 +14,9 @@ pub enum UiCommand {
         tab_id: u64,
         url: String,
     },
+    NavigateActive {
+        url: String,
+    },
 }
 
 impl UiCommand {
@@ -33,6 +36,11 @@ impl UiCommand {
                 tab_id: TabId(tab_id),
                 url,
             },
+            Self::NavigateActive { .. } => {
+                unreachable!(
+                    "NavigateActive requires runtime tab resolution before intent dispatch"
+                )
+            }
         }
     }
 }

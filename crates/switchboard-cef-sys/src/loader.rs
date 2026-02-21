@@ -7,8 +7,8 @@ use std::ptr::NonNull;
 use crate::raw::{
     cef_api_hash_fn, cef_api_version_fn, cef_browser_host_create_browser_fn, cef_currently_on_fn,
     cef_do_message_loop_work_fn, cef_execute_process_fn, cef_initialize_fn, cef_post_task_fn,
-    cef_quit_message_loop_fn, cef_run_message_loop_fn, cef_shutdown_fn, cef_string_utf16_clear_fn,
-    cef_string_utf16_set_fn,
+    cef_quit_message_loop_fn, cef_register_scheme_handler_factory_fn, cef_run_message_loop_fn,
+    cef_shutdown_fn, cef_string_utf16_clear_fn, cef_string_utf16_set_fn,
 };
 
 const RTLD_LAZY: i32 = 0x1;
@@ -52,6 +52,7 @@ pub struct CefApi {
     pub cef_currently_on: cef_currently_on_fn,
     pub cef_post_task: cef_post_task_fn,
     pub cef_browser_host_create_browser: cef_browser_host_create_browser_fn,
+    pub cef_register_scheme_handler_factory: cef_register_scheme_handler_factory_fn,
     pub cef_string_utf16_set: cef_string_utf16_set_fn,
     pub cef_string_utf16_clear: cef_string_utf16_clear_fn,
 }
@@ -114,6 +115,12 @@ impl CefLibrary {
                 cef_browser_host_create_browser: load_symbol::<cef_browser_host_create_browser_fn>(
                     &load,
                     "cef_browser_host_create_browser",
+                )?,
+                cef_register_scheme_handler_factory: load_symbol::<
+                    cef_register_scheme_handler_factory_fn,
+                >(
+                    &load,
+                    "cef_register_scheme_handler_factory",
                 )?,
                 cef_string_utf16_set: load_symbol::<cef_string_utf16_set_fn>(
                     &load,

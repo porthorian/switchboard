@@ -1,7 +1,10 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use switchboard_core::TabId;
+
+use crate::bridge::UiCommand;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowId(pub u64);
@@ -83,9 +86,27 @@ pub trait CefHost {
         url: &str,
     ) -> Result<(), Self::Error>;
 
-    fn run_event_loop(self) -> Result<(), Self::Error>
-    where
-        Self: Sized;
+    fn run_event_loop(&mut self) -> Result<(), Self::Error>;
+}
+
+pub type UiCommandHandler = Box<dyn FnMut(UiCommand) + 'static>;
+
+thread_local! {
+    static UI_COMMAND_HANDLER: RefCell<Option<UiCommandHandler>> = RefCell::new(None);
+}
+
+pub fn install_ui_command_handler(handler: Option<UiCommandHandler>) {
+    UI_COMMAND_HANDLER.with(|slot| {
+        *slot.borrow_mut() = handler;
+    });
+}
+
+fn emit_ui_command(command: UiCommand) {
+    UI_COMMAND_HANDLER.with(|slot| {
+        if let Some(handler) = slot.borrow_mut().as_mut() {
+            handler(command);
+        }
+    });
 }
 
 #[cfg(any(test, not(target_os = "macos")))]
@@ -164,7 +185,7 @@ impl CefHost for MockCefHost {
         Ok(())
     }
 
-    fn run_event_loop(self) -> Result<(), Self::Error> {
+    fn run_event_loop(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -180,14 +201,21 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::mem::{size_of, zeroed};
 #[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::slice;
 
 #[cfg(target_os = "macos")]
 use switchboard_cef_sys::loader::CefLibrary;
 #[cfg(target_os = "macos")]
 use switchboard_cef_sys::raw::{
-    cef_base_ref_counted_t, cef_browser_host_create_browser_fn, cef_browser_settings_t,
-    cef_client_t, cef_main_args_t, cef_rect_t, cef_settings_t, cef_string_t, cef_string_utf16_t,
-    cef_window_info_t, CEF_RUNTIME_STYLE_ALLOY,
+    cef_app_t, cef_base_ref_counted_t, cef_browser_host_create_browser_fn, cef_browser_settings_t,
+    cef_browser_t, cef_callback_t, cef_client_t, cef_frame_t, cef_jsdialog_callback_t,
+    cef_jsdialog_handler_t, cef_main_args_t, cef_rect_t, cef_request_t, cef_resource_handler_t,
+    cef_response_t, cef_scheme_handler_factory_t, cef_scheme_registrar_t, cef_settings_t,
+    cef_string_t, cef_string_utf16_t, cef_window_info_t, CEF_RUNTIME_STYLE_ALLOY,
+    CEF_SCHEME_OPTION_CORS_ENABLED, CEF_SCHEME_OPTION_DISPLAY_ISOLATED,
+    CEF_SCHEME_OPTION_FETCH_ENABLED, CEF_SCHEME_OPTION_SECURE, CEF_SCHEME_OPTION_STANDARD,
+    JSDIALOGTYPE_PROMPT,
 };
 
 #[cfg(target_os = "macos")]
@@ -235,6 +263,10 @@ const ENV_CEF_TMPDIR: &str = "SWITCHBOARD_CEF_TMPDIR";
 #[cfg(target_os = "macos")]
 const ENV_CEF_API_VERSION: &str = "SWITCHBOARD_CEF_API_VERSION";
 #[cfg(target_os = "macos")]
+const ENV_CEF_USE_MOCK_KEYCHAIN: &str = "SWITCHBOARD_CEF_USE_MOCK_KEYCHAIN";
+#[cfg(target_os = "macos")]
+const ENV_CEF_PASSWORD_STORE: &str = "SWITCHBOARD_CEF_PASSWORD_STORE";
+#[cfg(target_os = "macos")]
 const DEFAULT_CEF_API_VERSION: i32 = 14500;
 
 #[cfg(target_os = "macos")]
@@ -249,6 +281,64 @@ const STYLE_RESIZABLE: u64 = 1 << 3;
 const BACKING_STORE_BUFFERED: u64 = 2;
 #[cfg(target_os = "macos")]
 const APP_ACTIVATION_POLICY_REGULAR: i64 = 0;
+#[cfg(target_os = "macos")]
+const NS_VIEW_WIDTH_SIZABLE: u64 = 2;
+#[cfg(target_os = "macos")]
+const NS_VIEW_MAX_X_MARGIN: u64 = 4;
+#[cfg(target_os = "macos")]
+const NS_VIEW_HEIGHT_SIZABLE: u64 = 16;
+#[cfg(target_os = "macos")]
+const UI_VIEW_AUTORE_SIZE_MASK: u64 = NS_VIEW_MAX_X_MARGIN | NS_VIEW_HEIGHT_SIZABLE;
+#[cfg(target_os = "macos")]
+const CONTENT_VIEW_AUTORE_SIZE_MASK: u64 = NS_VIEW_WIDTH_SIZABLE | NS_VIEW_HEIGHT_SIZABLE;
+#[cfg(target_os = "macos")]
+const UI_SCHEME: &str = "app";
+#[cfg(target_os = "macos")]
+const UI_INTENT_PROMPT_MARKER: &str = "__switchboard_intent__";
+#[cfg(target_os = "macos")]
+const UI_SCHEME_OPTIONS: u32 = CEF_SCHEME_OPTION_STANDARD
+    | CEF_SCHEME_OPTION_SECURE
+    | CEF_SCHEME_OPTION_CORS_ENABLED
+    | CEF_SCHEME_OPTION_FETCH_ENABLED
+    | CEF_SCHEME_OPTION_DISPLAY_ISOLATED;
+#[cfg(target_os = "macos")]
+const UI_SHELL_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Switchboard</title>
+  <style>
+    :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; }
+    body { margin: 0; padding: 12px; background: #111827; color: #f9fafb; }
+    h1 { margin: 0 0 10px; font-size: 15px; letter-spacing: 0.02em; }
+    .row { display: flex; gap: 8px; margin-bottom: 8px; }
+    input { flex: 1; padding: 8px; border: 1px solid #374151; border-radius: 8px; background: #1f2937; color: #f9fafb; }
+    button { padding: 8px 10px; border: 1px solid #4b5563; border-radius: 8px; background: #2563eb; color: #fff; cursor: pointer; }
+    p { margin: 0; font-size: 12px; color: #cbd5e1; }
+  </style>
+</head>
+<body>
+  <h1>Switchboard UI</h1>
+  <div class="row">
+    <input id="url" value="https://example.com" autocomplete="off">
+    <button id="go" type="button">Go</button>
+  </div>
+  <p>Prompt bridge uses a strict allowlist in Rust.</p>
+  <script>
+    const marker = "__switchboard_intent__";
+    const input = document.getElementById("url");
+    const go = document.getElementById("go");
+    function send(payload) { window.prompt(marker, payload); }
+    go.addEventListener("click", () => {
+      const url = (input.value || "").trim();
+      if (url) send(`navigate ${url}`);
+    });
+    send("ui_ready 0.1.0-dev");
+  </script>
+</body>
+</html>
+"#;
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
@@ -303,6 +393,9 @@ enum ContentBackend {
 struct CefRuntime {
     library: CefLibrary,
     config: CefConfig,
+    _app: *mut cef_app_t,
+    _ui_scheme_factory: *mut cef_scheme_handler_factory_t,
+    ui_client: *mut cef_client_t,
 }
 
 #[cfg(target_os = "macos")]
@@ -321,6 +414,38 @@ struct CefConfig {
 struct CefString {
     value: cef_string_t,
     clear: switchboard_cef_sys::raw::cef_string_utf16_clear_fn,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct SwitchboardCefApp {
+    app: cef_app_t,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct SwitchboardUiSchemeFactory {
+    factory: cef_scheme_handler_factory_t,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct SwitchboardUiResourceHandler {
+    handler: cef_resource_handler_t,
+    offset: usize,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct SwitchboardUiJsDialogHandler {
+    handler: cef_jsdialog_handler_t,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct SwitchboardUiClient {
+    client: cef_client_t,
+    jsdialog_handler: *mut cef_jsdialog_handler_t,
 }
 
 #[cfg(target_os = "macos")]
@@ -443,35 +568,393 @@ impl Drop for CefString {
 }
 
 #[cfg(target_os = "macos")]
-unsafe extern "C" fn cef_client_add_ref_noop(_self_: *mut cef_base_ref_counted_t) {}
+unsafe extern "C" fn cef_ref_counted_add_ref_noop(_self_: *mut cef_base_ref_counted_t) {}
 
 #[cfg(target_os = "macos")]
-unsafe extern "C" fn cef_client_release_noop(_self_: *mut cef_base_ref_counted_t) -> c_int {
+unsafe extern "C" fn cef_ref_counted_release_noop(_self_: *mut cef_base_ref_counted_t) -> c_int {
     0
 }
 
 #[cfg(target_os = "macos")]
-unsafe extern "C" fn cef_client_has_one_ref_true(_self_: *mut cef_base_ref_counted_t) -> c_int {
-    1
-}
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" fn cef_client_has_at_least_one_ref_true(
+unsafe extern "C" fn cef_ref_counted_has_one_ref_true(
     _self_: *mut cef_base_ref_counted_t,
 ) -> c_int {
     1
 }
 
 #[cfg(target_os = "macos")]
+unsafe extern "C" fn cef_ref_counted_has_at_least_one_ref_true(
+    _self_: *mut cef_base_ref_counted_t,
+) -> c_int {
+    1
+}
+
+#[cfg(target_os = "macos")]
+fn ref_counted_base<T>() -> cef_base_ref_counted_t {
+    cef_base_ref_counted_t {
+        size: size_of::<T>(),
+        add_ref: Some(cef_ref_counted_add_ref_noop),
+        release: Some(cef_ref_counted_release_noop),
+        has_one_ref: Some(cef_ref_counted_has_one_ref_true),
+        has_at_least_one_ref: Some(cef_ref_counted_has_at_least_one_ref_true),
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn cef_string_to_owned(value: *const cef_string_t) -> String {
+    if value.is_null() {
+        return String::new();
+    }
+    if (*value).str_.is_null() || (*value).length == 0 {
+        return String::new();
+    }
+    let units = slice::from_raw_parts((*value).str_, (*value).length);
+    String::from_utf16_lossy(units)
+}
+
+#[cfg(target_os = "macos")]
+fn with_stack_cef_string(value: &str, callback: impl FnOnce(*const cef_string_t)) {
+    let utf16: Vec<u16> = value.encode_utf16().collect();
+    let cef_value = cef_string_t {
+        str_: utf16.as_ptr() as *mut u16,
+        length: utf16.len(),
+        dtor: None,
+    };
+    callback(&cef_value);
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_app_on_register_custom_schemes(
+    _self_: *mut cef_app_t,
+    registrar: *mut cef_scheme_registrar_t,
+) {
+    if registrar.is_null() {
+        return;
+    }
+    let Some(add_custom_scheme) = (*registrar).add_custom_scheme else {
+        return;
+    };
+    with_stack_cef_string(UI_SCHEME, |scheme_name| unsafe {
+        let _ = add_custom_scheme(registrar, scheme_name, UI_SCHEME_OPTIONS as c_int);
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn allocate_cef_app() -> *mut cef_app_t {
+    let app = Box::new(SwitchboardCefApp {
+        app: cef_app_t {
+            base: ref_counted_base::<cef_app_t>(),
+            on_before_command_line_processing: None,
+            on_register_custom_schemes: Some(switchboard_app_on_register_custom_schemes),
+            get_resource_bundle_handler: None,
+            get_browser_process_handler: None,
+            get_render_process_handler: None,
+        },
+    });
+    let app_ptr = Box::into_raw(app);
+    unsafe { &mut (*app_ptr).app as *mut cef_app_t }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_ui_intent_payload(payload: &str) -> Result<UiCommand, &'static str> {
+    let trimmed = payload.trim();
+    if let Some(url) = trimmed.strip_prefix("navigate ") {
+        let normalized = url.trim();
+        if normalized.starts_with("https://") || normalized.starts_with("http://") {
+            return Ok(UiCommand::NavigateActive {
+                url: normalized.to_owned(),
+            });
+        }
+        return Err("navigate intents only allow http/https URLs");
+    }
+    if trimmed.starts_with("ui_ready ") {
+        return Err("ui_ready handled");
+    }
+    Err("intent is not in the allowlist")
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_ui_on_jsdialog(
+    _self_: *mut cef_jsdialog_handler_t,
+    _browser: *mut cef_browser_t,
+    _origin_url: *const cef_string_t,
+    dialog_type: switchboard_cef_sys::raw::cef_jsdialog_type_t,
+    message_text: *const cef_string_t,
+    default_prompt_text: *const cef_string_t,
+    _callback: *mut cef_jsdialog_callback_t,
+    suppress_message: *mut c_int,
+) -> c_int {
+    if dialog_type != JSDIALOGTYPE_PROMPT {
+        return 0;
+    }
+
+    let marker = cef_string_to_owned(message_text);
+    if marker != UI_INTENT_PROMPT_MARKER {
+        return 0;
+    }
+
+    if !suppress_message.is_null() {
+        *suppress_message = 1;
+    }
+
+    let payload = cef_string_to_owned(default_prompt_text);
+    match parse_ui_intent_payload(&payload) {
+        Ok(command) => {
+            eprintln!("switchboard-app: accepted UI intent `{payload}`");
+            emit_ui_command(command);
+        }
+        Err("ui_ready handled") => {}
+        Err(reason) => eprintln!("switchboard-app: rejected UI intent `{payload}` ({reason})"),
+    }
+
+    // Suppress marker prompts without showing native dialogs or running callback.
+    // CEF docs: set suppress_message=1 and return 0 to suppress.
+    0
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_ui_client_get_jsdialog_handler(
+    self_: *mut cef_client_t,
+) -> *mut cef_jsdialog_handler_t {
+    if self_.is_null() {
+        return std::ptr::null_mut();
+    }
+    let client = self_ as *mut SwitchboardUiClient;
+    (*client).jsdialog_handler
+}
+
+#[cfg(target_os = "macos")]
+fn allocate_ui_jsdialog_handler() -> *mut cef_jsdialog_handler_t {
+    let handler = Box::new(SwitchboardUiJsDialogHandler {
+        handler: cef_jsdialog_handler_t {
+            base: ref_counted_base::<cef_jsdialog_handler_t>(),
+            on_jsdialog: Some(switchboard_ui_on_jsdialog),
+            on_before_unload_dialog: None,
+            on_reset_dialog_state: None,
+            on_dialog_closed: None,
+        },
+    });
+    let ptr = Box::into_raw(handler);
+    unsafe { &mut (*ptr).handler as *mut cef_jsdialog_handler_t }
+}
+
+#[cfg(target_os = "macos")]
+fn allocate_ui_cef_client() -> *mut cef_client_t {
+    let jsdialog_handler = allocate_ui_jsdialog_handler();
+    let client = Box::new(SwitchboardUiClient {
+        client: cef_client_t {
+            base: ref_counted_base::<cef_client_t>(),
+            get_audio_handler: None,
+            get_command_handler: None,
+            get_context_menu_handler: None,
+            get_dialog_handler: None,
+            get_display_handler: None,
+            get_download_handler: None,
+            get_drag_handler: None,
+            get_find_handler: None,
+            get_focus_handler: None,
+            get_frame_handler: None,
+            get_permission_handler: None,
+            get_jsdialog_handler: Some(switchboard_ui_client_get_jsdialog_handler),
+            get_keyboard_handler: None,
+            get_life_span_handler: None,
+            get_load_handler: None,
+            get_print_handler: None,
+            get_render_handler: None,
+            get_request_handler: None,
+            on_process_message_received: None,
+        },
+        jsdialog_handler,
+    });
+    let ptr = Box::into_raw(client);
+    unsafe { &mut (*ptr).client as *mut cef_client_t }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_resource_handler_open(
+    _self_: *mut cef_resource_handler_t,
+    _request: *mut cef_request_t,
+    handle_request: *mut c_int,
+    _callback: *mut cef_callback_t,
+) -> c_int {
+    if !handle_request.is_null() {
+        *handle_request = 1;
+    }
+    1
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_resource_handler_process_request(
+    _self_: *mut cef_resource_handler_t,
+    _request: *mut cef_request_t,
+    callback: *mut cef_callback_t,
+) -> c_int {
+    if !callback.is_null() {
+        if let Some(cont) = (*callback).cont {
+            cont(callback);
+        }
+    }
+    1
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_resource_handler_get_response_headers(
+    _self_: *mut cef_resource_handler_t,
+    response: *mut cef_response_t,
+    response_length: *mut i64,
+    _redirect_url: *mut cef_string_t,
+) {
+    if !response_length.is_null() {
+        *response_length = UI_SHELL_HTML.as_bytes().len() as i64;
+    }
+    if response.is_null() {
+        return;
+    }
+    if let Some(set_status) = (*response).set_status {
+        set_status(response, 200);
+    }
+    if let Some(set_status_text) = (*response).set_status_text {
+        with_stack_cef_string("OK", |value| unsafe {
+            set_status_text(response, value);
+        });
+    }
+    if let Some(set_mime_type) = (*response).set_mime_type {
+        with_stack_cef_string("text/html", |value| unsafe {
+            set_mime_type(response, value);
+        });
+    }
+    if let Some(set_charset) = (*response).set_charset {
+        with_stack_cef_string("utf-8", |value| unsafe {
+            set_charset(response, value);
+        });
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_resource_handler_skip(
+    self_: *mut cef_resource_handler_t,
+    bytes_to_skip: i64,
+    bytes_skipped: *mut i64,
+    _callback: *mut switchboard_cef_sys::raw::cef_resource_skip_callback_t,
+) -> c_int {
+    if self_.is_null() {
+        return 0;
+    }
+    let this = self_ as *mut SwitchboardUiResourceHandler;
+    if bytes_to_skip <= 0 {
+        if !bytes_skipped.is_null() {
+            *bytes_skipped = 0;
+        }
+        return 1;
+    }
+    let total = UI_SHELL_HTML.as_bytes().len();
+    let remaining = total.saturating_sub((*this).offset);
+    let to_skip = (bytes_to_skip as usize).min(remaining);
+    (*this).offset += to_skip;
+    if !bytes_skipped.is_null() {
+        *bytes_skipped = to_skip as i64;
+    }
+    1
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_resource_handler_read(
+    self_: *mut cef_resource_handler_t,
+    data_out: *mut c_void,
+    bytes_to_read: c_int,
+    bytes_read: *mut c_int,
+    _callback: *mut switchboard_cef_sys::raw::cef_resource_read_callback_t,
+) -> c_int {
+    if self_.is_null() || data_out.is_null() || bytes_to_read <= 0 {
+        if !bytes_read.is_null() {
+            *bytes_read = 0;
+        }
+        return 0;
+    }
+    let this = self_ as *mut SwitchboardUiResourceHandler;
+    let body = UI_SHELL_HTML.as_bytes();
+    let remaining = body.len().saturating_sub((*this).offset);
+    if remaining == 0 {
+        if !bytes_read.is_null() {
+            *bytes_read = 0;
+        }
+        return 0;
+    }
+
+    let chunk_len = (bytes_to_read as usize).min(remaining);
+    std::ptr::copy_nonoverlapping(
+        body.as_ptr().add((*this).offset),
+        data_out as *mut u8,
+        chunk_len,
+    );
+    (*this).offset += chunk_len;
+    if !bytes_read.is_null() {
+        *bytes_read = chunk_len as c_int;
+    }
+    1
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_resource_handler_read_response(
+    self_: *mut cef_resource_handler_t,
+    data_out: *mut c_void,
+    bytes_to_read: c_int,
+    bytes_read: *mut c_int,
+    _callback: *mut cef_callback_t,
+) -> c_int {
+    switchboard_resource_handler_read(
+        self_,
+        data_out,
+        bytes_to_read,
+        bytes_read,
+        std::ptr::null_mut(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_resource_handler_cancel(_self_: *mut cef_resource_handler_t) {}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_scheme_factory_create(
+    _self_: *mut cef_scheme_handler_factory_t,
+    _browser: *mut cef_browser_t,
+    _frame: *mut cef_frame_t,
+    _scheme_name: *const cef_string_t,
+    _request: *mut cef_request_t,
+) -> *mut cef_resource_handler_t {
+    let handler = Box::new(SwitchboardUiResourceHandler {
+        handler: cef_resource_handler_t {
+            base: ref_counted_base::<cef_resource_handler_t>(),
+            open: Some(switchboard_resource_handler_open),
+            process_request: Some(switchboard_resource_handler_process_request),
+            get_response_headers: Some(switchboard_resource_handler_get_response_headers),
+            skip: Some(switchboard_resource_handler_skip),
+            read: Some(switchboard_resource_handler_read),
+            read_response: Some(switchboard_resource_handler_read_response),
+            cancel: Some(switchboard_resource_handler_cancel),
+        },
+        offset: 0,
+    });
+    let ptr = Box::into_raw(handler);
+    &mut (*ptr).handler as *mut cef_resource_handler_t
+}
+
+#[cfg(target_os = "macos")]
+fn allocate_ui_scheme_factory() -> *mut cef_scheme_handler_factory_t {
+    let factory = Box::new(SwitchboardUiSchemeFactory {
+        factory: cef_scheme_handler_factory_t {
+            base: ref_counted_base::<cef_scheme_handler_factory_t>(),
+            create: Some(switchboard_scheme_factory_create),
+        },
+    });
+    let ptr = Box::into_raw(factory);
+    unsafe { &mut (*ptr).factory as *mut cef_scheme_handler_factory_t }
+}
+
+#[cfg(target_os = "macos")]
 fn allocate_minimal_cef_client() -> *mut cef_client_t {
     let client = Box::new(cef_client_t {
-        base: cef_base_ref_counted_t {
-            size: size_of::<cef_client_t>(),
-            add_ref: Some(cef_client_add_ref_noop),
-            release: Some(cef_client_release_noop),
-            has_one_ref: Some(cef_client_has_one_ref_true),
-            has_at_least_one_ref: Some(cef_client_has_at_least_one_ref_true),
-        },
+        base: ref_counted_base::<cef_client_t>(),
         get_audio_handler: None,
         get_command_handler: None,
         get_context_menu_handler: None,
@@ -539,6 +1022,7 @@ impl CefRuntime {
                     }
                 ))
             })?;
+            let app = allocate_cef_app();
             let requested_api_version =
                 env_i32(ENV_CEF_API_VERSION).unwrap_or(DEFAULT_CEF_API_VERSION);
             let api_hash = (library.api.cef_api_hash)(requested_api_version, 0);
@@ -556,8 +1040,28 @@ impl CefRuntime {
                 );
             }
 
+            let mut cef_args: Vec<String> = std::env::args().collect();
+            let use_mock_keychain =
+                env_flag_or_default(ENV_CEF_USE_MOCK_KEYCHAIN, cfg!(debug_assertions));
+            if use_mock_keychain {
+                upsert_cef_switch(&mut cef_args, "--use-mock-keychain");
+            }
+            if let Ok(password_store) = std::env::var(ENV_CEF_PASSWORD_STORE) {
+                let trimmed = password_store.trim();
+                if !trimmed.is_empty() {
+                    upsert_cef_switch_with_value(&mut cef_args, "--password-store", trimmed);
+                }
+            }
+            if verbose_errors {
+                eprintln!(
+                    "switchboard-app: CEF launch switches mock_keychain={} password_store={}",
+                    use_mock_keychain,
+                    std::env::var(ENV_CEF_PASSWORD_STORE).unwrap_or_else(|_| "unset".to_owned())
+                );
+            }
+
             let mut argv_storage = Vec::new();
-            for arg in std::env::args() {
+            for arg in cef_args {
                 let c_arg = CString::new(arg)
                     .map_err(|_| HostError::Native("argv contained interior NUL".to_owned()))?;
                 argv_storage.push(c_arg);
@@ -572,11 +1076,8 @@ impl CefRuntime {
                 argv: argv_ptrs.as_mut_ptr(),
             };
 
-            let secondary_exit_code = (library.api.cef_execute_process)(
-                &main_args,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
+            let secondary_exit_code =
+                (library.api.cef_execute_process)(&main_args, app, std::ptr::null_mut());
             if verbose_errors {
                 eprintln!(
                     "switchboard-app: cef_execute_process returned {secondary_exit_code} (pid={})",
@@ -660,12 +1161,8 @@ impl CefRuntime {
                 )?;
             }
 
-            let initialized = (library.api.cef_initialize)(
-                &main_args,
-                &settings,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
+            let initialized =
+                (library.api.cef_initialize)(&main_args, &settings, app, std::ptr::null_mut());
             drop(settings_strings);
             if initialized == 0 {
                 return Err(HostError::Native(format!(
@@ -673,7 +1170,27 @@ impl CefRuntime {
                 )));
             }
 
-            Ok(Some(Self { library, config }))
+            let app_scheme = CefString::new(&library, UI_SCHEME)?;
+            let ui_scheme_factory = allocate_ui_scheme_factory();
+            let registered = (library.api.cef_register_scheme_handler_factory)(
+                app_scheme.as_ptr(),
+                std::ptr::null(),
+                ui_scheme_factory,
+            );
+            if registered == 0 {
+                return Err(HostError::Native(
+                    "CEF bootstrap failed at: register app:// scheme handler".to_owned(),
+                ));
+            }
+            let ui_client = allocate_ui_cef_client();
+
+            Ok(Some(Self {
+                library,
+                config,
+                _app: app,
+                _ui_scheme_factory: ui_scheme_factory,
+                ui_client,
+            }))
         }
     }
 
@@ -682,6 +1199,8 @@ impl CefRuntime {
         parent_view: ObjcId,
         url: &str,
         client: *mut cef_client_t,
+        width: f64,
+        height: f64,
     ) -> Result<(), HostError> {
         unsafe {
             if env_flag(ENV_CEF_VERBOSE_ERRORS) {
@@ -694,8 +1213,8 @@ impl CefRuntime {
             window_info.bounds = cef_rect_t {
                 x: 0,
                 y: 0,
-                width: CONTENT_WIDTH as c_int,
-                height: CONTENT_HEIGHT as c_int,
+                width: width as c_int,
+                height: height as c_int,
             };
             window_info.parent_view = parent_view;
             window_info.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
@@ -729,6 +1248,10 @@ impl CefRuntime {
             }
             Ok(())
         }
+    }
+
+    fn ui_client(&self) -> *mut cef_client_t {
+        self.ui_client
     }
 
     fn run_message_loop(&self) {
@@ -860,6 +1383,13 @@ fn env_flag(key: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+fn env_flag_or_default(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(default)
+}
+
+#[cfg(target_os = "macos")]
 fn env_i32(key: &str) -> Option<i32> {
     std::env::var(key).ok().and_then(|value| {
         let trimmed = value.trim();
@@ -918,6 +1448,24 @@ fn set_cef_path_string(
     *target = value.value();
     keep_alive.push(value);
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn upsert_cef_switch(args: &mut Vec<String>, switch: &str) {
+    if args.iter().any(|arg| arg == switch) {
+        return;
+    }
+    args.push(switch.to_owned());
+}
+
+#[cfg(target_os = "macos")]
+fn upsert_cef_switch_with_value(args: &mut Vec<String>, switch: &str, value: &str) {
+    let prefix = format!("{switch}=");
+    if let Some(existing) = args.iter_mut().find(|arg| arg.starts_with(&prefix)) {
+        *existing = format!("{prefix}{value}");
+        return;
+    }
+    args.push(format!("{prefix}{value}"));
 }
 
 #[cfg(target_os = "macos")]
@@ -1036,6 +1584,12 @@ impl CefHost for NativeMacHost {
         if !url.starts_with("app://ui") {
             return Err(HostError::InvalidUiUrl(url.to_owned()));
         }
+        let cef = self.cef.as_ref().ok_or_else(|| {
+            HostError::Native(
+                "UI shell requires CEF. Set SWITCHBOARD_CEF_DIST or SWITCHBOARD_CEF_LIBRARY."
+                    .to_owned(),
+            )
+        })?;
 
         unsafe {
             let window = self.window_for(window_id)?;
@@ -1043,6 +1597,7 @@ impl CefHost for NativeMacHost {
             if root_view == NIL {
                 return Err(HostError::Native("window content view is nil".to_owned()));
             }
+            msg_send_void_bool(root_view, selector("setAutoresizesSubviews:")?, YES);
 
             let view_class = objc_class("NSView")?;
             let view_alloc = msg_send_id(view_class, selector("alloc")?);
@@ -1057,8 +1612,14 @@ impl CefHost for NativeMacHost {
             if ui_view == NIL {
                 return Err(HostError::Native("failed to create UI view".to_owned()));
             }
+            msg_send_void_u64(
+                ui_view,
+                selector("setAutoresizingMask:")?,
+                UI_VIEW_AUTORE_SIZE_MASK,
+            );
 
             msg_send_void_id(root_view, selector("addSubview:")?, ui_view);
+            cef.create_browser_in_view(ui_view, url, cef.ui_client(), UI_WIDTH, WINDOW_HEIGHT)?;
 
             self.next_ui_view_id += 1;
             let view_id = UiViewId(self.next_ui_view_id);
@@ -1083,6 +1644,7 @@ impl CefHost for NativeMacHost {
             if root_view == NIL {
                 return Err(HostError::Native("window content view is nil".to_owned()));
             }
+            msg_send_void_bool(root_view, selector("setAutoresizesSubviews:")?, YES);
             let frame = NSRect {
                 origin: NSPoint {
                     x: UI_WIDTH,
@@ -1094,12 +1656,23 @@ impl CefHost for NativeMacHost {
                 },
             };
             let content_view = create_content_container(frame)?;
+            msg_send_void_u64(
+                content_view,
+                selector("setAutoresizingMask:")?,
+                CONTENT_VIEW_AUTORE_SIZE_MASK,
+            );
             msg_send_void_id(root_view, selector("addSubview:")?, content_view);
 
             let mut cef_client: Option<*mut cef_client_t> = None;
             let backend = if let Some(cef) = self.cef.as_ref() {
                 let client = allocate_minimal_cef_client();
-                if let Err(error) = cef.create_browser_in_view(content_view, url, client) {
+                if let Err(error) = cef.create_browser_in_view(
+                    content_view,
+                    url,
+                    client,
+                    CONTENT_WIDTH,
+                    CONTENT_HEIGHT,
+                ) {
                     free_minimal_cef_client(client);
                     return Err(error);
                 }
@@ -1160,7 +1733,7 @@ impl CefHost for NativeMacHost {
                             view_id.0
                         ))
                     })?;
-                    cef.create_browser_in_view(view, url, client)?;
+                    cef.create_browser_in_view(view, url, client, CONTENT_WIDTH, CONTENT_HEIGHT)?;
                 }
             }
             let title_value = nsstring(&format!("Switchboard - {url}"))?;
@@ -1169,15 +1742,22 @@ impl CefHost for NativeMacHost {
         Ok(())
     }
 
-    fn run_event_loop(mut self) -> Result<(), Self::Error> {
+    fn run_event_loop(&mut self) -> Result<(), Self::Error> {
         unsafe {
             msg_send_void_bool(self.app, selector("activateIgnoringOtherApps:")?, YES);
-            if let Some(cef) = self.cef.take() {
+            if self.cef.is_some() {
+                // Keep CEF runtime available while message loop is running so
+                // UI-originated intents can navigate content views.
+                let cef = self
+                    .cef
+                    .as_ref()
+                    .ok_or_else(|| HostError::Native("CEF runtime unavailable".to_owned()))?;
                 cef.run_message_loop();
                 for client in self.cef_clients.values().copied() {
                     free_minimal_cef_client(client);
                 }
                 cef.shutdown();
+                self.cef = None;
             } else {
                 msg_send_void(self.app, selector("run")?);
             }
@@ -1410,6 +1990,13 @@ unsafe fn msg_send_void_bool(receiver: ObjcId, selector: ObjcSel, arg: i8) {
 #[cfg(target_os = "macos")]
 unsafe fn msg_send_void_i64(receiver: ObjcId, selector: ObjcSel, arg: i64) {
     let send: unsafe extern "C" fn(ObjcId, ObjcSel, i64) =
+        std::mem::transmute(objc_msgSend as *const ());
+    send(receiver, selector, arg);
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn msg_send_void_u64(receiver: ObjcId, selector: ObjcSel, arg: u64) {
+    let send: unsafe extern "C" fn(ObjcId, ObjcSel, u64) =
         std::mem::transmute(objc_msgSend as *const ());
     send(receiver, selector, arg);
 }

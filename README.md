@@ -18,7 +18,7 @@ cargo test
 ```
 
 `cargo run -p switchboard-app` starts the Milestone 1 shell and opens a native macOS window.
-By default this uses a `WKWebView` fallback for content rendering.
+Milestone 1 now boots a privileged CEF UI view at `app://ui`, so a CEF distribution path is required on macOS.
 
 To render content with CEF, provide either a distribution root or an explicit framework binary:
 
@@ -34,6 +34,8 @@ SWITCHBOARD_CEF_LIBRARY=/path/to/Release/Chromium\ Embedded\ Framework.framework
 cargo run -p switchboard-app
 ```
 
+The `app://ui` shell currently exposes a minimal prompt-based bridge marker (`__switchboard_intent__`) with a strict allowlist (`navigate http(s)://...`).
+
 Optional overrides:
 - `SWITCHBOARD_CEF_FRAMEWORK_DIR`
 - `SWITCHBOARD_CEF_RESOURCES_DIR`
@@ -42,7 +44,14 @@ Optional overrides:
 - `SWITCHBOARD_CEF_API_VERSION` (defaults to `14500`; set explicitly if using a different CEF build)
 - `SWITCHBOARD_CEF_ROOT_CACHE_PATH`
 - `SWITCHBOARD_CEF_TMPDIR`
+- `SWITCHBOARD_CEF_USE_MOCK_KEYCHAIN` (`1/true` to force `--use-mock-keychain`, defaults to enabled in debug builds)
+- `SWITCHBOARD_CEF_PASSWORD_STORE` (optional Chromium `--password-store=<value>`, e.g. `basic` for dev)
 - `SWITCHBOARD_CEF_VERBOSE_ERRORS` (`1` to include raw loader details)
+
+Note on macOS keychain prompts:
+- CEF/Chromium uses the login keychain by default (`Chromium Safe Storage` entry).
+- Upstream Chromium does not provide a simple runtime switch for a custom keychain name like `Switchboard`; that requires deeper platform customization.
+- For local development, mock keychain mode avoids repeated prompts.
 
 ## CEF bindings generation
 

@@ -8,11 +8,27 @@ pub type cef_log_items_t = c_uint;
 pub type cef_state_t = c_uint;
 pub type cef_runtime_style_t = c_uint;
 pub type cef_process_id_t = c_uint;
+pub type cef_errorcode_t = c_int;
+pub type cef_jsdialog_type_t = c_uint;
+pub type cef_scheme_options_t = c_uint;
+pub type cef_string_userfree_t = *mut cef_string_t;
+pub type cef_string_multimap_t = *mut c_void;
 pub type cef_window_handle_t = *mut c_void;
 
 pub const CEF_RUNTIME_STYLE_DEFAULT: cef_runtime_style_t = 0;
 pub const CEF_RUNTIME_STYLE_CHROME: cef_runtime_style_t = 1;
 pub const CEF_RUNTIME_STYLE_ALLOY: cef_runtime_style_t = 2;
+pub const JSDIALOGTYPE_ALERT: cef_jsdialog_type_t = 0;
+pub const JSDIALOGTYPE_CONFIRM: cef_jsdialog_type_t = 1;
+pub const JSDIALOGTYPE_PROMPT: cef_jsdialog_type_t = 2;
+pub const CEF_SCHEME_OPTION_NONE: cef_scheme_options_t = 0;
+pub const CEF_SCHEME_OPTION_STANDARD: cef_scheme_options_t = 1;
+pub const CEF_SCHEME_OPTION_LOCAL: cef_scheme_options_t = 2;
+pub const CEF_SCHEME_OPTION_DISPLAY_ISOLATED: cef_scheme_options_t = 4;
+pub const CEF_SCHEME_OPTION_SECURE: cef_scheme_options_t = 8;
+pub const CEF_SCHEME_OPTION_CORS_ENABLED: cef_scheme_options_t = 16;
+pub const CEF_SCHEME_OPTION_CSP_BYPASSING: cef_scheme_options_t = 32;
+pub const CEF_SCHEME_OPTION_FETCH_ENABLED: cef_scheme_options_t = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -42,6 +58,13 @@ pub struct cef_base_ref_counted_t {
     pub has_one_ref: Option<unsafe extern "C" fn(self_: *mut cef_base_ref_counted_t) -> c_int>,
     pub has_at_least_one_ref:
         Option<unsafe extern "C" fn(self_: *mut cef_base_ref_counted_t) -> c_int>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct cef_base_scoped_t {
+    pub size: usize,
+    pub del: Option<unsafe extern "C" fn(self_: *mut cef_base_scoped_t)>,
 }
 
 #[repr(C)]
@@ -115,8 +138,47 @@ pub struct cef_permission_handler_t {
 }
 
 #[repr(C)]
+pub struct cef_jsdialog_callback_t {
+    pub base: cef_base_ref_counted_t,
+    pub cont: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_jsdialog_callback_t,
+            success: c_int,
+            user_input: *const cef_string_t,
+        ),
+    >,
+}
+
+#[repr(C)]
 pub struct cef_jsdialog_handler_t {
-    pub _private: [u8; 0],
+    pub base: cef_base_ref_counted_t,
+    pub on_jsdialog: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_jsdialog_handler_t,
+            browser: *mut cef_browser_t,
+            origin_url: *const cef_string_t,
+            dialog_type: cef_jsdialog_type_t,
+            message_text: *const cef_string_t,
+            default_prompt_text: *const cef_string_t,
+            callback: *mut cef_jsdialog_callback_t,
+            suppress_message: *mut c_int,
+        ) -> c_int,
+    >,
+    pub on_before_unload_dialog: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_jsdialog_handler_t,
+            browser: *mut cef_browser_t,
+            message_text: *const cef_string_t,
+            is_reload: c_int,
+            callback: *mut cef_jsdialog_callback_t,
+        ) -> c_int,
+    >,
+    pub on_reset_dialog_state: Option<
+        unsafe extern "C" fn(self_: *mut cef_jsdialog_handler_t, browser: *mut cef_browser_t),
+    >,
+    pub on_dialog_closed: Option<
+        unsafe extern "C" fn(self_: *mut cef_jsdialog_handler_t, browser: *mut cef_browser_t),
+    >,
 }
 
 #[repr(C)]
@@ -161,6 +223,11 @@ pub struct cef_frame_t {
 
 #[repr(C)]
 pub struct cef_process_message_t {
+    pub _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct cef_request_t {
     pub _private: [u8; 0],
 }
 
@@ -238,6 +305,150 @@ pub struct cef_dictionary_value_t {
 #[repr(C)]
 pub struct cef_request_context_t {
     pub _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct cef_callback_t {
+    pub base: cef_base_ref_counted_t,
+    pub cont: Option<unsafe extern "C" fn(self_: *mut cef_callback_t)>,
+    pub cancel: Option<unsafe extern "C" fn(self_: *mut cef_callback_t)>,
+}
+
+#[repr(C)]
+pub struct cef_response_t {
+    pub base: cef_base_ref_counted_t,
+    pub is_read_only: Option<unsafe extern "C" fn(self_: *mut cef_response_t) -> c_int>,
+    pub get_error: Option<unsafe extern "C" fn(self_: *mut cef_response_t) -> cef_errorcode_t>,
+    pub set_error: Option<unsafe extern "C" fn(self_: *mut cef_response_t, error: cef_errorcode_t)>,
+    pub get_status: Option<unsafe extern "C" fn(self_: *mut cef_response_t) -> c_int>,
+    pub set_status: Option<unsafe extern "C" fn(self_: *mut cef_response_t, status: c_int)>,
+    pub get_status_text:
+        Option<unsafe extern "C" fn(self_: *mut cef_response_t) -> cef_string_userfree_t>,
+    pub set_status_text:
+        Option<unsafe extern "C" fn(self_: *mut cef_response_t, status_text: *const cef_string_t)>,
+    pub get_mime_type:
+        Option<unsafe extern "C" fn(self_: *mut cef_response_t) -> cef_string_userfree_t>,
+    pub set_mime_type:
+        Option<unsafe extern "C" fn(self_: *mut cef_response_t, mime_type: *const cef_string_t)>,
+    pub get_charset:
+        Option<unsafe extern "C" fn(self_: *mut cef_response_t) -> cef_string_userfree_t>,
+    pub set_charset:
+        Option<unsafe extern "C" fn(self_: *mut cef_response_t, charset: *const cef_string_t)>,
+    pub get_header_by_name: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_response_t,
+            name: *const cef_string_t,
+        ) -> cef_string_userfree_t,
+    >,
+    pub set_header_by_name: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_response_t,
+            name: *const cef_string_t,
+            value: *const cef_string_t,
+            overwrite: c_int,
+        ),
+    >,
+    pub get_header_map:
+        Option<unsafe extern "C" fn(self_: *mut cef_response_t, header_map: cef_string_multimap_t)>,
+    pub set_header_map:
+        Option<unsafe extern "C" fn(self_: *mut cef_response_t, header_map: cef_string_multimap_t)>,
+    pub get_url: Option<unsafe extern "C" fn(self_: *mut cef_response_t) -> cef_string_userfree_t>,
+    pub set_url: Option<unsafe extern "C" fn(self_: *mut cef_response_t, url: *const cef_string_t)>,
+}
+
+#[repr(C)]
+pub struct cef_resource_skip_callback_t {
+    pub base: cef_base_ref_counted_t,
+    pub cont:
+        Option<unsafe extern "C" fn(self_: *mut cef_resource_skip_callback_t, bytes_skipped: i64)>,
+}
+
+#[repr(C)]
+pub struct cef_resource_read_callback_t {
+    pub base: cef_base_ref_counted_t,
+    pub cont:
+        Option<unsafe extern "C" fn(self_: *mut cef_resource_read_callback_t, bytes_read: c_int)>,
+}
+
+#[repr(C)]
+pub struct cef_resource_handler_t {
+    pub base: cef_base_ref_counted_t,
+    pub open: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_resource_handler_t,
+            request: *mut cef_request_t,
+            handle_request: *mut c_int,
+            callback: *mut cef_callback_t,
+        ) -> c_int,
+    >,
+    pub process_request: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_resource_handler_t,
+            request: *mut cef_request_t,
+            callback: *mut cef_callback_t,
+        ) -> c_int,
+    >,
+    pub get_response_headers: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_resource_handler_t,
+            response: *mut cef_response_t,
+            response_length: *mut i64,
+            redirect_url: *mut cef_string_t,
+        ),
+    >,
+    pub skip: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_resource_handler_t,
+            bytes_to_skip: i64,
+            bytes_skipped: *mut i64,
+            callback: *mut cef_resource_skip_callback_t,
+        ) -> c_int,
+    >,
+    pub read: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_resource_handler_t,
+            data_out: *mut c_void,
+            bytes_to_read: c_int,
+            bytes_read: *mut c_int,
+            callback: *mut cef_resource_read_callback_t,
+        ) -> c_int,
+    >,
+    pub read_response: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_resource_handler_t,
+            data_out: *mut c_void,
+            bytes_to_read: c_int,
+            bytes_read: *mut c_int,
+            callback: *mut cef_callback_t,
+        ) -> c_int,
+    >,
+    pub cancel: Option<unsafe extern "C" fn(self_: *mut cef_resource_handler_t)>,
+}
+
+#[repr(C)]
+pub struct cef_scheme_registrar_t {
+    pub base: cef_base_scoped_t,
+    pub add_custom_scheme: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_scheme_registrar_t,
+            scheme_name: *const cef_string_t,
+            options: c_int,
+        ) -> c_int,
+    >,
+}
+
+#[repr(C)]
+pub struct cef_scheme_handler_factory_t {
+    pub base: cef_base_ref_counted_t,
+    pub create: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_scheme_handler_factory_t,
+            browser: *mut cef_browser_t,
+            frame: *mut cef_frame_t,
+            scheme_name: *const cef_string_t,
+            request: *mut cef_request_t,
+        ) -> *mut cef_resource_handler_t,
+    >,
 }
 
 #[repr(C)]
@@ -337,7 +548,7 @@ pub struct cef_app_t {
         ),
     >,
     pub on_register_custom_schemes:
-        Option<unsafe extern "C" fn(self_: *mut cef_app_t, registrar: *mut c_void)>,
+        Option<unsafe extern "C" fn(self_: *mut cef_app_t, registrar: *mut cef_scheme_registrar_t)>,
     pub get_resource_bundle_handler:
         Option<unsafe extern "C" fn(self_: *mut cef_app_t) -> *mut cef_resource_bundle_handler_t>,
     pub get_browser_process_handler:
@@ -399,4 +610,10 @@ pub type cef_browser_host_create_browser_fn = unsafe extern "C" fn(
     settings: *const cef_browser_settings_t,
     extra_info: *mut cef_dictionary_value_t,
     request_context: *mut cef_request_context_t,
+) -> c_int;
+
+pub type cef_register_scheme_handler_factory_fn = unsafe extern "C" fn(
+    scheme_name: *const cef_string_t,
+    domain_name: *const cef_string_t,
+    factory: *mut cef_scheme_handler_factory_t,
 ) -> c_int;
