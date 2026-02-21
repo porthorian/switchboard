@@ -9,7 +9,7 @@ use switchboard_core::{
 use crate::bridge::UiCommand;
 use crate::host::{install_ui_command_handler, CefHost, ContentViewId, UiViewId, WindowId};
 
-const UI_SHELL_URL: &str = "app://ui";
+const UI_SHELL_URL_BASE: &str = "app://ui";
 
 #[derive(Debug)]
 pub enum RuntimeError<HError> {
@@ -49,8 +49,9 @@ impl<H: CefHost + 'static> AppRuntime<H> {
         let window_id = host
             .create_window("Switchboard")
             .map_err(RuntimeError::Host)?;
+        let ui_shell_url = format!("{UI_SHELL_URL_BASE}?v={}", std::process::id());
         let ui_view_id = host
-            .create_ui_view(window_id, UI_SHELL_URL)
+            .create_ui_view(window_id, &ui_shell_url)
             .map_err(RuntimeError::Host)?;
 
         let ui_ready = UiCommand::UiReady {
@@ -234,7 +235,7 @@ mod tests {
         ));
         assert!(matches!(
             &runtime.host().events()[1],
-            HostEvent::UiViewCreated { url, .. } if url == "app://ui"
+            HostEvent::UiViewCreated { url, .. } if url.starts_with("app://ui")
         ));
     }
 

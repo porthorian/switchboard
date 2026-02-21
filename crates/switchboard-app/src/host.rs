@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 use switchboard_core::TabId;
 
 use crate::bridge::UiCommand;
@@ -235,11 +237,13 @@ const WINDOW_WIDTH: f64 = 1280.0;
 #[cfg(target_os = "macos")]
 const WINDOW_HEIGHT: f64 = 840.0;
 #[cfg(target_os = "macos")]
-const UI_WIDTH: f64 = 320.0;
+const UI_TOP_HEIGHT: f64 = 44.0;
 #[cfg(target_os = "macos")]
-const CONTENT_WIDTH: f64 = WINDOW_WIDTH - UI_WIDTH;
+const UI_LEFT_WIDTH: f64 = 180.0;
 #[cfg(target_os = "macos")]
-const CONTENT_HEIGHT: f64 = WINDOW_HEIGHT;
+const CONTENT_WIDTH: f64 = WINDOW_WIDTH - UI_LEFT_WIDTH;
+#[cfg(target_os = "macos")]
+const CONTENT_HEIGHT: f64 = WINDOW_HEIGHT - UI_TOP_HEIGHT;
 #[cfg(target_os = "macos")]
 const DEFAULT_BACKGROUND_COLOR: u32 = 0xFF_FF_FF_FF;
 #[cfg(target_os = "macos")]
@@ -278,17 +282,19 @@ const STYLE_MINIATURIZABLE: u64 = 1 << 2;
 #[cfg(target_os = "macos")]
 const STYLE_RESIZABLE: u64 = 1 << 3;
 #[cfg(target_os = "macos")]
+const STYLE_FULL_SIZE_CONTENT_VIEW: u64 = 1 << 15;
+#[cfg(target_os = "macos")]
 const BACKING_STORE_BUFFERED: u64 = 2;
 #[cfg(target_os = "macos")]
 const APP_ACTIVATION_POLICY_REGULAR: i64 = 0;
 #[cfg(target_os = "macos")]
-const NS_VIEW_WIDTH_SIZABLE: u64 = 2;
+const WINDOW_TITLE_HIDDEN: i64 = 1;
 #[cfg(target_os = "macos")]
-const NS_VIEW_MAX_X_MARGIN: u64 = 4;
+const NS_VIEW_WIDTH_SIZABLE: u64 = 2;
 #[cfg(target_os = "macos")]
 const NS_VIEW_HEIGHT_SIZABLE: u64 = 16;
 #[cfg(target_os = "macos")]
-const UI_VIEW_AUTORE_SIZE_MASK: u64 = NS_VIEW_MAX_X_MARGIN | NS_VIEW_HEIGHT_SIZABLE;
+const UI_VIEW_AUTORE_SIZE_MASK: u64 = NS_VIEW_WIDTH_SIZABLE | NS_VIEW_HEIGHT_SIZABLE;
 #[cfg(target_os = "macos")]
 const CONTENT_VIEW_AUTORE_SIZE_MASK: u64 = NS_VIEW_WIDTH_SIZABLE | NS_VIEW_HEIGHT_SIZABLE;
 #[cfg(target_os = "macos")]
@@ -302,43 +308,25 @@ const UI_SCHEME_OPTIONS: u32 = CEF_SCHEME_OPTION_STANDARD
     | CEF_SCHEME_OPTION_FETCH_ENABLED
     | CEF_SCHEME_OPTION_DISPLAY_ISOLATED;
 #[cfg(target_os = "macos")]
-const UI_SHELL_HTML: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Switchboard</title>
-  <style>
-    :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; }
-    body { margin: 0; padding: 12px; background: #111827; color: #f9fafb; }
-    h1 { margin: 0 0 10px; font-size: 15px; letter-spacing: 0.02em; }
-    .row { display: flex; gap: 8px; margin-bottom: 8px; }
-    input { flex: 1; padding: 8px; border: 1px solid #374151; border-radius: 8px; background: #1f2937; color: #f9fafb; }
-    button { padding: 8px 10px; border: 1px solid #4b5563; border-radius: 8px; background: #2563eb; color: #fff; cursor: pointer; }
-    p { margin: 0; font-size: 12px; color: #cbd5e1; }
-  </style>
-</head>
-<body>
-  <h1>Switchboard UI</h1>
-  <div class="row">
-    <input id="url" value="https://example.com" autocomplete="off">
-    <button id="go" type="button">Go</button>
-  </div>
-  <p>Prompt bridge uses a strict allowlist in Rust.</p>
-  <script>
-    const marker = "__switchboard_intent__";
-    const input = document.getElementById("url");
-    const go = document.getElementById("go");
-    function send(payload) { window.prompt(marker, payload); }
-    go.addEventListener("click", () => {
-      const url = (input.value || "").trim();
-      if (url) send(`navigate ${url}`);
-    });
-    send("ui_ready 0.1.0-dev");
-  </script>
-</body>
-</html>
-"#;
+const UI_SHELL_TEMPLATE_HTML: &str = include_str!("ui_shell.html");
+#[cfg(target_os = "macos")]
+const UI_SHELL_CSS: &str = include_str!("ui_shell.css");
+#[cfg(target_os = "macos")]
+const UI_SHELL_JS: &str = include_str!("ui_shell.js");
+#[cfg(target_os = "macos")]
+static UI_SHELL_BODY_BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn ui_shell_body() -> &'static [u8] {
+    UI_SHELL_BODY_BYTES
+        .get_or_init(|| {
+            UI_SHELL_TEMPLATE_HTML
+                .replace("/* __SWITCHBOARD_UI_SHELL_CSS__ */", UI_SHELL_CSS)
+                .replace("// __SWITCHBOARD_UI_SHELL_JS__", UI_SHELL_JS)
+                .into_bytes()
+        })
+        .as_slice()
+}
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
@@ -805,7 +793,7 @@ unsafe extern "C" fn switchboard_resource_handler_get_response_headers(
     _redirect_url: *mut cef_string_t,
 ) {
     if !response_length.is_null() {
-        *response_length = UI_SHELL_HTML.as_bytes().len() as i64;
+        *response_length = ui_shell_body().len() as i64;
     }
     if response.is_null() {
         return;
@@ -828,6 +816,26 @@ unsafe extern "C" fn switchboard_resource_handler_get_response_headers(
             set_charset(response, value);
         });
     }
+    if let Some(set_header_by_name) = (*response).set_header_by_name {
+        with_stack_cef_string("Cache-Control", |name| {
+            with_stack_cef_string(
+                "no-store, no-cache, must-revalidate, max-age=0",
+                |value| unsafe {
+                    set_header_by_name(response, name, value, 1);
+                },
+            );
+        });
+        with_stack_cef_string("Pragma", |name| {
+            with_stack_cef_string("no-cache", |value| unsafe {
+                set_header_by_name(response, name, value, 1);
+            });
+        });
+        with_stack_cef_string("Expires", |name| {
+            with_stack_cef_string("0", |value| unsafe {
+                set_header_by_name(response, name, value, 1);
+            });
+        });
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -847,7 +855,7 @@ unsafe extern "C" fn switchboard_resource_handler_skip(
         }
         return 1;
     }
-    let total = UI_SHELL_HTML.as_bytes().len();
+    let total = ui_shell_body().len();
     let remaining = total.saturating_sub((*this).offset);
     let to_skip = (bytes_to_skip as usize).min(remaining);
     (*this).offset += to_skip;
@@ -872,7 +880,7 @@ unsafe extern "C" fn switchboard_resource_handler_read(
         return 0;
     }
     let this = self_ as *mut SwitchboardUiResourceHandler;
-    let body = UI_SHELL_HTML.as_bytes();
+    let body = ui_shell_body();
     let remaining = body.len().saturating_sub((*this).offset);
     if remaining == 0 {
         if !bytes_read.is_null() {
@@ -1544,7 +1552,11 @@ impl CefHost for NativeMacHost {
 
     fn create_window(&mut self, title: &str) -> Result<WindowId, Self::Error> {
         unsafe {
-            let style = STYLE_TITLED | STYLE_CLOSABLE | STYLE_MINIATURIZABLE | STYLE_RESIZABLE;
+            let style = STYLE_TITLED
+                | STYLE_CLOSABLE
+                | STYLE_MINIATURIZABLE
+                | STYLE_RESIZABLE
+                | STYLE_FULL_SIZE_CONTENT_VIEW;
             let frame = NSRect {
                 origin: NSPoint { x: 0.0, y: 0.0 },
                 size: NSSize {
@@ -1567,6 +1579,9 @@ impl CefHost for NativeMacHost {
                 return Err(HostError::Native("failed to create NSWindow".to_owned()));
             }
 
+            msg_send_void_bool(window, selector("setTitlebarAppearsTransparent:")?, YES);
+            msg_send_void_i64(window, selector("setTitleVisibility:")?, WINDOW_TITLE_HIDDEN);
+            msg_send_void_bool(window, selector("setMovableByWindowBackground:")?, YES);
             msg_send_void(window, selector("center")?);
             let title_value = nsstring(title)?;
             msg_send_void_id(window, selector("setTitle:")?, title_value);
@@ -1604,7 +1619,7 @@ impl CefHost for NativeMacHost {
             let frame = NSRect {
                 origin: NSPoint { x: 0.0, y: 0.0 },
                 size: NSSize {
-                    width: UI_WIDTH,
+                    width: WINDOW_WIDTH,
                     height: WINDOW_HEIGHT,
                 },
             };
@@ -1619,7 +1634,7 @@ impl CefHost for NativeMacHost {
             );
 
             msg_send_void_id(root_view, selector("addSubview:")?, ui_view);
-            cef.create_browser_in_view(ui_view, url, cef.ui_client(), UI_WIDTH, WINDOW_HEIGHT)?;
+            cef.create_browser_in_view(ui_view, url, cef.ui_client(), WINDOW_WIDTH, WINDOW_HEIGHT)?;
 
             self.next_ui_view_id += 1;
             let view_id = UiViewId(self.next_ui_view_id);
@@ -1647,7 +1662,7 @@ impl CefHost for NativeMacHost {
             msg_send_void_bool(root_view, selector("setAutoresizesSubviews:")?, YES);
             let frame = NSRect {
                 origin: NSPoint {
-                    x: UI_WIDTH,
+                    x: UI_LEFT_WIDTH,
                     y: 0.0,
                 },
                 size: NSSize {
