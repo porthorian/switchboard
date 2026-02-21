@@ -92,9 +92,11 @@ pub trait CefHost {
 }
 
 pub type UiCommandHandler = Box<dyn FnMut(UiCommand) + 'static>;
+pub type UiStateProvider = Box<dyn FnMut() -> String + 'static>;
 
 thread_local! {
     static UI_COMMAND_HANDLER: RefCell<Option<UiCommandHandler>> = RefCell::new(None);
+    static UI_STATE_PROVIDER: RefCell<Option<UiStateProvider>> = RefCell::new(None);
     static ACTIVE_CONTENT_URI: RefCell<Option<String>> = const { RefCell::new(None) };
     #[cfg(target_os = "macos")]
     static ACTIVE_CONTENT_BROWSER: RefCell<*mut cef_browser_t> = const { RefCell::new(std::ptr::null_mut()) };
@@ -106,12 +108,29 @@ pub fn install_ui_command_handler(handler: Option<UiCommandHandler>) {
     });
 }
 
+pub fn install_ui_state_provider(provider: Option<UiStateProvider>) {
+    UI_STATE_PROVIDER.with(|slot| {
+        *slot.borrow_mut() = provider;
+    });
+}
+
 fn emit_ui_command(command: UiCommand) {
     UI_COMMAND_HANDLER.with(|slot| {
         if let Some(handler) = slot.borrow_mut().as_mut() {
             handler(command);
         }
     });
+}
+
+fn query_ui_shell_state() -> String {
+    UI_STATE_PROVIDER.with(|slot| {
+        let mut slot_ref = slot.borrow_mut();
+        if let Some(provider) = slot_ref.as_mut() {
+            return provider();
+        }
+        "{\"revision\":0,\"active_profile_id\":null,\"profiles\":[],\"workspaces\":[],\"tabs\":[]}"
+            .to_owned()
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -268,7 +287,7 @@ const WINDOW_HEIGHT: f64 = 840.0;
 #[cfg(target_os = "macos")]
 const UI_TOP_HEIGHT: f64 = 44.0;
 #[cfg(target_os = "macos")]
-const UI_LEFT_WIDTH: f64 = 180.0;
+const UI_LEFT_WIDTH: f64 = 320.0;
 #[cfg(target_os = "macos")]
 const CONTENT_WIDTH: f64 = WINDOW_WIDTH - UI_LEFT_WIDTH;
 #[cfg(target_os = "macos")]
@@ -689,6 +708,7 @@ fn allocate_cef_app() -> *mut cef_app_t {
 enum UiPromptAction {
     Intent(UiCommand),
     QueryActiveUri,
+    QueryShellState,
     UiReady,
 }
 
@@ -697,6 +717,50 @@ fn parse_ui_prompt_payload(payload: &str) -> Result<UiPromptAction, &'static str
     let trimmed = payload.trim();
     if trimmed == "query_active_uri" {
         return Ok(UiPromptAction::QueryActiveUri);
+    }
+    if trimmed == "query_shell_state" {
+        return Ok(UiPromptAction::QueryShellState);
+    }
+    if let Some(raw_name) = trimmed.strip_prefix("new_workspace ") {
+        let name = raw_name.trim();
+        if name.is_empty() {
+            return Err("workspace name cannot be empty");
+        }
+        return Ok(UiPromptAction::Intent(UiCommand::NewWorkspace {
+            name: name.to_owned(),
+        }));
+    }
+    if trimmed == "new_workspace" {
+        return Ok(UiPromptAction::Intent(UiCommand::NewWorkspace {
+            name: "New Workspace".to_owned(),
+        }));
+    }
+    if let Some(value) = trimmed.strip_prefix("switch_workspace ") {
+        let workspace_id = value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "switch_workspace requires a numeric workspace id")?;
+        return Ok(UiPromptAction::Intent(UiCommand::SwitchWorkspace {
+            workspace_id,
+        }));
+    }
+    if let Some(value) = trimmed.strip_prefix("activate_tab ") {
+        let tab_id = value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "activate_tab requires a numeric tab id")?;
+        return Ok(UiPromptAction::Intent(UiCommand::ActivateTab { tab_id }));
+    }
+    if let Some(value) = trimmed.strip_prefix("new_tab ") {
+        let workspace_id = value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "new_tab requires a numeric workspace id")?;
+        return Ok(UiPromptAction::Intent(UiCommand::NewTab {
+            workspace_id,
+            url: None,
+            make_active: true,
+        }));
     }
     if let Some(url) = trimmed.strip_prefix("navigate ") {
         let normalized = url.trim();
@@ -748,6 +812,25 @@ unsafe extern "C" fn switchboard_ui_on_jsdialog(
                 *suppress_message = 1;
             }
             0
+        }
+        Ok(UiPromptAction::QueryShellState) => {
+            if callback.is_null() {
+                if !suppress_message.is_null() {
+                    *suppress_message = 1;
+                }
+                return 0;
+            }
+            let Some(cont) = (*callback).cont else {
+                if !suppress_message.is_null() {
+                    *suppress_message = 1;
+                }
+                return 0;
+            };
+            let json = query_ui_shell_state();
+            with_stack_cef_string(&json, |value| unsafe {
+                cont(callback, 1, value);
+            });
+            1
         }
         Ok(UiPromptAction::QueryActiveUri) => {
             if callback.is_null() {

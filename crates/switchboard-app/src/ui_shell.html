@@ -20,14 +20,17 @@
       <div class="titlebar-pad"></div>
     </div>
   </div>
-  <div class="leftpane">
-    <div class="section">Workspace</div>
-    <button class="tab-pill">YouTube</button>
-    <button class="tab-pill">Example</button>
-    <button class="tab-pill">Rust Docs</button>
-    <div class="left-meta">
-      <div>Prompt bridge uses a strict allowlist in Rust.</div>
-      <div id="current" class="current"></div>
+  <div class="leftshell">
+    <div class="workspace-rail">
+      <div id="workspace-list" class="workspace-list"></div>
+      <button id="workspace-new" class="workspace-new" type="button" aria-label="New Workspace">+</button>
+    </div>
+    <div class="tab-pane">
+      <div class="tab-pane-header">
+        <div id="workspace-title" class="workspace-title">Workspace</div>
+      </div>
+      <div id="tab-list" class="tab-list"></div>
+      <button id="tab-new" class="tab-new" type="button">+ New Page</button>
     </div>
   </div>
   <script>

@@ -3,11 +3,15 @@ use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
 use switchboard_core::{
-    BrowserState, Engine, EngineError, Intent, NoopPersistence, Patch, TabId, WorkspaceId,
+    BrowserState, Engine, EngineError, Intent, NoopPersistence, Patch, ProfileId, TabId,
+    WorkspaceId,
 };
 
 use crate::bridge::UiCommand;
-use crate::host::{install_ui_command_handler, CefHost, ContentViewId, UiViewId, WindowId};
+use crate::host::{
+    install_ui_command_handler, install_ui_state_provider, CefHost, ContentViewId, UiViewId,
+    WindowId,
+};
 
 const UI_SHELL_URL_BASE: &str = "app://ui";
 
@@ -15,7 +19,8 @@ const UI_SHELL_URL_BASE: &str = "app://ui";
 pub enum RuntimeError<HError> {
     Host(HError),
     Engine(EngineError<Infallible>),
-    NoActiveTab,
+    NoActiveWorkspace,
+    NoActiveProfile,
     WorkspaceNotFound(WorkspaceId),
     TabNotFound(TabId),
     BlockedContentNavigation(String),
@@ -102,9 +107,13 @@ impl<H: CefHost + 'static> AppRuntime<H> {
                 eprintln!("switchboard-app: UI command failed: {error}");
             }
         })));
+        install_ui_state_provider(Some(Box::new(move || unsafe {
+            (*runtime_ptr).ui_shell_state_json()
+        })));
 
         let result = self.host.run_event_loop().map_err(RuntimeError::Host);
         install_ui_command_handler(None);
+        install_ui_state_provider(None);
         result
     }
 
@@ -114,16 +123,38 @@ impl<H: CefHost + 'static> AppRuntime<H> {
     ) -> Result<Patch, RuntimeError<H::Error>> {
         match command {
             UiCommand::NavigateActive { url } => {
-                let tab_id = self
-                    .resolve_active_tab_id()
-                    .ok_or(RuntimeError::NoActiveTab)?;
-                self.handle_intent(Intent::Navigate { tab_id, url })
+                if let Some(tab_id) = self.resolve_active_tab_id() {
+                    return self.handle_intent(Intent::Navigate { tab_id, url });
+                }
+                let workspace_id = self
+                    .resolve_active_workspace_id()
+                    .ok_or(RuntimeError::NoActiveWorkspace)?;
+                self.handle_intent(Intent::NewTab {
+                    workspace_id,
+                    url: Some(url),
+                    make_active: true,
+                })
+            }
+            UiCommand::NewWorkspace { name } => {
+                let profile_id = self
+                    .resolve_active_profile_id()
+                    .ok_or(RuntimeError::NoActiveProfile)?;
+                self.handle_intent(Intent::NewWorkspace { profile_id, name })
             }
             other => self.handle_intent(other.into_intent()),
         }
     }
 
     pub fn handle_intent(&mut self, intent: Intent) -> Result<Patch, RuntimeError<H::Error>> {
+        let should_sync_active_content = matches!(
+            &intent,
+            Intent::NewTab {
+                make_active: true,
+                ..
+            } | Intent::ActivateTab { .. }
+                | Intent::SwitchWorkspace { .. }
+                | Intent::SwitchProfile { .. }
+        );
         let navigation = match &intent {
             Intent::Navigate { tab_id, url } => {
                 if url.starts_with("app://") {
@@ -138,6 +169,10 @@ impl<H: CefHost + 'static> AppRuntime<H> {
 
         if let Some((tab_id, url)) = navigation {
             self.ensure_single_content_view(tab_id, &url)?;
+        } else if should_sync_active_content {
+            if let Some((tab_id, url)) = self.resolve_active_tab_target() {
+                self.ensure_single_content_view(tab_id, &url)?;
+            }
         }
 
         Ok(patch)
@@ -156,6 +191,123 @@ impl<H: CefHost + 'static> AppRuntime<H> {
         let profile_id = state.active_profile_id?;
         let workspace_id = state.profiles.get(&profile_id)?.active_workspace_id?;
         state.workspaces.get(&workspace_id)?.active_tab_id
+    }
+
+    fn resolve_active_workspace_id(&self) -> Option<WorkspaceId> {
+        let state = self.engine.state();
+        let profile_id = state.active_profile_id?;
+        state.profiles.get(&profile_id)?.active_workspace_id
+    }
+
+    fn resolve_active_tab_target(&self) -> Option<(TabId, String)> {
+        let tab_id = self.resolve_active_tab_id()?;
+        let url = self.engine.state().tabs.get(&tab_id)?.url.clone();
+        Some((tab_id, url))
+    }
+
+    fn resolve_active_profile_id(&self) -> Option<ProfileId> {
+        self.engine.state().active_profile_id
+    }
+
+    pub fn ui_shell_state_json(&self) -> String {
+        let state = self.engine.state();
+        let mut json = String::new();
+        json.push('{');
+        json.push_str("\"revision\":");
+        json.push_str(&self.revision().to_string());
+        json.push(',');
+        json.push_str("\"active_profile_id\":");
+        match state.active_profile_id {
+            Some(profile_id) => json.push_str(&profile_id.0.to_string()),
+            None => json.push_str("null"),
+        }
+        json.push(',');
+        json.push_str("\"profiles\":[");
+        let mut first = true;
+        for profile in state.profiles.values() {
+            if !first {
+                json.push(',');
+            }
+            first = false;
+            json.push('{');
+            json.push_str("\"id\":");
+            json.push_str(&profile.id.0.to_string());
+            json.push(',');
+            json.push_str("\"name\":");
+            push_json_string(&mut json, &profile.name);
+            json.push(',');
+            json.push_str("\"active_workspace_id\":");
+            match profile.active_workspace_id {
+                Some(workspace_id) => json.push_str(&workspace_id.0.to_string()),
+                None => json.push_str("null"),
+            }
+            json.push(',');
+            json.push_str("\"workspace_order\":[");
+            for (index, workspace_id) in profile.workspace_order.iter().enumerate() {
+                if index > 0 {
+                    json.push(',');
+                }
+                json.push_str(&workspace_id.0.to_string());
+            }
+            json.push_str("]}");
+        }
+        json.push_str("],");
+        json.push_str("\"workspaces\":[");
+        let mut first = true;
+        for workspace in state.workspaces.values() {
+            if !first {
+                json.push(',');
+            }
+            first = false;
+            json.push('{');
+            json.push_str("\"id\":");
+            json.push_str(&workspace.id.0.to_string());
+            json.push(',');
+            json.push_str("\"profile_id\":");
+            json.push_str(&workspace.profile_id.0.to_string());
+            json.push(',');
+            json.push_str("\"name\":");
+            push_json_string(&mut json, &workspace.name);
+            json.push(',');
+            json.push_str("\"active_tab_id\":");
+            match workspace.active_tab_id {
+                Some(tab_id) => json.push_str(&tab_id.0.to_string()),
+                None => json.push_str("null"),
+            }
+            json.push(',');
+            json.push_str("\"tab_order\":[");
+            for (index, tab_id) in workspace.tab_order.iter().enumerate() {
+                if index > 0 {
+                    json.push(',');
+                }
+                json.push_str(&tab_id.0.to_string());
+            }
+            json.push_str("]}");
+        }
+        json.push_str("],");
+        json.push_str("\"tabs\":[");
+        let mut first = true;
+        for tab in state.tabs.values() {
+            if !first {
+                json.push(',');
+            }
+            first = false;
+            json.push('{');
+            json.push_str("\"id\":");
+            json.push_str(&tab.id.0.to_string());
+            json.push(',');
+            json.push_str("\"workspace_id\":");
+            json.push_str(&tab.workspace_id.0.to_string());
+            json.push(',');
+            json.push_str("\"url\":");
+            push_json_string(&mut json, &tab.url);
+            json.push(',');
+            json.push_str("\"title\":");
+            push_json_string(&mut json, &tab.title);
+            json.push_str("}");
+        }
+        json.push_str("]}");
+        json
     }
 
     fn ensure_single_content_view(
@@ -200,7 +352,10 @@ impl<HError: Display> Display for RuntimeError<HError> {
         match self {
             Self::Host(err) => write!(f, "host error: {err}"),
             Self::Engine(err) => write!(f, "engine error: {err:?}"),
-            Self::NoActiveTab => write!(f, "no active tab available for UI navigation"),
+            Self::NoActiveWorkspace => {
+                write!(f, "no active workspace available for UI navigation")
+            }
+            Self::NoActiveProfile => write!(f, "no active profile available for UI command"),
             Self::WorkspaceNotFound(workspace_id) => {
                 write!(f, "workspace not found: {workspace_id}")
             }
@@ -213,6 +368,29 @@ impl<HError: Display> Display for RuntimeError<HError> {
 }
 
 impl<HError: Error + 'static> Error for RuntimeError<HError> {}
+
+fn push_json_string(json: &mut String, value: &str) {
+    json.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => json.push_str("\\\""),
+            '\\' => json.push_str("\\\\"),
+            '\n' => json.push_str("\\n"),
+            '\r' => json.push_str("\\r"),
+            '\t' => json.push_str("\\t"),
+            '\u{08}' => json.push_str("\\b"),
+            '\u{0c}' => json.push_str("\\f"),
+            c if c <= '\u{1f}' => {
+                let code = c as u32;
+                json.push_str("\\u");
+                let hex = format!("{code:04x}");
+                json.push_str(&hex);
+            }
+            c => json.push(c),
+        }
+    }
+    json.push('"');
+}
 
 #[cfg(test)]
 mod tests {
@@ -283,7 +461,7 @@ mod tests {
             .count();
 
         assert_eq!(content_create_count, 1);
-        assert_eq!(content_navigate_count, 1);
+        assert_eq!(content_navigate_count, 2);
     }
 
     #[test]
@@ -342,5 +520,89 @@ mod tests {
             .count();
 
         assert_eq!(content_create_count, 1);
+    }
+
+    #[test]
+    fn navigate_active_creates_tab_for_empty_workspace() {
+        let host = MockCefHost::default();
+        let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
+        let initial_workspace_id = runtime.default_workspace_id();
+
+        runtime
+            .handle_ui_command(UiCommand::NewWorkspace {
+                name: "Workspace 2".to_owned(),
+            })
+            .expect("new workspace should succeed");
+
+        let second_workspace_id = runtime
+            .engine()
+            .state()
+            .workspaces
+            .values()
+            .find(|workspace| workspace.id != initial_workspace_id)
+            .map(|workspace| workspace.id)
+            .expect("second workspace should exist");
+
+        runtime
+            .handle_ui_command(UiCommand::SwitchWorkspace {
+                workspace_id: second_workspace_id.0,
+            })
+            .expect("switch workspace should succeed");
+        runtime
+            .handle_ui_command(UiCommand::NavigateActive {
+                url: "https://example.com".to_owned(),
+            })
+            .expect("navigate active should create a tab");
+
+        let active_tab_id = runtime
+            .active_tab_id(second_workspace_id)
+            .expect("new tab should be active in second workspace");
+        let active_tab = runtime
+            .engine()
+            .state()
+            .tabs
+            .get(&active_tab_id)
+            .expect("new tab should exist");
+        assert_eq!(active_tab.url, "https://example.com");
+    }
+
+    #[test]
+    fn activate_tab_updates_content_view_to_selected_tab() {
+        let host = MockCefHost::default();
+        let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
+        let workspace_id = runtime.default_workspace_id();
+
+        runtime
+            .handle_ui_command(UiCommand::NewTab {
+                workspace_id: workspace_id.0,
+                url: Some("https://one.example".to_owned()),
+                make_active: true,
+            })
+            .expect("first tab should succeed");
+        let first_tab_id = runtime
+            .active_tab_id(workspace_id)
+            .expect("first tab should be active");
+
+        runtime
+            .handle_ui_command(UiCommand::NewTab {
+                workspace_id: workspace_id.0,
+                url: Some("https://two.example".to_owned()),
+                make_active: true,
+            })
+            .expect("second tab should succeed");
+
+        runtime
+            .handle_ui_command(UiCommand::ActivateTab {
+                tab_id: first_tab_id.0,
+            })
+            .expect("activate tab should succeed");
+
+        let content_navigate_count = runtime
+            .host()
+            .events()
+            .iter()
+            .filter(|event| matches!(event, HostEvent::ContentNavigated { .. }))
+            .count();
+        assert_eq!(content_navigate_count, 2);
     }
 }

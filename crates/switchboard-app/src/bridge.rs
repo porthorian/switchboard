@@ -17,6 +17,15 @@ pub enum UiCommand {
     NavigateActive {
         url: String,
     },
+    NewWorkspace {
+        name: String,
+    },
+    SwitchWorkspace {
+        workspace_id: u64,
+    },
+    ActivateTab {
+        tab_id: u64,
+    },
 }
 
 impl UiCommand {
@@ -41,6 +50,17 @@ impl UiCommand {
                     "NavigateActive requires runtime tab resolution before intent dispatch"
                 )
             }
+            Self::NewWorkspace { .. } => {
+                unreachable!(
+                    "NewWorkspace requires runtime profile resolution before intent dispatch"
+                )
+            }
+            Self::SwitchWorkspace { workspace_id } => Intent::SwitchWorkspace {
+                workspace_id: WorkspaceId(workspace_id),
+            },
+            Self::ActivateTab { tab_id } => Intent::ActivateTab {
+                tab_id: TabId(tab_id),
+            },
         }
     }
 }
