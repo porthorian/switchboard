@@ -158,4 +158,25 @@ impl BrowserState {
         self.next_profile_id += 1;
         id
     }
+
+    pub fn recompute_next_ids(&mut self) {
+        self.next_profile_id = self
+            .profiles
+            .keys()
+            .next_back()
+            .map(|id| id.0.saturating_add(1))
+            .unwrap_or(1);
+        self.next_workspace_id = self
+            .workspaces
+            .keys()
+            .next_back()
+            .map(|id| id.0.saturating_add(1))
+            .unwrap_or(1);
+        self.next_tab_id = self
+            .tabs
+            .keys()
+            .next_back()
+            .map(|id| id.0.saturating_add(1))
+            .unwrap_or(1);
+    }
 }

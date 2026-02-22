@@ -1,26 +1,43 @@
-use std::convert::Infallible;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
 use switchboard_core::{
-    BrowserState, Engine, EngineError, Intent, NoopPersistence, Patch, PatchOp, ProfileId, TabId,
+    BrowserState, Engine, EngineError, Intent, Patch, PatchOp, ProfileId, TabRuntimeState, TabId,
     WorkspaceId,
 };
+#[cfg(test)]
+use std::convert::Infallible;
+#[cfg(test)]
+use switchboard_core::NoopPersistence;
 
 use crate::bridge::UiCommand;
 use crate::host::{
     install_content_event_handler, install_ui_command_handler, install_ui_state_provider, CefHost,
     ContentEvent, ContentViewId, UiViewId, WindowId,
 };
+#[cfg(not(test))]
+use crate::persistence::{AppPersistence, AppPersistenceError};
 
 const UI_SHELL_URL_BASE: &str = "app://ui";
 const THUMBNAIL_MAX_ENTRIES: usize = 120;
 
+#[cfg(test)]
+type RuntimePersistence = NoopPersistence;
+#[cfg(not(test))]
+type RuntimePersistence = AppPersistence;
+
+#[cfg(test)]
+type RuntimePersistenceError = Infallible;
+#[cfg(not(test))]
+type RuntimePersistenceError = AppPersistenceError;
+
 #[derive(Debug)]
+#[cfg_attr(test, allow(dead_code))]
 pub enum RuntimeError<HError> {
+    PersistenceInit(String),
     Host(HError),
-    Engine(EngineError<Infallible>),
+    Engine(EngineError<RuntimePersistenceError>),
     NoActiveWorkspace,
     NoActiveProfile,
     WorkspaceNotFound(WorkspaceId),
@@ -35,7 +52,7 @@ struct ContentBinding {
 }
 
 pub struct AppRuntime<H: CefHost> {
-    engine: Engine<NoopPersistence>,
+    engine: Engine<RuntimePersistence>,
     host: H,
     window_id: WindowId,
     ui_view_id: UiViewId,
@@ -46,13 +63,22 @@ pub struct AppRuntime<H: CefHost> {
 
 impl<H: CefHost + 'static> AppRuntime<H> {
     pub fn bootstrap(mut host: H, ui_version: &str) -> Result<Self, RuntimeError<H::Error>> {
-        let mut state = BrowserState::default();
-        let profile_id = state.add_profile("Default");
-        let workspace_id = state
-            .add_workspace(profile_id, "Workspace 1")
-            .expect("bootstrap profile must exist");
+        #[cfg(test)]
+        let (persistence, mut state) = (NoopPersistence, BrowserState::default());
 
-        let mut engine = Engine::with_state(NoopPersistence, state, 0);
+        #[cfg(not(test))]
+        let (persistence, mut state) = {
+            let mut persistence = AppPersistence::open_default()
+                .map_err(|error| RuntimeError::PersistenceInit(error.to_string()))?;
+            let state = persistence
+                .load_state()
+                .map_err(|error| RuntimeError::PersistenceInit(error.to_string()))?
+                .unwrap_or_default();
+            (persistence, state)
+        };
+
+        let workspace_id = ensure_bootstrap_state(&mut state);
+        let mut engine = Engine::with_state(persistence, state, 0);
 
         let window_id = host
             .create_window("Switchboard")
@@ -92,8 +118,12 @@ impl<H: CefHost + 'static> AppRuntime<H> {
         self.engine.revision()
     }
 
-    pub fn engine(&self) -> &Engine<NoopPersistence> {
+    pub fn engine(&self) -> &Engine<RuntimePersistence> {
         &self.engine
+    }
+
+    pub fn has_tabs(&self) -> bool {
+        !self.engine.state().tabs.is_empty()
     }
 
     #[cfg(test)]
@@ -537,9 +567,119 @@ impl<H: CefHost + 'static> AppRuntime<H> {
     }
 }
 
+fn ensure_bootstrap_state(state: &mut BrowserState) -> WorkspaceId {
+    if state.profiles.is_empty() {
+        let profile_id = state.add_profile("Default");
+        let workspace_id = state
+            .add_workspace(profile_id, "Workspace 1")
+            .expect("bootstrap profile must exist");
+        state.recompute_next_ids();
+        return workspace_id;
+    }
+
+    state.recompute_next_ids();
+
+    if state
+        .active_profile_id
+        .map(|profile_id| !state.profiles.contains_key(&profile_id))
+        .unwrap_or(true)
+    {
+        state.active_profile_id = state.profiles.keys().next().copied();
+    }
+
+    let profile_ids: Vec<ProfileId> = state.profiles.keys().copied().collect();
+    for profile_id in profile_ids {
+        let mut workspace_order = state
+            .workspaces
+            .iter()
+            .filter(|(_, workspace)| workspace.profile_id == profile_id)
+            .map(|(workspace_id, _)| *workspace_id)
+            .collect::<Vec<_>>();
+        workspace_order.sort();
+
+        if let Some(profile) = state.profiles.get_mut(&profile_id) {
+            if profile.workspace_order.is_empty() {
+                profile.workspace_order = workspace_order;
+            }
+            if profile
+                .active_workspace_id
+                .map(|workspace_id| !profile.workspace_order.contains(&workspace_id))
+                .unwrap_or(true)
+            {
+                profile.active_workspace_id = profile.workspace_order.first().copied();
+            }
+        }
+    }
+
+    let workspace_ids: Vec<WorkspaceId> = state.workspaces.keys().copied().collect();
+    for workspace_id in workspace_ids {
+        let mut tab_order = state
+            .tabs
+            .iter()
+            .filter(|(_, tab)| tab.workspace_id == workspace_id)
+            .map(|(tab_id, _)| *tab_id)
+            .collect::<Vec<_>>();
+        tab_order.sort();
+
+        if let Some(workspace) = state.workspaces.get_mut(&workspace_id) {
+            if workspace.tab_order.is_empty() {
+                workspace.tab_order = tab_order;
+            }
+            if workspace
+                .active_tab_id
+                .map(|tab_id| !workspace.tab_order.contains(&tab_id))
+                .unwrap_or(true)
+            {
+                workspace.active_tab_id = workspace.tab_order.first().copied();
+            }
+
+            if let Some(active_tab_id) = workspace.active_tab_id {
+                if let Some(active_tab) = state.tabs.get_mut(&active_tab_id) {
+                    active_tab.runtime_state = TabRuntimeState::Active;
+                }
+            }
+        }
+    }
+
+    if let Some(active_profile_id) = state.active_profile_id {
+        if let Some(workspace_id) = state
+            .profiles
+            .get(&active_profile_id)
+            .and_then(|profile| profile.active_workspace_id)
+        {
+            return workspace_id;
+        }
+    }
+
+    if let Some(workspace_id) = state.workspaces.keys().next().copied() {
+        let profile_id = state
+            .workspaces
+            .get(&workspace_id)
+            .map(|workspace| workspace.profile_id)
+            .expect("workspace id came from map key");
+        state.active_profile_id = Some(profile_id);
+        if let Some(profile) = state.profiles.get_mut(&profile_id) {
+            if !profile.workspace_order.contains(&workspace_id) {
+                profile.workspace_order.insert(0, workspace_id);
+            }
+            profile.active_workspace_id = Some(workspace_id);
+        }
+        return workspace_id;
+    }
+
+    let profile_id = state.active_profile_id.unwrap_or_else(|| state.add_profile("Default"));
+    let workspace_id = state
+        .add_workspace(profile_id, "Workspace 1")
+        .expect("profile must exist");
+    state.active_profile_id = Some(profile_id);
+    state.recompute_next_ids();
+    workspace_id
+}
+
 impl<HError: Display> Display for RuntimeError<HError> {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
+            Self::PersistenceInit(message) => write!(f, "persistence initialization failed: {message}"),
             Self::Host(err) => write!(f, "host error: {err}"),
             Self::Engine(err) => write!(f, "engine error: {err:?}"),
             Self::NoActiveWorkspace => {
