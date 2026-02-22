@@ -5,7 +5,7 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 #[cfg(target_os = "macos")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use switchboard_core::TabId;
 
 use crate::bridge::UiCommand;
@@ -428,6 +428,8 @@ extern "C" {}
 
 #[cfg(target_os = "macos")]
 static NSAPP_HANDLING_SEND_EVENT: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static CEF_QUIT_MESSAGE_LOOP_FN: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
@@ -740,6 +742,122 @@ fn install_nsapplication_event_shim() -> Result<(), HostError> {
             set_handling_selector,
             switchboard_nsapp_set_handling_send_event as *const c_void,
             set_encoding.as_ptr(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_cef_quit_message_loop_hook(quit: unsafe extern "C" fn()) {
+    CEF_QUIT_MESSAGE_LOOP_FN.store(quit as usize, Ordering::Release);
+}
+
+#[cfg(target_os = "macos")]
+fn clear_cef_quit_message_loop_hook() {
+    CEF_QUIT_MESSAGE_LOOP_FN.store(0, Ordering::Release);
+}
+
+#[cfg(target_os = "macos")]
+fn quit_cef_message_loop_if_available() {
+    let raw = CEF_QUIT_MESSAGE_LOOP_FN.load(Ordering::Acquire);
+    if raw == 0 {
+        return;
+    }
+    let quit: unsafe extern "C" fn() = unsafe { std::mem::transmute(raw) };
+    unsafe {
+        quit();
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_nsapp_window_should_close(
+    self_: ObjcId,
+    _cmd: ObjcSel,
+    _window: ObjcId,
+) -> i8 {
+    quit_cef_message_loop_if_available();
+    let terminate_sel = sel_registerName(b"terminate:\0".as_ptr() as *const c_char);
+    if terminate_sel != NIL {
+        msg_send_void_id(self_, terminate_sel, NIL);
+        return NO;
+    }
+    YES
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_nsapp_application_will_terminate(
+    _self: ObjcId,
+    _cmd: ObjcSel,
+    _notification: ObjcId,
+) {
+    quit_cef_message_loop_if_available();
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_nsapp_should_handle_reopen(
+    self_: ObjcId,
+    _cmd: ObjcSel,
+    _application: ObjcId,
+    has_visible_windows: i8,
+) -> i8 {
+    if has_visible_windows == NO {
+        let windows_sel = sel_registerName(b"windows\0".as_ptr() as *const c_char);
+        let count_sel = sel_registerName(b"count\0".as_ptr() as *const c_char);
+        let object_at_index_sel =
+            sel_registerName(b"objectAtIndex:\0".as_ptr() as *const c_char);
+        let make_key_and_order_front_sel =
+            sel_registerName(b"makeKeyAndOrderFront:\0".as_ptr() as *const c_char);
+        if windows_sel != NIL
+            && count_sel != NIL
+            && object_at_index_sel != NIL
+            && make_key_and_order_front_sel != NIL
+        {
+            let windows = msg_send_id(self_, windows_sel);
+            if windows != NIL && msg_send_usize(windows, count_sel) > 0 {
+                let window = msg_send_id_usize(windows, object_at_index_sel, 0);
+                if window != NIL {
+                    msg_send_void_id(window, make_key_and_order_front_sel, NIL);
+                }
+            }
+        }
+    }
+    let activate_sel = sel_registerName(b"activateIgnoringOtherApps:\0".as_ptr() as *const c_char);
+    if activate_sel != NIL {
+        msg_send_void_bool(self_, activate_sel, YES);
+    }
+    YES
+}
+
+#[cfg(target_os = "macos")]
+fn install_nsapplication_suspend_shim() -> Result<(), HostError> {
+    unsafe {
+        let app_class = objc_class("NSApplication")?;
+        let window_should_close_selector = selector("windowShouldClose:")?;
+        let should_handle_reopen_selector =
+            selector("applicationShouldHandleReopen:hasVisibleWindows:")?;
+        let will_terminate_selector = selector("applicationWillTerminate:")?;
+        let window_close_encoding = CString::new("c@:@").expect("static signature should be valid");
+        let reopen_encoding = CString::new("c@:@c").expect("static signature should be valid");
+        let will_terminate_encoding =
+            CString::new("v@:@").expect("static signature should be valid");
+
+        let _ = class_addMethod(
+            app_class,
+            window_should_close_selector,
+            switchboard_nsapp_window_should_close as *const c_void,
+            window_close_encoding.as_ptr(),
+        );
+        let _ = class_addMethod(
+            app_class,
+            should_handle_reopen_selector,
+            switchboard_nsapp_should_handle_reopen as *const c_void,
+            reopen_encoding.as_ptr(),
+        );
+        let _ = class_addMethod(
+            app_class,
+            will_terminate_selector,
+            switchboard_nsapp_application_will_terminate as *const c_void,
+            will_terminate_encoding.as_ptr(),
         );
     }
     Ok(())
@@ -1356,6 +1474,7 @@ impl CefRuntime {
                     }
                 ))
             })?;
+            install_cef_quit_message_loop_hook(library.api.cef_quit_message_loop);
             let app = allocate_cef_app();
             let requested_api_version =
                 env_i32(ENV_CEF_API_VERSION).unwrap_or(DEFAULT_CEF_API_VERSION);
@@ -1598,6 +1717,7 @@ impl CefRuntime {
         unsafe {
             (self.library.api.cef_shutdown)();
         }
+        clear_cef_quit_message_loop_hook();
     }
 }
 
@@ -1834,6 +1954,7 @@ impl NativeMacHost {
                 return Err(HostError::Native("failed to load NSApplication".to_owned()));
             }
             install_nsapplication_event_shim()?;
+            install_nsapplication_suspend_shim()?;
 
             let app_class = objc_class("NSApplication")?;
             let app = msg_send_id(app_class, selector("sharedApplication")?);
@@ -1842,6 +1963,7 @@ impl NativeMacHost {
                     "NSApplication sharedApplication returned nil".to_owned(),
                 ));
             }
+            msg_send_void_id(app, selector("setDelegate:")?, app);
 
             msg_send_void_i64(
                 app,
@@ -1909,6 +2031,7 @@ impl CefHost for NativeMacHost {
             msg_send_void_bool(window, selector("setTitlebarAppearsTransparent:")?, YES);
             msg_send_void_i64(window, selector("setTitleVisibility:")?, WINDOW_TITLE_HIDDEN);
             msg_send_void_bool(window, selector("setMovableByWindowBackground:")?, YES);
+            msg_send_void_id(window, selector("setDelegate:")?, self.app);
             msg_send_void(window, selector("center")?);
             let title_value = nsstring(title)?;
             msg_send_void_id(window, selector("setTitle:")?, title_value);
