@@ -383,6 +383,46 @@ Rust converts these into state mutations and emits patches.
 * capture + display placeholders
 * storage cap + cleanup
 
+### Milestone 7: Persistence + restore
+
+* SQLite-backed persistence for profiles/workspaces/tabs/order/active pointers
+* startup restore path that hydrates UI quickly from DB
+* crash-safe write ordering validation (mutate -> commit -> patch)
+
+### Milestone 8: Lifecycle + memory policy hardening
+
+* strict active/warm/discarded lifecycle enforcement
+* warm pool LRU budget enforcement under tab stress
+* deterministic restore-on-click behavior across workspace/profile switches
+
+### Milestone 9: Profile UX completion
+
+* full profile CRUD UX parity in shell
+* guardrails for invalid profile operations (e.g., last-profile delete)
+* keyboard-accessible create/switch/rename flows
+
+### Milestone 10: Stabilization + release readiness
+
+* integration tests for snapshot/patch revision integrity and resync
+* restart/crash recovery validation against persisted state
+* macOS packaging/signing/notarization runbook + smoke checks
+
+### Milestone 11: Settings + behavior preferences
+
+* settings surface in UI shell for browser preferences
+* configurable default search engine
+* configurable homepage/start page
+* configurable new tab behavior (blank/home/custom URL/workspace defaults)
+* persisted settings with patch-driven runtime updates
+
+### Milestone 12: Keybindings + command ergonomics
+
+* global keybinding system in UI shell + Rust intent bridge
+* default shortcuts for core actions (e.g., close active tab)
+* keyboard shortcut to focus/open navigation input (including Space in shell command mode)
+* conflict handling between content-page input and browser chrome shortcuts
+* user-configurable keybindings persisted in settings
+
 ## 16. Open Questions (Later)
 
 * Tab groups
@@ -391,4 +431,3 @@ Rust converts these into state mutations and emits patches.
 * Crash recovery beyond last committed DB transaction
 * Update mechanism and signing/notarization
 * Detailed memory pressure signals and heuristics
-
