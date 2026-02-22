@@ -188,6 +188,9 @@ function createTabButton(tab, isActive) {
   if (isActive) {
     button.classList.add("active");
   }
+  if (tab.loading) {
+    button.classList.add("loading");
+  }
 
   const icon = document.createElement("span");
   icon.className = "tab-icon";
@@ -208,6 +211,16 @@ function createTabButton(tab, isActive) {
   content.appendChild(url);
 
   button.appendChild(content);
+
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "tab-close";
+  close.dataset.tabId = String(tab.id);
+  close.setAttribute("aria-label", "Close tab");
+  close.title = "Close tab";
+  close.textContent = "×";
+  button.appendChild(close);
+
   return button;
 }
 
@@ -449,6 +462,17 @@ function handleWorkspaceClick(event) {
 }
 
 function handleTabClick(event) {
+  const closeTarget = event.target.closest(".tab-close");
+  if (closeTarget) {
+    event.preventDefault();
+    event.stopPropagation();
+    const tabId = closeTarget.dataset.tabId;
+    if (!tabId) return;
+    send(`close_tab ${tabId}`);
+    queueStateRefresh();
+    return;
+  }
+
   const target = event.target.closest(".tab-item");
   if (!target) return;
   if (target.classList.contains("active")) return;

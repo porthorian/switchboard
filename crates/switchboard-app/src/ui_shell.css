@@ -277,7 +277,7 @@ body {
   width: 100%;
   display: grid;
   align-items: center;
-  grid-template-columns: 18px minmax(0, 1fr);
+  grid-template-columns: 18px minmax(0, 1fr) 20px;
   gap: 8px;
   margin: 0;
 }
@@ -312,6 +312,16 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.tab-item.loading .tab-title::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  border-radius: 999px;
+  background: #7ea3ff;
+  vertical-align: middle;
+}
 .tab-url {
   display: block;
   margin-top: 2px;
@@ -320,6 +330,26 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.tab-close {
+  width: 20px;
+  height: 20px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: #8f9cb6;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+.tab-item:hover .tab-close,
+.tab-item.active .tab-close {
+  color: #cdd7eb;
+}
+.tab-close:hover {
+  border-color: #44506b;
+  background: #222c40;
 }
 .tab-empty {
   padding: 10px;

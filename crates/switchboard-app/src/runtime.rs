@@ -3,14 +3,14 @@ use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
 use switchboard_core::{
-    BrowserState, Engine, EngineError, Intent, NoopPersistence, Patch, ProfileId, TabId,
+    BrowserState, Engine, EngineError, Intent, NoopPersistence, Patch, PatchOp, ProfileId, TabId,
     WorkspaceId,
 };
 
 use crate::bridge::UiCommand;
 use crate::host::{
-    install_ui_command_handler, install_ui_state_provider, CefHost, ContentViewId, UiViewId,
-    WindowId,
+    install_content_event_handler, install_ui_command_handler, install_ui_state_provider, CefHost,
+    ContentEvent, ContentViewId, UiViewId, WindowId,
 };
 
 const UI_SHELL_URL_BASE: &str = "app://ui";
@@ -110,10 +110,16 @@ impl<H: CefHost + 'static> AppRuntime<H> {
         install_ui_state_provider(Some(Box::new(move || unsafe {
             (*runtime_ptr).ui_shell_state_json()
         })));
+        install_content_event_handler(Some(Box::new(move |event| unsafe {
+            if let Err(error) = (*runtime_ptr).handle_content_event(event) {
+                eprintln!("switchboard-app: content event failed: {error}");
+            }
+        })));
 
         let result = self.host.run_event_loop().map_err(RuntimeError::Host);
         install_ui_command_handler(None);
         install_ui_state_provider(None);
+        install_content_event_handler(None);
         result
     }
 
@@ -146,16 +152,6 @@ impl<H: CefHost + 'static> AppRuntime<H> {
     }
 
     pub fn handle_intent(&mut self, intent: Intent) -> Result<Patch, RuntimeError<H::Error>> {
-        let should_sync_active_content = matches!(
-            &intent,
-            Intent::NewTab {
-                make_active: true,
-                ..
-            } | Intent::ActivateTab { .. }
-                | Intent::SwitchWorkspace { .. }
-                | Intent::SwitchProfile { .. }
-                | Intent::DeleteWorkspace { .. }
-        );
         let navigation = match &intent {
             Intent::Navigate { tab_id, url } => {
                 if url.starts_with("app://") {
@@ -170,13 +166,54 @@ impl<H: CefHost + 'static> AppRuntime<H> {
 
         if let Some((tab_id, url)) = navigation {
             self.ensure_single_content_view(tab_id, &url)?;
-        } else if should_sync_active_content && !patch.ops.is_empty() {
+        } else if patch_updates_active_content(&patch) {
             if let Some((tab_id, url)) = self.resolve_active_tab_target() {
                 self.ensure_single_content_view(tab_id, &url)?;
+            } else if let Some(binding) = self.content_binding {
+                self.host
+                    .clear_content_view(binding.view_id)
+                    .map_err(RuntimeError::Host)?;
+                self.host
+                    .set_content_view_visible(binding.view_id, false)
+                    .map_err(RuntimeError::Host)?;
             }
         }
 
         Ok(patch)
+    }
+
+    pub fn handle_content_event(
+        &mut self,
+        event: ContentEvent,
+    ) -> Result<Patch, RuntimeError<H::Error>> {
+        let intent = match event {
+            ContentEvent::UrlChanged { tab_id, url } => Intent::ObserveTabUrl { tab_id, url },
+            ContentEvent::TitleChanged { tab_id, title } => Intent::ObserveTabTitle {
+                tab_id,
+                title,
+            },
+            ContentEvent::LoadingChanged { tab_id, is_loading } => Intent::ObserveTabLoading {
+                tab_id,
+                is_loading,
+            },
+        };
+
+        let tab_id = match &intent {
+            Intent::ObserveTabUrl { tab_id, .. }
+            | Intent::ObserveTabTitle { tab_id, .. }
+            | Intent::ObserveTabLoading { tab_id, .. } => *tab_id,
+            _ => unreachable!("content events always map to observe-tab intents"),
+        };
+        if !self.engine.state().tabs.contains_key(&tab_id) {
+            let revision = self.revision();
+            return Ok(Patch {
+                ops: Vec::new(),
+                from_revision: revision,
+                to_revision: revision,
+            });
+        }
+
+        self.handle_intent(intent)
     }
 
     pub fn active_tab_id(&self, workspace_id: WorkspaceId) -> Option<TabId> {
@@ -305,6 +342,9 @@ impl<H: CefHost + 'static> AppRuntime<H> {
             json.push(',');
             json.push_str("\"title\":");
             push_json_string(&mut json, &tab.title);
+            json.push(',');
+            json.push_str("\"loading\":");
+            json.push_str(if tab.loading { "true" } else { "false" });
             json.push_str("}");
         }
         json.push_str("]}");
@@ -332,6 +372,9 @@ impl<H: CefHost + 'static> AppRuntime<H> {
                 self.host
                     .navigate_content_view(binding.view_id, tab_id, url)
                     .map_err(RuntimeError::Host)?;
+                self.host
+                    .set_content_view_visible(binding.view_id, true)
+                    .map_err(RuntimeError::Host)?;
                 binding.tab_id = tab_id;
                 self.content_binding = Some(binding);
             }
@@ -339,6 +382,9 @@ impl<H: CefHost + 'static> AppRuntime<H> {
                 let view_id = self
                     .host
                     .create_content_view(self.window_id, tab_id, url)
+                    .map_err(RuntimeError::Host)?;
+                self.host
+                    .set_content_view_visible(view_id, true)
                     .map_err(RuntimeError::Host)?;
                 self.content_binding = Some(ContentBinding { view_id, tab_id });
             }
@@ -370,6 +416,17 @@ impl<HError: Display> Display for RuntimeError<HError> {
 
 impl<HError: Error + 'static> Error for RuntimeError<HError> {}
 
+fn patch_updates_active_content(patch: &Patch) -> bool {
+    patch.ops.iter().any(|op| {
+        matches!(
+            op,
+            PatchOp::SetActiveProfile { .. }
+                | PatchOp::SetActiveWorkspace { .. }
+                | PatchOp::SetActiveTab { .. }
+        )
+    })
+}
+
 fn push_json_string(json: &mut String, value: &str) {
     json.push('"');
     for ch in value.chars() {
@@ -396,7 +453,7 @@ fn push_json_string(json: &mut String, value: &str) {
 #[cfg(test)]
 mod tests {
     use crate::bridge::UiCommand;
-    use crate::host::{HostEvent, MockCefHost};
+    use crate::host::{ContentEvent, HostEvent, MockCefHost};
 
     use super::{AppRuntime, RuntimeError};
 
@@ -651,5 +708,79 @@ mod tests {
             .count();
         assert_eq!(content_create_count, 1);
         assert_eq!(content_navigate_count, 0);
+    }
+
+    #[test]
+    fn content_events_update_tab_metadata() {
+        let host = MockCefHost::default();
+        let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
+        let workspace_id = runtime.default_workspace_id();
+
+        runtime
+            .handle_ui_command(UiCommand::NewTab {
+                workspace_id: workspace_id.0,
+                url: Some("https://one.example".to_owned()),
+                make_active: true,
+            })
+            .expect("tab should be created");
+        let tab_id = runtime
+            .active_tab_id(workspace_id)
+            .expect("tab should be active");
+
+        runtime
+            .handle_content_event(ContentEvent::TitleChanged {
+                tab_id,
+                title: "One Example".to_owned(),
+            })
+            .expect("title event should apply");
+        runtime
+            .handle_content_event(ContentEvent::LoadingChanged {
+                tab_id,
+                is_loading: true,
+            })
+            .expect("loading event should apply");
+
+        let tab = runtime
+            .engine()
+            .state()
+            .tabs
+            .get(&tab_id)
+            .expect("tab should exist");
+        assert_eq!(tab.title, "One Example");
+        assert!(tab.loading);
+    }
+
+    #[test]
+    fn stale_content_events_are_ignored() {
+        let host = MockCefHost::default();
+        let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
+        let workspace_id = runtime.default_workspace_id();
+
+        runtime
+            .handle_ui_command(UiCommand::NewTab {
+                workspace_id: workspace_id.0,
+                url: Some("https://one.example".to_owned()),
+                make_active: true,
+            })
+            .expect("tab should be created");
+        let tab_id = runtime
+            .active_tab_id(workspace_id)
+            .expect("tab should be active");
+
+        runtime
+            .handle_ui_command(UiCommand::CloseTab { tab_id: tab_id.0 })
+            .expect("close tab should succeed");
+        let revision_before = runtime.revision();
+
+        let patch = runtime
+            .handle_content_event(ContentEvent::TitleChanged {
+                tab_id,
+                title: "stale".to_owned(),
+            })
+            .expect("stale event should be ignored");
+
+        assert!(patch.ops.is_empty());
+        assert_eq!(patch.from_revision, revision_before);
+        assert_eq!(patch.to_revision, revision_before);
     }
 }

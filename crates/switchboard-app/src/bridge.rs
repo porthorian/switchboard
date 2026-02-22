@@ -33,6 +33,9 @@ pub enum UiCommand {
     ActivateTab {
         tab_id: u64,
     },
+    CloseTab {
+        tab_id: u64,
+    },
 }
 
 impl UiCommand {
@@ -73,6 +76,9 @@ impl UiCommand {
                 workspace_id: WorkspaceId(workspace_id),
             },
             Self::ActivateTab { tab_id } => Intent::ActivateTab {
+                tab_id: TabId(tab_id),
+            },
+            Self::CloseTab { tab_id } => Intent::CloseTab {
                 tab_id: TabId(tab_id),
             },
         }

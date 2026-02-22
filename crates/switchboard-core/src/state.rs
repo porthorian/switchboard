@@ -40,6 +40,7 @@ pub struct Tab {
     pub workspace_id: WorkspaceId,
     pub url: String,
     pub title: String,
+    pub loading: bool,
     pub pinned: bool,
     pub muted: bool,
     pub runtime_state: TabRuntimeState,

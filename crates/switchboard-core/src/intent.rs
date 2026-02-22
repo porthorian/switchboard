@@ -13,6 +13,18 @@ pub enum Intent {
         tab_id: TabId,
         url: String,
     },
+    ObserveTabUrl {
+        tab_id: TabId,
+        url: String,
+    },
+    ObserveTabTitle {
+        tab_id: TabId,
+        title: String,
+    },
+    ObserveTabLoading {
+        tab_id: TabId,
+        is_loading: bool,
+    },
     NewTab {
         workspace_id: WorkspaceId,
         url: Option<String>,

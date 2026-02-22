@@ -191,6 +191,7 @@ pub fn apply_intent(state: &mut BrowserState, intent: Intent) -> Result<Vec<Patc
                 workspace_id,
                 url: url.unwrap_or_else(|| "about:blank".to_owned()),
                 title: String::new(),
+                loading: false,
                 pinned: false,
                 muted: false,
                 runtime_state: if make_active {
@@ -242,7 +243,43 @@ pub fn apply_intent(state: &mut BrowserState, intent: Intent) -> Result<Vec<Patc
                 .tabs
                 .get_mut(&tab_id)
                 .ok_or(ReduceError::TabNotFound(tab_id))?;
+            if tab.url == url {
+                return Ok(ops);
+            }
             tab.url = url;
+            ops.push(PatchOp::UpsertTab(tab.clone()));
+        }
+        Intent::ObserveTabUrl { tab_id, url } => {
+            let tab = state
+                .tabs
+                .get_mut(&tab_id)
+                .ok_or(ReduceError::TabNotFound(tab_id))?;
+            if tab.url == url {
+                return Ok(ops);
+            }
+            tab.url = url;
+            ops.push(PatchOp::UpsertTab(tab.clone()));
+        }
+        Intent::ObserveTabTitle { tab_id, title } => {
+            let tab = state
+                .tabs
+                .get_mut(&tab_id)
+                .ok_or(ReduceError::TabNotFound(tab_id))?;
+            if tab.title == title {
+                return Ok(ops);
+            }
+            tab.title = title;
+            ops.push(PatchOp::UpsertTab(tab.clone()));
+        }
+        Intent::ObserveTabLoading { tab_id, is_loading } => {
+            let tab = state
+                .tabs
+                .get_mut(&tab_id)
+                .ok_or(ReduceError::TabNotFound(tab_id))?;
+            if tab.loading == is_loading {
+                return Ok(ops);
+            }
+            tab.loading = is_loading;
             ops.push(PatchOp::UpsertTab(tab.clone()));
         }
         Intent::PinTab { tab_id, pinned } => {
