@@ -309,6 +309,15 @@ body {
   border-color: #5f8bff;
   background: #203556;
 }
+.profile-menu-action.danger {
+  border-color: #654145;
+  background: #2e1f22;
+  color: #f3c1c1;
+}
+.profile-menu-action.danger:hover {
+  border-color: #8f5259;
+  background: #3a2328;
+}
 .profile-editor {
   display: grid;
   gap: 6px;

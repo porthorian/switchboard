@@ -58,6 +58,9 @@ pub enum HostEvent {
         tab_id: TabId,
         url: String,
     },
+    ContentViewDestroyed {
+        view_id: ContentViewId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +116,8 @@ pub trait CefHost {
     ) -> Result<(), Self::Error>;
 
     fn clear_content_view(&mut self, view_id: ContentViewId) -> Result<(), Self::Error>;
+
+    fn destroy_content_view(&mut self, view_id: ContentViewId) -> Result<(), Self::Error>;
 
     fn run_event_loop(&mut self) -> Result<(), Self::Error>;
 }
@@ -328,6 +333,12 @@ impl CefHost for MockCefHost {
     }
 
     fn clear_content_view(&mut self, _view_id: ContentViewId) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn destroy_content_view(&mut self, view_id: ContentViewId) -> Result<(), Self::Error> {
+        self.events
+            .push(HostEvent::ContentViewDestroyed { view_id });
         Ok(())
     }
 
@@ -2509,6 +2520,34 @@ impl CefHost for NativeMacHost {
             }
         }
         set_active_content_tab(None);
+        set_active_content_uri(String::new());
+        Ok(())
+    }
+
+    fn destroy_content_view(&mut self, view_id: ContentViewId) -> Result<(), Self::Error> {
+        let content_backend = self
+            .content_views
+            .remove(&view_id)
+            .ok_or_else(|| HostError::Native(format!("content view not found: {}", view_id.0)))?;
+        self.content_view_windows.remove(&view_id);
+
+        unsafe {
+            match content_backend {
+                ContentBackend::WebKit(container) | ContentBackend::Cef(container) => {
+                    remove_all_subviews(container)?;
+                    msg_send_void(container, selector("removeFromSuperview")?);
+                }
+            }
+        }
+
+        if let Some(client) = self.cef_clients.remove(&view_id) {
+            unsafe {
+                free_content_cef_client(client);
+            }
+        }
+
+        set_active_content_tab(None);
+        set_active_content_browser(std::ptr::null_mut());
         set_active_content_uri(String::new());
         Ok(())
     }

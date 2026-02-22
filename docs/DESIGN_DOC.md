@@ -426,6 +426,7 @@ Rust converts these into state mutations and emits patches.
 * integration tests for snapshot/patch revision integrity and resync
 * restart/crash recovery validation against persisted state
 * macOS packaging/signing/notarization runbook + smoke checks
+* runbook reference: `docs/RELEASE_RUNBOOK.md`
 
 ### Milestone 11: Settings + behavior preferences
 

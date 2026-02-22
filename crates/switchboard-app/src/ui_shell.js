@@ -9,6 +9,7 @@ const profileMenuLabel = document.getElementById("profile-menu-label");
 const profileMenuPopover = document.getElementById("profile-menu-popover");
 const profileMenuList = document.getElementById("profile-menu-list");
 const profileRename = document.getElementById("profile-rename");
+const profileDelete = document.getElementById("profile-delete");
 const profileEditor = document.getElementById("profile-editor");
 const profileEditorInput = document.getElementById("profile-editor-input");
 const profileEditorSubmit = document.getElementById("profile-editor-submit");
@@ -154,6 +155,35 @@ function profileDisplayName(profile) {
   return "Profile";
 }
 
+function isTextInputTarget(target) {
+  if (!target) return false;
+  if (target instanceof HTMLInputElement) return true;
+  if (target instanceof HTMLTextAreaElement) return true;
+  if (target instanceof HTMLElement && target.isContentEditable) return true;
+  return false;
+}
+
+function profileMenuItems() {
+  return Array.from(profileMenuList.querySelectorAll(".profile-menu-item"));
+}
+
+function focusProfileMenuItem(index) {
+  const items = profileMenuItems();
+  if (items.length === 0) return;
+  const normalized = Math.max(0, Math.min(index, items.length - 1));
+  items[normalized].focus();
+}
+
+function focusNextProfileMenuItem(step) {
+  const items = profileMenuItems();
+  if (items.length === 0) return;
+  const active = document.activeElement;
+  const currentIndex = items.indexOf(active);
+  const startIndex = currentIndex === -1 ? 0 : currentIndex;
+  const nextIndex = (startIndex + step + items.length) % items.length;
+  items[nextIndex].focus();
+}
+
 function tabLabel(tab) {
   if (tab.title && tab.title.trim()) return tab.title.trim();
   if (tab.url) {
@@ -233,9 +263,13 @@ function renderProfileControls(orderedProfiles, activeProfile) {
   profileMenuButton.title = activeProfileName || "No active profile";
   profileMenuLabel.textContent = activeProfileBadge;
   profileRename.disabled = activeProfileId === null;
+  profileDelete.disabled = activeProfileId === null || orderedProfiles.length <= 1;
   profileRename.title = activeProfileName
     ? `Rename "${activeProfileName}"`
     : "Rename profile";
+  profileDelete.title = activeProfileName
+    ? `Delete "${activeProfileName}"`
+    : "Delete profile";
   if (profileMenuOpen && activeProfileId === null) {
     closeProfileMenu();
   }
@@ -498,6 +532,9 @@ function createProfile() {
 
 function switchProfile(profileId) {
   if (!profileId) return;
+  if (!shellState || !Array.isArray(shellState.profiles)) return;
+  const exists = shellState.profiles.some((profile) => String(profile.id) === String(profileId));
+  if (!exists) return;
   if (
     shellState &&
     shellState.active_profile_id !== null &&
@@ -514,6 +551,24 @@ function renameActiveProfile() {
   const { activeProfile } = deriveActiveContext(shellState);
   if (!activeProfile) return;
   openProfileEditor("rename");
+}
+
+function deleteActiveProfile() {
+  if (!shellState || !Array.isArray(shellState.profiles)) return;
+  const { activeProfile } = deriveActiveContext(shellState);
+  if (!activeProfile) return;
+  if (shellState.profiles.length <= 1) {
+    window.alert("At least one profile must remain.");
+    return;
+  }
+  const confirmed = window.confirm(
+    `Delete profile "${profileDisplayName(activeProfile)}" and all associated workspaces/tabs?`
+  );
+  if (!confirmed) return;
+  send(`delete_profile ${activeProfile.id}`);
+  closeProfileEditor();
+  closeProfileMenu();
+  queueStateRefresh();
 }
 
 function openProfileEditor(mode) {
@@ -582,6 +637,19 @@ function openProfileMenu() {
   profileMenuOpen = true;
   profileMenuPopover.hidden = false;
   profileMenuButton.setAttribute("aria-expanded", "true");
+}
+
+function openProfileMenuAndFocus(first) {
+  openProfileMenu();
+  if (!profileMenuOpen) return;
+  if (first) {
+    focusProfileMenuItem(0);
+  } else {
+    const items = profileMenuItems();
+    if (items.length > 0) {
+      focusProfileMenuItem(items.length - 1);
+    }
+  }
 }
 
 function closeProfileMenu() {
@@ -719,6 +787,25 @@ profileMenuButton.addEventListener("click", (event) => {
   event.stopPropagation();
   toggleProfileMenu();
 });
+profileMenuButton.addEventListener("keydown", (event) => {
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    openProfileMenuAndFocus(true);
+    return;
+  }
+  if (event.key === "ArrowUp") {
+    event.preventDefault();
+    openProfileMenuAndFocus(false);
+    return;
+  }
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    toggleProfileMenu();
+    if (profileMenuOpen) {
+      focusProfileMenuItem(0);
+    }
+  }
+});
 profileMenuList.addEventListener("click", (event) => {
   const selected = event.target.closest(".profile-menu-item");
   if (!selected) return;
@@ -726,9 +813,44 @@ profileMenuList.addEventListener("click", (event) => {
   closeProfileMenu();
   switchProfile(selectedProfileId);
 });
+profileMenuPopover.addEventListener("keydown", (event) => {
+  if (!profileMenuOpen) return;
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    focusNextProfileMenuItem(1);
+    return;
+  }
+  if (event.key === "ArrowUp") {
+    event.preventDefault();
+    focusNextProfileMenuItem(-1);
+    return;
+  }
+  if (event.key === "Home") {
+    event.preventDefault();
+    focusProfileMenuItem(0);
+    return;
+  }
+  if (event.key === "End") {
+    event.preventDefault();
+    const items = profileMenuItems();
+    if (items.length > 0) {
+      focusProfileMenuItem(items.length - 1);
+    }
+    return;
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeProfileMenu();
+    profileMenuButton.focus();
+  }
+});
 profileRename.addEventListener("click", (event) => {
   event.stopPropagation();
   renameActiveProfile();
+});
+profileDelete.addEventListener("click", (event) => {
+  event.stopPropagation();
+  deleteActiveProfile();
 });
 profileEditor.addEventListener("submit", (event) => {
   event.preventDefault();
@@ -794,8 +916,29 @@ document.addEventListener("pointerdown", (event) => {
   closeProfileMenu();
 });
 document.addEventListener("keydown", (event) => {
-  if (event.key !== "Escape") return;
-  closeProfileMenu();
+  if (event.key === "Escape") {
+    closeProfileMenu();
+    return;
+  }
+  if (isTextInputTarget(event.target)) return;
+  const hasPrimaryModifier = event.metaKey || event.ctrlKey;
+  if (!hasPrimaryModifier || !event.shiftKey || event.altKey) return;
+
+  const keyLower = event.key.toLowerCase();
+  if (keyLower === "p") {
+    event.preventDefault();
+    openProfileMenuAndFocus(true);
+    return;
+  }
+  if (keyLower === "n") {
+    event.preventDefault();
+    createProfile();
+    return;
+  }
+  if (keyLower === "r") {
+    event.preventDefault();
+    renameActiveProfile();
+  }
 });
 
 renderUri();

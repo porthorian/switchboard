@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
@@ -7,7 +8,7 @@ use std::convert::Infallible;
 #[cfg(test)]
 use switchboard_core::NoopPersistence;
 use switchboard_core::{
-    BrowserState, Engine, EngineError, Intent, Patch, PatchOp, ProfileId, SettingValue, TabId,
+    BrowserState, Engine, EngineError, Intent, Patch, ProfileId, SettingValue, TabId,
     TabRuntimeState, WorkspaceId,
 };
 
@@ -45,15 +46,19 @@ pub enum RuntimeError<HError> {
     Engine(EngineError<RuntimePersistenceError>),
     NoActiveWorkspace,
     NoActiveProfile,
-    WorkspaceNotFound(WorkspaceId),
-    TabNotFound(TabId),
     BlockedContentNavigation(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ContentBinding {
     view_id: ContentViewId,
-    tab_id: TabId,
+    profile_id: ProfileId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveTabBinding {
+    content: ContentBinding,
+    last_url: String,
 }
 
 pub struct AppRuntime<H: CefHost> {
@@ -62,7 +67,7 @@ pub struct AppRuntime<H: CefHost> {
     window_id: WindowId,
     ui_view_id: UiViewId,
     default_workspace_id: WorkspaceId,
-    content_bindings: BTreeMap<ProfileId, ContentBinding>,
+    tab_bindings: BTreeMap<TabId, LiveTabBinding>,
     thumbnail_lru: Vec<TabId>,
 }
 
@@ -107,7 +112,7 @@ impl<H: CefHost + 'static> AppRuntime<H> {
             window_id,
             ui_view_id,
             default_workspace_id: workspace_id,
-            content_bindings: BTreeMap::new(),
+            tab_bindings: BTreeMap::new(),
             thumbnail_lru: Vec::new(),
         })
     }
@@ -141,7 +146,7 @@ impl<H: CefHost + 'static> AppRuntime<H> {
     where
         H::Error: Display,
     {
-        self.sync_active_profile_content_view()?;
+        self.sync_runtime_views()?;
 
         let runtime_ptr: *mut Self = &mut self;
         install_ui_command_handler(Some(Box::new(move |command| unsafe {
@@ -201,25 +206,14 @@ impl<H: CefHost + 'static> AppRuntime<H> {
     }
 
     pub fn handle_intent(&mut self, intent: Intent) -> Result<Patch, RuntimeError<H::Error>> {
-        let navigation = match &intent {
-            Intent::Navigate { tab_id, url } => {
-                if url.starts_with("app://") {
-                    return Err(RuntimeError::BlockedContentNavigation(url.clone()));
-                }
-                Some((*tab_id, url.clone()))
+        if let Intent::Navigate { url, .. } = &intent {
+            if url.starts_with("app://") {
+                return Err(RuntimeError::BlockedContentNavigation(url.clone()));
             }
-            _ => None,
-        };
-
-        let patch = self.engine.dispatch(intent).map_err(RuntimeError::Engine)?;
-
-        if let Some((tab_id, url)) = navigation {
-            self.ensure_single_content_view(tab_id, &url)?;
-        } else if patch_updates_active_content(&patch) {
-            self.sync_active_profile_content_view()?;
         }
 
-        self.cleanup_deleted_profile_bindings()?;
+        let patch = self.engine.dispatch(intent).map_err(RuntimeError::Engine)?;
+        self.sync_runtime_views()?;
         Ok(patch)
     }
 
@@ -288,12 +282,6 @@ impl<H: CefHost + 'static> AppRuntime<H> {
         state.profiles.get(&profile_id)?.active_workspace_id
     }
 
-    fn resolve_active_tab_target(&self) -> Option<(TabId, String)> {
-        let tab_id = self.resolve_active_tab_id()?;
-        let url = self.engine.state().tabs.get(&tab_id)?.url.clone();
-        Some((tab_id, url))
-    }
-
     fn resolve_active_profile_id(&self) -> Option<ProfileId> {
         self.engine.state().active_profile_id
     }
@@ -340,49 +328,90 @@ impl<H: CefHost + 'static> AppRuntime<H> {
         Ok(patch)
     }
 
-    fn sync_active_profile_content_view(&mut self) -> Result<(), RuntimeError<H::Error>> {
-        let active_profile_id = match self.resolve_active_profile_id() {
-            Some(profile_id) => profile_id,
-            None => {
-                self.set_profile_view_visibility(None)?;
-                return Ok(());
-            }
-        };
+    fn sync_runtime_views(&mut self) -> Result<(), RuntimeError<H::Error>> {
+        let active_profile_id = self.resolve_active_profile_id();
+        let active_tab_id = self.resolve_active_tab_id();
 
-        if let Some((tab_id, url)) = self.resolve_active_tab_target() {
-            self.ensure_single_content_view(tab_id, &url)?;
-            self.set_profile_view_visibility(Some(active_profile_id))?;
-            return Ok(());
-        }
-
-        if let Some(binding) = self.content_bindings.get(&active_profile_id).copied() {
-            self.host
-                .clear_content_view(binding.view_id)
-                .map_err(RuntimeError::Host)?;
-            self.host
-                .set_content_view_visible(binding.view_id, false)
-                .map_err(RuntimeError::Host)?;
-        }
-
-        self.set_profile_view_visibility(Some(active_profile_id))?;
-        Ok(())
-    }
-
-    fn set_profile_view_visibility(
-        &mut self,
-        active_profile_id: Option<ProfileId>,
-    ) -> Result<(), RuntimeError<H::Error>> {
-        let views: Vec<(ProfileId, ContentViewId)> = self
-            .content_bindings
-            .iter()
-            .map(|(profile_id, binding)| (*profile_id, binding.view_id))
+        let desired_live_tabs: Vec<(TabId, ProfileId, String)> = self
+            .engine
+            .state()
+            .tabs
+            .values()
+            .filter(|tab| {
+                matches!(
+                    tab.runtime_state,
+                    TabRuntimeState::Active | TabRuntimeState::Warm
+                )
+            })
+            .map(|tab| (tab.id, tab.profile_id, tab.url.clone()))
             .collect();
-        for (profile_id, view_id) in views {
-            let visible = active_profile_id == Some(profile_id);
+        let desired_live_ids: BTreeSet<TabId> = desired_live_tabs
+            .iter()
+            .map(|(tab_id, _, _)| *tab_id)
+            .collect();
+
+        let stale_tabs: Vec<TabId> = self
+            .tab_bindings
+            .keys()
+            .copied()
+            .filter(|tab_id| !desired_live_ids.contains(tab_id))
+            .collect();
+        for tab_id in stale_tabs {
+            if let Some(binding) = self.tab_bindings.remove(&tab_id) {
+                self.host
+                    .clear_content_view(binding.content.view_id)
+                    .map_err(RuntimeError::Host)?;
+                self.host
+                    .destroy_content_view(binding.content.view_id)
+                    .map_err(RuntimeError::Host)?;
+            }
+        }
+
+        for (tab_id, profile_id, url) in desired_live_tabs {
+            match self.tab_bindings.get(&tab_id).cloned() {
+                Some(existing) => {
+                    if existing.last_url != url {
+                        self.host
+                            .navigate_content_view(existing.content.view_id, tab_id, &url)
+                            .map_err(RuntimeError::Host)?;
+                        if let Some(binding) = self.tab_bindings.get_mut(&tab_id) {
+                            binding.last_url = url.clone();
+                            binding.content.profile_id = profile_id;
+                        }
+                    }
+                }
+                None => {
+                    let view_id = self
+                        .host
+                        .create_content_view(self.window_id, tab_id, &url)
+                        .map_err(RuntimeError::Host)?;
+                    self.tab_bindings.insert(
+                        tab_id,
+                        LiveTabBinding {
+                            content: ContentBinding {
+                                view_id,
+                                profile_id,
+                            },
+                            last_url: url,
+                        },
+                    );
+                }
+            }
+        }
+
+        let visibility: Vec<(TabId, ContentBinding)> = self
+            .tab_bindings
+            .iter()
+            .map(|(tab_id, binding)| (*tab_id, binding.content))
+            .collect();
+        for (tab_id, binding) in visibility {
+            let visible =
+                Some(tab_id) == active_tab_id && Some(binding.profile_id) == active_profile_id;
             self.host
-                .set_content_view_visible(view_id, visible)
+                .set_content_view_visible(binding.view_id, visible)
                 .map_err(RuntimeError::Host)?;
         }
+
         Ok(())
     }
 
@@ -441,29 +470,6 @@ impl<H: CefHost + 'static> AppRuntime<H> {
                     data_url: None,
                 })
                 .map_err(RuntimeError::Engine)?;
-        }
-        Ok(())
-    }
-
-    fn cleanup_deleted_profile_bindings(&mut self) -> Result<(), RuntimeError<H::Error>> {
-        let existing_profile_ids: std::collections::BTreeSet<ProfileId> =
-            self.engine.state().profiles.keys().copied().collect();
-        let removed_profile_ids: Vec<ProfileId> = self
-            .content_bindings
-            .keys()
-            .copied()
-            .filter(|profile_id| !existing_profile_ids.contains(profile_id))
-            .collect();
-
-        for profile_id in removed_profile_ids {
-            if let Some(binding) = self.content_bindings.remove(&profile_id) {
-                self.host
-                    .clear_content_view(binding.view_id)
-                    .map_err(RuntimeError::Host)?;
-                self.host
-                    .set_content_view_visible(binding.view_id, false)
-                    .map_err(RuntimeError::Host)?;
-            }
         }
         Ok(())
     }
@@ -579,56 +585,6 @@ impl<H: CefHost + 'static> AppRuntime<H> {
         }
         json.push_str("]}");
         json
-    }
-
-    fn ensure_single_content_view(
-        &mut self,
-        tab_id: TabId,
-        url: &str,
-    ) -> Result<(), RuntimeError<H::Error>> {
-        let tab = self
-            .engine
-            .state()
-            .tabs
-            .get(&tab_id)
-            .ok_or(RuntimeError::TabNotFound(tab_id))?;
-        let workspace_id = tab.workspace_id;
-        let profile_id = tab.profile_id;
-        if !self.engine.state().workspaces.contains_key(&workspace_id) {
-            return Err(RuntimeError::WorkspaceNotFound(workspace_id));
-        }
-
-        match self.content_bindings.get(&profile_id).copied() {
-            Some(mut binding) => {
-                self.host
-                    .navigate_content_view(binding.view_id, tab_id, url)
-                    .map_err(RuntimeError::Host)?;
-                self.host
-                    .set_content_view_visible(
-                        binding.view_id,
-                        self.resolve_active_profile_id() == Some(profile_id),
-                    )
-                    .map_err(RuntimeError::Host)?;
-                binding.tab_id = tab_id;
-                self.content_bindings.insert(profile_id, binding);
-            }
-            None => {
-                let view_id = self
-                    .host
-                    .create_content_view(self.window_id, tab_id, url)
-                    .map_err(RuntimeError::Host)?;
-                self.host
-                    .set_content_view_visible(
-                        view_id,
-                        self.resolve_active_profile_id() == Some(profile_id),
-                    )
-                    .map_err(RuntimeError::Host)?;
-                self.content_bindings
-                    .insert(profile_id, ContentBinding { view_id, tab_id });
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -775,10 +731,6 @@ impl<HError: Display> Display for RuntimeError<HError> {
                 write!(f, "no active workspace available for UI navigation")
             }
             Self::NoActiveProfile => write!(f, "no active profile available for UI command"),
-            Self::WorkspaceNotFound(workspace_id) => {
-                write!(f, "workspace not found: {workspace_id}")
-            }
-            Self::TabNotFound(tab_id) => write!(f, "tab not found: {tab_id}"),
             Self::BlockedContentNavigation(url) => {
                 write!(f, "content navigation blocked for url: {url}")
             }
@@ -787,17 +739,6 @@ impl<HError: Display> Display for RuntimeError<HError> {
 }
 
 impl<HError: Error + 'static> Error for RuntimeError<HError> {}
-
-fn patch_updates_active_content(patch: &Patch) -> bool {
-    patch.ops.iter().any(|op| {
-        matches!(
-            op,
-            PatchOp::SetActiveProfile { .. }
-                | PatchOp::SetActiveWorkspace { .. }
-                | PatchOp::SetActiveTab { .. }
-        )
-    })
-}
 
 fn build_thumbnail_data_url(title: &str, url: &str) -> String {
     let title_line = if title.trim().is_empty() {
@@ -877,7 +818,7 @@ mod tests {
         CefHost, ContentEvent, ContentViewId, HostError, HostEvent, MockCefHost, UiViewId,
         WindowEvent, WindowId, WindowSize,
     };
-    use switchboard_core::TabId;
+    use switchboard_core::{Intent, SettingValue, TabId, TabRuntimeState};
 
     use super::{AppRuntime, RuntimeError};
 
@@ -978,6 +919,13 @@ mod tests {
         }
 
         fn clear_content_view(&mut self, _view_id: ContentViewId) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn destroy_content_view(&mut self, view_id: ContentViewId) -> Result<(), Self::Error> {
+            self.events
+                .borrow_mut()
+                .push(HostEvent::ContentViewDestroyed { view_id });
             Ok(())
         }
 
@@ -1184,13 +1132,20 @@ mod tests {
             })
             .expect("activate tab should succeed");
 
+        let content_create_count = runtime
+            .host()
+            .events()
+            .iter()
+            .filter(|event| matches!(event, HostEvent::ContentViewCreated { .. }))
+            .count();
         let content_navigate_count = runtime
             .host()
             .events()
             .iter()
             .filter(|event| matches!(event, HostEvent::ContentNavigated { .. }))
             .count();
-        assert_eq!(content_navigate_count, 2);
+        assert_eq!(content_create_count, 2);
+        assert_eq!(content_navigate_count, 0);
     }
 
     #[test]
@@ -1335,7 +1290,7 @@ mod tests {
             .count();
         assert_eq!(initial_content_creates, 1);
 
-        runtime.content_bindings.clear();
+        runtime.tab_bindings.clear();
         runtime.run().expect("run should succeed");
 
         let post_run_content_creates = events
@@ -1387,6 +1342,184 @@ mod tests {
         assert!(noop_patch.ops.is_empty());
         assert_eq!(noop_patch.from_revision, revision_before);
         assert_eq!(noop_patch.to_revision, revision_before);
+    }
+
+    #[test]
+    fn patch_revisions_remain_monotonic_and_contiguous() {
+        let host = MockCefHost::default();
+        let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
+        let workspace_id = runtime.default_workspace_id();
+        let mut expected_revision = runtime.revision();
+
+        let patch = runtime
+            .handle_ui_command(UiCommand::NewTab {
+                workspace_id: workspace_id.0,
+                url: Some("https://revision-one.example".to_owned()),
+                make_active: true,
+            })
+            .expect("first command should succeed");
+        assert_eq!(patch.from_revision, expected_revision);
+        assert_eq!(patch.to_revision, expected_revision + 1);
+        expected_revision = patch.to_revision;
+
+        let active_tab_id = runtime
+            .active_tab_id(workspace_id)
+            .expect("new tab should be active");
+        let patch = runtime
+            .handle_ui_command(UiCommand::Navigate {
+                tab_id: active_tab_id.0,
+                url: "https://revision-two.example".to_owned(),
+            })
+            .expect("navigation should succeed");
+        assert_eq!(patch.from_revision, expected_revision);
+        assert_eq!(patch.to_revision, expected_revision + 1);
+        expected_revision = patch.to_revision;
+
+        let patch = runtime
+            .handle_ui_command(UiCommand::NewWorkspace {
+                name: "Revision Workspace".to_owned(),
+            })
+            .expect("new workspace should succeed");
+        assert_eq!(patch.from_revision, expected_revision);
+        assert_eq!(patch.to_revision, expected_revision + 1);
+        expected_revision = patch.to_revision;
+
+        let patch = runtime
+            .handle_ui_command(UiCommand::ActivateTab {
+                tab_id: active_tab_id.0,
+            })
+            .expect("activate already-active tab should succeed");
+        assert_eq!(patch.from_revision, expected_revision);
+        assert_eq!(patch.to_revision, expected_revision);
+        assert!(patch.ops.is_empty());
+        assert_eq!(runtime.revision(), expected_revision);
+    }
+
+    #[test]
+    fn shell_state_json_supports_full_resync_after_revision_drift() {
+        let host = MockCefHost::default();
+        let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
+        let workspace_id = runtime.default_workspace_id();
+        let stale_revision = runtime.revision();
+
+        runtime
+            .handle_ui_command(UiCommand::NewTab {
+                workspace_id: workspace_id.0,
+                url: Some("https://resync.example".to_owned()),
+                make_active: true,
+            })
+            .expect("tab creation should succeed");
+        let active_tab_id = runtime
+            .active_tab_id(workspace_id)
+            .expect("active tab should exist");
+        runtime
+            .handle_ui_command(UiCommand::Navigate {
+                tab_id: active_tab_id.0,
+                url: "https://resync.example/latest".to_owned(),
+            })
+            .expect("navigate should succeed");
+
+        let latest_revision = runtime.revision();
+        assert!(latest_revision > stale_revision);
+        let state_json = runtime.ui_shell_state_json();
+        assert!(state_json.contains(&format!("\"revision\":{latest_revision}")));
+        assert!(state_json.contains("\"tabs\":["));
+        assert!(state_json.contains("https://resync.example/latest"));
+    }
+
+    #[test]
+    fn lifecycle_policy_drives_live_view_set_under_runtime_churn() {
+        let host = MockCefHost::default();
+        let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
+        let default_workspace_id = runtime.default_workspace_id();
+
+        runtime
+            .handle_intent(Intent::SettingSet {
+                key: "warm_pool_budget".to_owned(),
+                value: SettingValue::Int(2),
+            })
+            .expect("warm pool budget update should succeed");
+
+        runtime
+            .handle_ui_command(UiCommand::NewProfile {
+                name: "Work".to_owned(),
+            })
+            .expect("second profile should be created");
+        let second_profile_id = runtime
+            .engine()
+            .state()
+            .profiles
+            .keys()
+            .copied()
+            .find(|profile_id| profile_id.0 != 1)
+            .expect("second profile id should exist");
+        let second_workspace_id = runtime
+            .engine()
+            .state()
+            .profiles
+            .get(&second_profile_id)
+            .and_then(|profile| profile.active_workspace_id)
+            .expect("second profile should have active workspace");
+
+        runtime
+            .handle_ui_command(UiCommand::SwitchProfile { profile_id: 1 })
+            .expect("switching back to first profile should succeed");
+
+        for i in 0..24u64 {
+            let target_workspace_id = if i % 2 == 0 {
+                default_workspace_id
+            } else {
+                second_workspace_id
+            };
+            let target_profile_id = if i % 2 == 0 { 1 } else { second_profile_id.0 };
+            runtime
+                .handle_ui_command(UiCommand::SwitchProfile {
+                    profile_id: target_profile_id,
+                })
+                .expect("profile switch should succeed");
+            runtime
+                .handle_ui_command(UiCommand::SwitchWorkspace {
+                    workspace_id: target_workspace_id.0,
+                })
+                .expect("workspace switch should succeed");
+            runtime
+                .handle_ui_command(UiCommand::NewTab {
+                    workspace_id: target_workspace_id.0,
+                    url: Some(format!("https://lifecycle-{i}.example")),
+                    make_active: true,
+                })
+                .expect("tab creation should succeed");
+
+            let live_state_count = runtime
+                .engine()
+                .state()
+                .tabs
+                .values()
+                .filter(|tab| {
+                    matches!(
+                        tab.runtime_state,
+                        TabRuntimeState::Active | TabRuntimeState::Warm
+                    )
+                })
+                .count();
+            assert_eq!(runtime.tab_bindings.len(), live_state_count);
+
+            let active_tab_id = runtime.resolve_active_tab_id();
+            if let Some(active_tab_id) = active_tab_id {
+                assert!(
+                    runtime.tab_bindings.contains_key(&active_tab_id),
+                    "active tab must have a live content view binding"
+                );
+            }
+        }
+
+        let destroy_events = runtime
+            .host()
+            .events()
+            .iter()
+            .filter(|event| matches!(event, HostEvent::ContentViewDestroyed { .. }))
+            .count();
+        assert!(destroy_events > 0, "discarded tabs should destroy views");
     }
 
     #[test]
@@ -1449,7 +1582,14 @@ mod tests {
             .iter()
             .filter(|event| matches!(event, HostEvent::ContentViewCreated { .. }))
             .count();
-        assert_eq!(content_create_count, 2);
+        let content_destroy_count = runtime
+            .host()
+            .events()
+            .iter()
+            .filter(|event| matches!(event, HostEvent::ContentViewDestroyed { .. }))
+            .count();
+        assert!(content_create_count >= 2);
+        assert!(content_destroy_count >= 1);
     }
 
     #[test]

@@ -940,4 +940,72 @@ mod tests {
             WorkspaceId(1)
         );
     }
+
+    #[test]
+    fn sqlite_persistence_survives_reopen_and_last_commit_wins() {
+        let mut path = std::env::temp_dir();
+        let unique_suffix = format!(
+            "switchboard_state_test_{}_{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        path.push(unique_suffix);
+
+        let mut state_v1 = sample_state();
+        state_v1.settings.insert(
+            "homepage".to_owned(),
+            SettingValue::Text("https://v1.example".to_owned()),
+        );
+
+        {
+            let mut persistence =
+                AppPersistence::open_path(&path).expect("open sqlite path for v1 commit");
+            persistence
+                .commit(&state_v1)
+                .expect("v1 commit should succeed");
+        }
+
+        let mut state_v2 = state_v1.clone();
+        state_v2.settings.insert(
+            "homepage".to_owned(),
+            SettingValue::Text("https://v2.example".to_owned()),
+        );
+        state_v2
+            .settings
+            .insert("restore_last_session".to_owned(), SettingValue::Bool(false));
+        state_v2.recompute_next_ids();
+
+        {
+            let mut persistence =
+                AppPersistence::open_path(&path).expect("reopen sqlite path for v2 commit");
+            let loaded_v1 = persistence
+                .load_state()
+                .expect("load after reopen should succeed")
+                .expect("persisted state should exist");
+            assert_eq!(loaded_v1.settings, state_v1.settings);
+
+            persistence
+                .commit(&state_v2)
+                .expect("v2 commit should succeed");
+        }
+
+        {
+            let mut persistence =
+                AppPersistence::open_path(&path).expect("reopen sqlite path for final load");
+            let loaded_v2 = persistence
+                .load_state()
+                .expect("final load should succeed")
+                .expect("persisted state should exist");
+            assert_eq!(loaded_v2.active_profile_id, state_v2.active_profile_id);
+            assert_eq!(loaded_v2.profiles, state_v2.profiles);
+            assert_eq!(loaded_v2.workspaces, state_v2.workspaces);
+            assert_eq!(loaded_v2.tabs, state_v2.tabs);
+            assert_eq!(loaded_v2.settings, state_v2.settings);
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
 }
