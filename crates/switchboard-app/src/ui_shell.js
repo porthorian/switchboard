@@ -13,6 +13,10 @@ const workspaceDelete = document.getElementById("workspace-delete");
 const tabList = document.getElementById("tab-list");
 const tabNew = document.getElementById("tab-new");
 
+const TAB_ROW_HEIGHT = 56;
+const TAB_OVERSCAN = 6;
+const TAB_LIST_PADDING_Y = 8;
+
 let backStack = [];
 let forwardStack = [];
 let activeUri = normalizeUrl(localStorage.getItem(key)) || "https://youtube.com";
@@ -21,6 +25,12 @@ let shellState = null;
 let editingWorkspaceId = null;
 let editingWorkspaceOriginalName = "";
 let pendingWorkspaceRenameId = null;
+let virtualTabs = [];
+let virtualActiveTabId = null;
+let lastRenderedWorkspaceId = null;
+let virtualRenderPending = false;
+let virtualDataEpoch = 0;
+let virtualRenderKey = "";
 
 function send(payload) {
   try {
@@ -168,48 +178,142 @@ function renderWorkspaceRail(orderedWorkspaces, activeWorkspaceId) {
   });
 }
 
-function renderTabList(orderedTabs, activeTabId) {
-  tabList.innerHTML = "";
-  if (orderedTabs.length === 0) {
+function createTabButton(tab, isActive) {
+  const label = tabLabel(tab);
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "tab-item";
+  button.dataset.tabId = String(tab.id);
+  button.dataset.tabUrl = tab.url || "";
+  if (isActive) {
+    button.classList.add("active");
+  }
+
+  const icon = document.createElement("span");
+  icon.className = "tab-icon";
+  icon.textContent = label.slice(0, 1).toUpperCase();
+  button.appendChild(icon);
+
+  const content = document.createElement("span");
+  content.className = "tab-copy";
+
+  const title = document.createElement("span");
+  title.className = "tab-title";
+  title.textContent = label;
+  content.appendChild(title);
+
+  const url = document.createElement("span");
+  url.className = "tab-url";
+  url.textContent = tab.url || "about:blank";
+  content.appendChild(url);
+
+  button.appendChild(content);
+  return button;
+}
+
+function setVirtualTabState(orderedTabs, activeTabId) {
+  virtualTabs = orderedTabs;
+  virtualActiveTabId = activeTabId;
+  virtualDataEpoch += 1;
+  virtualRenderKey = "";
+}
+
+function computeTabListHeight(totalRows) {
+  const pane = tabList.closest(".tab-pane");
+  const header = pane ? pane.querySelector(".tab-pane-header") : null;
+  if (!pane || !header) {
+    return Math.min(totalRows * TAB_ROW_HEIGHT + TAB_LIST_PADDING_Y * 2, 320);
+  }
+  const footerStyle = getComputedStyle(tabNew);
+  const footerMargins =
+    (Number.parseFloat(footerStyle.marginTop) || 0) +
+    (Number.parseFloat(footerStyle.marginBottom) || 0);
+  const footerHeight = tabNew.offsetHeight + footerMargins;
+  const available = pane.clientHeight - header.offsetHeight - footerHeight;
+  const minHeight = TAB_ROW_HEIGHT + TAB_LIST_PADDING_Y * 2;
+  const maxHeight = Math.max(minHeight, available);
+  const desired = totalRows * TAB_ROW_HEIGHT + TAB_LIST_PADDING_Y * 2;
+  return Math.min(maxHeight, desired);
+}
+
+function scheduleVirtualTabListRender() {
+  if (virtualRenderPending) return;
+  virtualRenderPending = true;
+  window.requestAnimationFrame(() => {
+    virtualRenderPending = false;
+    renderVirtualTabList();
+  });
+}
+
+function computeVirtualRange(totalRows, scrollTop, viewportHeight) {
+  const start = Math.max(0, Math.floor(scrollTop / TAB_ROW_HEIGHT) - TAB_OVERSCAN);
+  const end = Math.min(
+    totalRows,
+    Math.ceil((scrollTop + viewportHeight) / TAB_ROW_HEIGHT) + TAB_OVERSCAN
+  );
+  return { start, end };
+}
+
+function renderVirtualTabList() {
+  const totalRows = virtualTabs.length;
+  if (totalRows === 0) {
+    const emptyKey = `empty:${virtualDataEpoch}`;
+    if (virtualRenderKey === emptyKey) return;
+    virtualRenderKey = emptyKey;
+    tabList.style.height = "auto";
+    tabList.scrollTop = 0;
     const empty = document.createElement("div");
     empty.className = "tab-empty";
     empty.textContent = "No tabs yet.";
-    tabList.appendChild(empty);
+    tabList.replaceChildren(empty);
     return;
   }
 
-  orderedTabs.forEach((tab) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "tab-item";
-    button.dataset.tabId = String(tab.id);
-    button.dataset.tabUrl = tab.url || "";
-    if (tab.id === activeTabId) {
-      button.classList.add("active");
-    }
+  const listHeight = Math.round(computeTabListHeight(totalRows));
+  tabList.style.height = `${listHeight}px`;
 
-    const icon = document.createElement("span");
-    icon.className = "tab-icon";
-    icon.textContent = tabLabel(tab).slice(0, 1).toUpperCase();
-    button.appendChild(icon);
+  const viewportHeight = Math.max(1, tabList.clientHeight - TAB_LIST_PADDING_Y * 2);
+  const maxScrollTop = Math.max(0, totalRows * TAB_ROW_HEIGHT - viewportHeight);
+  if (tabList.scrollTop > maxScrollTop) {
+    tabList.scrollTop = maxScrollTop;
+  }
 
-    const content = document.createElement("span");
-    content.className = "tab-copy";
+  const scrollTop = tabList.scrollTop;
+  const { start, end } = computeVirtualRange(totalRows, scrollTop, viewportHeight);
+  const nextRenderKey = [
+    virtualDataEpoch,
+    totalRows,
+    listHeight,
+    start,
+    end,
+    virtualActiveTabId ?? "none",
+  ].join(":");
+  if (virtualRenderKey === nextRenderKey) return;
+  virtualRenderKey = nextRenderKey;
 
-    const title = document.createElement("span");
-    title.className = "tab-title";
-    title.textContent = tabLabel(tab);
-    content.appendChild(title);
+  const fragment = document.createDocumentFragment();
 
-    const url = document.createElement("span");
-    url.className = "tab-url";
-    url.textContent = tab.url || "about:blank";
-    content.appendChild(url);
+  if (start > 0) {
+    const topSpacer = document.createElement("div");
+    topSpacer.className = "tab-spacer";
+    topSpacer.style.height = `${start * TAB_ROW_HEIGHT}px`;
+    fragment.appendChild(topSpacer);
+  }
 
-    button.appendChild(content);
+  for (let index = start; index < end; index += 1) {
+    const tab = virtualTabs[index];
+    const button = createTabButton(tab, tab.id === virtualActiveTabId);
+    fragment.appendChild(button);
+  }
 
-    tabList.appendChild(button);
-  });
+  if (end < totalRows) {
+    const bottomSpacer = document.createElement("div");
+    bottomSpacer.className = "tab-spacer";
+    bottomSpacer.style.height = `${(totalRows - end) * TAB_ROW_HEIGHT}px`;
+    fragment.appendChild(bottomSpacer);
+  }
+
+  tabList.replaceChildren(fragment);
 }
 
 function renderShellState(state) {
@@ -231,7 +335,12 @@ function renderShellState(state) {
   }
 
   renderWorkspaceRail(orderedWorkspaces, activeWorkspaceId);
-  renderTabList(orderedTabs, activeTabId);
+  if (lastRenderedWorkspaceId !== activeWorkspaceId) {
+    tabList.scrollTop = 0;
+    lastRenderedWorkspaceId = activeWorkspaceId;
+  }
+  setVirtualTabState(orderedTabs, activeTabId);
+  renderVirtualTabList();
 
   tabNew.disabled = !activeWorkspaceId;
   workspaceTitleWrap.classList.toggle("disabled", !activeWorkspaceId);
@@ -410,6 +519,10 @@ workspaceTitleWrap.addEventListener("mouseleave", () => {
 });
 workspaceList.addEventListener("click", handleWorkspaceClick);
 tabList.addEventListener("click", handleTabClick);
+tabList.addEventListener("scroll", () => {
+  if (virtualTabs.length <= 1) return;
+  scheduleVirtualTabListRender();
+}, { passive: true });
 tabNew.addEventListener("click", createTabInActiveWorkspace);
 
 renderUri();
@@ -426,4 +539,7 @@ document.addEventListener("visibilitychange", () => {
     syncShellStateFromHost(true);
     syncActiveUriFromHost();
   }
+});
+window.addEventListener("resize", () => {
+  scheduleVirtualTabListRender();
 });
