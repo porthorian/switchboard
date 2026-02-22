@@ -41,6 +41,7 @@ pub struct Tab {
     pub url: String,
     pub title: String,
     pub loading: bool,
+    pub thumbnail_data_url: Option<String>,
     pub pinned: bool,
     pub muted: bool,
     pub runtime_state: TabRuntimeState,

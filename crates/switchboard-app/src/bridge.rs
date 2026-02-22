@@ -1,4 +1,4 @@
-use switchboard_core::{Intent, TabId, WorkspaceId};
+use switchboard_core::{Intent, ProfileId, TabId, WorkspaceId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
@@ -20,6 +20,16 @@ pub enum UiCommand {
     NewWorkspace {
         name: String,
     },
+    NewProfile {
+        name: String,
+    },
+    DeleteProfile {
+        profile_id: u64,
+    },
+    RenameProfile {
+        profile_id: u64,
+        name: String,
+    },
     RenameWorkspace {
         workspace_id: u64,
         name: String,
@@ -29,6 +39,9 @@ pub enum UiCommand {
     },
     SwitchWorkspace {
         workspace_id: u64,
+    },
+    SwitchProfile {
+        profile_id: u64,
     },
     ActivateTab {
         tab_id: u64,
@@ -65,6 +78,18 @@ impl UiCommand {
                     "NewWorkspace requires runtime profile resolution before intent dispatch"
                 )
             }
+            Self::NewProfile { .. } => {
+                unreachable!(
+                    "NewProfile requires runtime defaults before intent dispatch"
+                )
+            }
+            Self::DeleteProfile { profile_id } => Intent::DeleteProfile {
+                profile_id: ProfileId(profile_id),
+            },
+            Self::RenameProfile { profile_id, name } => Intent::RenameProfile {
+                profile_id: ProfileId(profile_id),
+                name,
+            },
             Self::RenameWorkspace { workspace_id, name } => Intent::RenameWorkspace {
                 workspace_id: WorkspaceId(workspace_id),
                 name,
@@ -74,6 +99,9 @@ impl UiCommand {
             },
             Self::SwitchWorkspace { workspace_id } => Intent::SwitchWorkspace {
                 workspace_id: WorkspaceId(workspace_id),
+            },
+            Self::SwitchProfile { profile_id } => Intent::SwitchProfile {
+                profile_id: ProfileId(profile_id),
             },
             Self::ActivateTab { tab_id } => Intent::ActivateTab {
                 tab_id: TabId(tab_id),

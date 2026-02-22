@@ -327,4 +327,31 @@ mod tests {
             } if *workspace_id == second_workspace_id && *op_profile_id == profile_id
         )));
     }
+
+    #[test]
+    fn rename_profile_updates_state_and_patch() {
+        let (mut engine, _workspace_id) = seeded_engine();
+        let profile_id = engine
+            .state()
+            .active_profile_id
+            .expect("profile should exist");
+
+        let patch = engine
+            .dispatch(Intent::RenameProfile {
+                profile_id,
+                name: "Work".to_owned(),
+            })
+            .expect("rename profile should succeed");
+
+        let profile = engine
+            .state()
+            .profiles
+            .get(&profile_id)
+            .expect("profile should exist");
+        assert_eq!(profile.name, "Work");
+        assert!(patch.ops.iter().any(|op| matches!(
+            op,
+            PatchOp::UpsertProfile(profile) if profile.id == profile_id && profile.name == "Work"
+        )));
+    }
 }

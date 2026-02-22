@@ -22,8 +22,44 @@
   </div>
   <div class="leftshell">
     <div class="workspace-rail">
-      <div id="workspace-list" class="workspace-list"></div>
-      <button id="workspace-new" class="workspace-new" type="button" aria-label="New Workspace">+</button>
+      <div class="workspace-rail-main">
+        <div id="workspace-list" class="workspace-list"></div>
+        <button id="workspace-new" class="workspace-new" type="button" aria-label="New Workspace">+</button>
+      </div>
+      <div class="workspace-rail-footer">
+        <div class="profile-menu">
+          <button
+            id="profile-menu-button"
+            class="profile-menu-button"
+            type="button"
+            aria-label="Active profile"
+            aria-haspopup="listbox"
+            aria-expanded="false"
+          >
+            <span id="profile-menu-label" class="profile-menu-label">P</span>
+            <span class="profile-chevron" aria-hidden="true">⌄</span>
+          </button>
+          <div id="profile-menu-popover" class="profile-menu-popover" role="listbox" aria-label="Profiles" hidden>
+            <div id="profile-menu-list" class="profile-menu-list"></div>
+            <form id="profile-editor" class="profile-editor" hidden>
+              <input
+                id="profile-editor-input"
+                class="profile-editor-input"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                aria-label="Profile Name"
+              >
+              <div class="profile-editor-actions">
+                <button id="profile-editor-submit" class="profile-editor-btn primary" type="submit">Save</button>
+                <button id="profile-editor-cancel" class="profile-editor-btn" type="button">Cancel</button>
+              </div>
+            </form>
+            <button id="profile-rename" class="profile-menu-action" type="button">Rename Active Profile</button>
+          </div>
+        </div>
+        <button id="profile-new" class="profile-new" type="button" aria-label="New Profile">+</button>
+      </div>
     </div>
     <div class="tab-pane">
       <div class="tab-pane-header">

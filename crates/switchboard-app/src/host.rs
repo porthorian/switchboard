@@ -952,6 +952,54 @@ fn parse_ui_prompt_payload(payload: &str) -> Result<UiPromptAction, &'static str
     if trimmed == "query_shell_state" {
         return Ok(UiPromptAction::QueryShellState);
     }
+    if let Some(raw_name) = trimmed.strip_prefix("new_profile ") {
+        let name = raw_name.trim();
+        if name.is_empty() {
+            return Err("profile name cannot be empty");
+        }
+        return Ok(UiPromptAction::Intent(UiCommand::NewProfile {
+            name: name.to_owned(),
+        }));
+    }
+    if trimmed == "new_profile" {
+        return Ok(UiPromptAction::Intent(UiCommand::NewProfile {
+            name: "Profile".to_owned(),
+        }));
+    }
+    if let Some(value) = trimmed.strip_prefix("switch_profile ") {
+        let profile_id = value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "switch_profile requires a numeric profile id")?;
+        return Ok(UiPromptAction::Intent(UiCommand::SwitchProfile { profile_id }));
+    }
+    if let Some(value) = trimmed.strip_prefix("delete_profile ") {
+        let profile_id = value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "delete_profile requires a numeric profile id")?;
+        return Ok(UiPromptAction::Intent(UiCommand::DeleteProfile { profile_id }));
+    }
+    if let Some(rest) = trimmed.strip_prefix("rename_profile ") {
+        let mut parts = rest.trim().splitn(2, ' ');
+        let profile_id = parts
+            .next()
+            .ok_or("rename_profile requires profile id")?
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "rename_profile requires a numeric profile id")?;
+        let name = parts
+            .next()
+            .ok_or("rename_profile requires a name")?
+            .trim();
+        if name.is_empty() {
+            return Err("profile name cannot be empty");
+        }
+        return Ok(UiPromptAction::Intent(UiCommand::RenameProfile {
+            profile_id,
+            name: name.to_owned(),
+        }));
+    }
     if let Some(raw_name) = trimmed.strip_prefix("new_workspace ") {
         let name = raw_name.trim();
         if name.is_empty() {

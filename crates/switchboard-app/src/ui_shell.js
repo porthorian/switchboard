@@ -4,6 +4,16 @@ const key = "switchboard.active_uri";
 const input = document.getElementById("url");
 const backButton = document.getElementById("nav-back");
 const forwardButton = document.getElementById("nav-forward");
+const profileMenuButton = document.getElementById("profile-menu-button");
+const profileMenuLabel = document.getElementById("profile-menu-label");
+const profileMenuPopover = document.getElementById("profile-menu-popover");
+const profileMenuList = document.getElementById("profile-menu-list");
+const profileRename = document.getElementById("profile-rename");
+const profileEditor = document.getElementById("profile-editor");
+const profileEditorInput = document.getElementById("profile-editor-input");
+const profileEditorSubmit = document.getElementById("profile-editor-submit");
+const profileEditorCancel = document.getElementById("profile-editor-cancel");
+const profileNew = document.getElementById("profile-new");
 const workspaceList = document.getElementById("workspace-list");
 const workspaceNew = document.getElementById("workspace-new");
 const workspaceTitleWrap = document.getElementById("workspace-title-wrap");
@@ -27,10 +37,14 @@ let editingWorkspaceOriginalName = "";
 let pendingWorkspaceRenameId = null;
 let virtualTabs = [];
 let virtualActiveTabId = null;
+let lastRenderedProfileId = null;
 let lastRenderedWorkspaceId = null;
 let virtualRenderPending = false;
 let virtualDataEpoch = 0;
 let virtualRenderKey = "";
+let profileMenuOpen = false;
+let profileEditorMode = null;
+let profileEditorTargetId = null;
 
 function send(payload) {
   try {
@@ -124,6 +138,22 @@ function workspaceBadge(name) {
   return trimmed.slice(0, 1).toUpperCase();
 }
 
+function profileBadge(name, fallbackId) {
+  const trimmed = (name || "").trim();
+  if (trimmed) return trimmed.slice(0, 1).toUpperCase();
+  if (fallbackId !== undefined && fallbackId !== null) return String(fallbackId).slice(0, 1).toUpperCase();
+  return "P";
+}
+
+function profileDisplayName(profile) {
+  const trimmed = (profile?.name || "").trim();
+  if (trimmed) return trimmed;
+  if (profile && profile.id !== undefined && profile.id !== null) {
+    return `Profile ${profile.id}`;
+  }
+  return "Profile";
+}
+
 function tabLabel(tab) {
   if (tab.title && tab.title.trim()) return tab.title.trim();
   if (tab.url) {
@@ -154,12 +184,64 @@ function deriveActiveContext(state) {
   const activeTab = activeWorkspace ? tabs.get(activeWorkspace.active_tab_id) || null : null;
 
   return {
+    orderedProfiles: state.profiles || [],
     activeProfile,
     activeWorkspace,
     activeTab,
     orderedWorkspaces,
     orderedTabs,
   };
+}
+
+function renderProfileControls(orderedProfiles, activeProfile) {
+  profileMenuList.innerHTML = "";
+  const activeProfileId = activeProfile ? activeProfile.id : null;
+  let activeProfileName = "";
+  let activeProfileBadge = "P";
+  orderedProfiles.forEach((profile) => {
+    const displayName = profileDisplayName(profile);
+    const option = document.createElement("button");
+    option.type = "button";
+    option.className = "profile-menu-item";
+    option.dataset.profileId = String(profile.id);
+    option.title = displayName;
+
+    const badge = document.createElement("span");
+    badge.className = "profile-menu-item-badge";
+    badge.textContent = profileBadge(profile.name, profile.id);
+    option.appendChild(badge);
+
+    const name = document.createElement("span");
+    name.className = "profile-menu-item-name";
+    name.textContent = displayName;
+    option.appendChild(name);
+
+    if (profile.id === activeProfileId) {
+      option.classList.add("active");
+      activeProfileName = displayName;
+      activeProfileBadge = profileBadge(profile.name, profile.id);
+    }
+    profileMenuList.appendChild(option);
+  });
+  if (orderedProfiles.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "profile-menu-empty";
+    empty.textContent = "No profiles";
+    profileMenuList.appendChild(empty);
+  }
+  profileMenuButton.disabled = orderedProfiles.length === 0;
+  profileMenuButton.title = activeProfileName || "No active profile";
+  profileMenuLabel.textContent = activeProfileBadge;
+  profileRename.disabled = activeProfileId === null;
+  profileRename.title = activeProfileName
+    ? `Rename "${activeProfileName}"`
+    : "Rename profile";
+  if (profileMenuOpen && activeProfileId === null) {
+    closeProfileMenu();
+  }
+  if (profileEditorMode === "rename" && activeProfileId === null) {
+    closeProfileEditor();
+  }
 }
 
 function renderWorkspaceRail(orderedWorkspaces, activeWorkspaceId) {
@@ -194,6 +276,10 @@ function createTabButton(tab, isActive) {
 
   const icon = document.createElement("span");
   icon.className = "tab-icon";
+  if (tab.thumbnail_data_url) {
+    icon.classList.add("thumbnail");
+    icon.style.backgroundImage = `url("${tab.thumbnail_data_url}")`;
+  }
   icon.textContent = label.slice(0, 1).toUpperCase();
   button.appendChild(icon);
 
@@ -330,7 +416,15 @@ function renderVirtualTabList() {
 }
 
 function renderShellState(state) {
-  const { activeWorkspace, activeTab, orderedWorkspaces, orderedTabs } = deriveActiveContext(state);
+  const {
+    orderedProfiles,
+    activeProfile,
+    activeWorkspace,
+    activeTab,
+    orderedWorkspaces,
+    orderedTabs,
+  } = deriveActiveContext(state);
+  const activeProfileId = activeProfile ? activeProfile.id : null;
   const activeWorkspaceId = activeWorkspace ? activeWorkspace.id : null;
   const activeTabId = activeWorkspace ? activeWorkspace.active_tab_id : null;
   const renameSyncResolved =
@@ -347,9 +441,11 @@ function renderShellState(state) {
     pendingWorkspaceRenameId = null;
   }
 
+  renderProfileControls(orderedProfiles, activeProfile);
   renderWorkspaceRail(orderedWorkspaces, activeWorkspaceId);
-  if (lastRenderedWorkspaceId !== activeWorkspaceId) {
+  if (lastRenderedProfileId !== activeProfileId || lastRenderedWorkspaceId !== activeWorkspaceId) {
     tabList.scrollTop = 0;
+    lastRenderedProfileId = activeProfileId;
     lastRenderedWorkspaceId = activeWorkspaceId;
   }
   setVirtualTabState(orderedTabs, activeTabId);
@@ -387,6 +483,121 @@ function nextWorkspaceName() {
     return "Workspace";
   }
   return `Workspace ${shellState.workspaces.length + 1}`;
+}
+
+function nextProfileName() {
+  if (!shellState || !Array.isArray(shellState.profiles)) {
+    return "Profile";
+  }
+  return `Profile ${shellState.profiles.length + 1}`;
+}
+
+function createProfile() {
+  openProfileEditor("create");
+}
+
+function switchProfile(profileId) {
+  if (!profileId) return;
+  if (
+    shellState &&
+    shellState.active_profile_id !== null &&
+    String(shellState.active_profile_id) === String(profileId)
+  ) {
+    return;
+  }
+  send(`switch_profile ${profileId}`);
+  queueStateRefresh();
+}
+
+function renameActiveProfile() {
+  if (!shellState) return;
+  const { activeProfile } = deriveActiveContext(shellState);
+  if (!activeProfile) return;
+  openProfileEditor("rename");
+}
+
+function openProfileEditor(mode) {
+  if (!shellState) return;
+  const { activeProfile } = deriveActiveContext(shellState);
+  const isRename = mode === "rename";
+  const targetProfile = isRename ? activeProfile : null;
+  if (isRename && !targetProfile) return;
+  openProfileMenu();
+  profileEditorMode = mode;
+  profileEditorTargetId = targetProfile ? targetProfile.id : null;
+  profileEditorSubmit.textContent = isRename ? "Save" : "Create";
+  profileEditorInput.value = isRename
+    ? profileDisplayName(targetProfile)
+    : nextProfileName();
+  profileEditor.hidden = false;
+  window.requestAnimationFrame(() => {
+    profileEditorInput.focus();
+    profileEditorInput.select();
+  });
+}
+
+function closeProfileEditor() {
+  profileEditorMode = null;
+  profileEditorTargetId = null;
+  profileEditor.hidden = true;
+  profileEditorInput.value = "";
+}
+
+function submitProfileEditor() {
+  if (!shellState) {
+    closeProfileEditor();
+    return;
+  }
+  if (!profileEditorMode) return;
+  const name = profileEditorInput.value.trim();
+  if (!name) {
+    window.alert("Profile name cannot be empty.");
+    return;
+  }
+  if (profileEditorMode === "rename") {
+    if (profileEditorTargetId === null) {
+      closeProfileEditor();
+      return;
+    }
+    const activeProfile = deriveActiveContext(shellState).activeProfile;
+    const currentName = profileDisplayName(activeProfile);
+    if (name === currentName) {
+      closeProfileEditor();
+      return;
+    }
+    send(`rename_profile ${profileEditorTargetId} ${name}`);
+    closeProfileEditor();
+    closeProfileMenu();
+    queueStateRefresh();
+    return;
+  }
+  send(`new_profile ${name}`);
+  closeProfileEditor();
+  closeProfileMenu();
+  queueStateRefresh();
+}
+
+function openProfileMenu() {
+  if (profileMenuButton.disabled || profileMenuOpen) return;
+  profileMenuOpen = true;
+  profileMenuPopover.hidden = false;
+  profileMenuButton.setAttribute("aria-expanded", "true");
+}
+
+function closeProfileMenu() {
+  if (!profileMenuOpen) return;
+  profileMenuOpen = false;
+  profileMenuPopover.hidden = true;
+  profileMenuButton.setAttribute("aria-expanded", "false");
+  closeProfileEditor();
+}
+
+function toggleProfileMenu() {
+  if (profileMenuOpen) {
+    closeProfileMenu();
+  } else {
+    openProfileMenu();
+  }
 }
 
 function createWorkspace() {
@@ -503,6 +714,35 @@ input.addEventListener("keydown", (event) => {
 });
 backButton.addEventListener("click", goBack);
 forwardButton.addEventListener("click", goForward);
+profileNew.addEventListener("click", createProfile);
+profileMenuButton.addEventListener("click", (event) => {
+  event.stopPropagation();
+  toggleProfileMenu();
+});
+profileMenuList.addEventListener("click", (event) => {
+  const selected = event.target.closest(".profile-menu-item");
+  if (!selected) return;
+  const selectedProfileId = selected.dataset.profileId || "";
+  closeProfileMenu();
+  switchProfile(selectedProfileId);
+});
+profileRename.addEventListener("click", (event) => {
+  event.stopPropagation();
+  renameActiveProfile();
+});
+profileEditor.addEventListener("submit", (event) => {
+  event.preventDefault();
+  submitProfileEditor();
+});
+profileEditorCancel.addEventListener("click", (event) => {
+  event.stopPropagation();
+  closeProfileEditor();
+});
+profileEditorInput.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  event.preventDefault();
+  closeProfileEditor();
+});
 workspaceNew.addEventListener("click", createWorkspace);
 workspaceDelete.addEventListener("click", deleteActiveWorkspace);
 workspaceTitleWrap.addEventListener("click", () => {
@@ -548,6 +788,15 @@ tabList.addEventListener("scroll", () => {
   scheduleVirtualTabListRender();
 }, { passive: true });
 tabNew.addEventListener("click", createTabInActiveWorkspace);
+document.addEventListener("pointerdown", (event) => {
+  if (!profileMenuOpen) return;
+  if (event.target.closest(".profile-menu")) return;
+  closeProfileMenu();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  closeProfileMenu();
+});
 
 renderUri();
 send("ui_ready 0.1.0-dev");

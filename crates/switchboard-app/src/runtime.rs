@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
@@ -14,6 +15,7 @@ use crate::host::{
 };
 
 const UI_SHELL_URL_BASE: &str = "app://ui";
+const THUMBNAIL_MAX_ENTRIES: usize = 120;
 
 #[derive(Debug)]
 pub enum RuntimeError<HError> {
@@ -38,7 +40,8 @@ pub struct AppRuntime<H: CefHost> {
     window_id: WindowId,
     ui_view_id: UiViewId,
     default_workspace_id: WorkspaceId,
-    content_binding: Option<ContentBinding>,
+    content_bindings: BTreeMap<ProfileId, ContentBinding>,
+    thumbnail_lru: Vec<TabId>,
 }
 
 impl<H: CefHost + 'static> AppRuntime<H> {
@@ -72,7 +75,8 @@ impl<H: CefHost + 'static> AppRuntime<H> {
             window_id,
             ui_view_id,
             default_workspace_id: workspace_id,
-            content_binding: None,
+            content_bindings: BTreeMap::new(),
+            thumbnail_lru: Vec::new(),
         })
     }
 
@@ -147,6 +151,7 @@ impl<H: CefHost + 'static> AppRuntime<H> {
                     .ok_or(RuntimeError::NoActiveProfile)?;
                 self.handle_intent(Intent::NewWorkspace { profile_id, name })
             }
+            UiCommand::NewProfile { name } => self.handle_intent(Intent::NewProfile { name }),
             other => self.handle_intent(other.into_intent()),
         }
     }
@@ -167,18 +172,10 @@ impl<H: CefHost + 'static> AppRuntime<H> {
         if let Some((tab_id, url)) = navigation {
             self.ensure_single_content_view(tab_id, &url)?;
         } else if patch_updates_active_content(&patch) {
-            if let Some((tab_id, url)) = self.resolve_active_tab_target() {
-                self.ensure_single_content_view(tab_id, &url)?;
-            } else if let Some(binding) = self.content_binding {
-                self.host
-                    .clear_content_view(binding.view_id)
-                    .map_err(RuntimeError::Host)?;
-                self.host
-                    .set_content_view_visible(binding.view_id, false)
-                    .map_err(RuntimeError::Host)?;
-            }
+            self.sync_active_profile_content_view()?;
         }
 
+        self.cleanup_deleted_profile_bindings()?;
         Ok(patch)
     }
 
@@ -186,24 +183,20 @@ impl<H: CefHost + 'static> AppRuntime<H> {
         &mut self,
         event: ContentEvent,
     ) -> Result<Patch, RuntimeError<H::Error>> {
-        let intent = match event {
-            ContentEvent::UrlChanged { tab_id, url } => Intent::ObserveTabUrl { tab_id, url },
-            ContentEvent::TitleChanged { tab_id, title } => Intent::ObserveTabTitle {
+        let (intent, tab_id, should_capture_thumbnail) = match event {
+            ContentEvent::UrlChanged { tab_id, url } => {
+                (Intent::ObserveTabUrl { tab_id, url }, tab_id, false)
+            }
+            ContentEvent::TitleChanged { tab_id, title } => {
+                (Intent::ObserveTabTitle { tab_id, title }, tab_id, false)
+            }
+            ContentEvent::LoadingChanged { tab_id, is_loading } => (
+                Intent::ObserveTabLoading { tab_id, is_loading },
                 tab_id,
-                title,
-            },
-            ContentEvent::LoadingChanged { tab_id, is_loading } => Intent::ObserveTabLoading {
-                tab_id,
-                is_loading,
-            },
+                !is_loading,
+            ),
         };
 
-        let tab_id = match &intent {
-            Intent::ObserveTabUrl { tab_id, .. }
-            | Intent::ObserveTabTitle { tab_id, .. }
-            | Intent::ObserveTabLoading { tab_id, .. } => *tab_id,
-            _ => unreachable!("content events always map to observe-tab intents"),
-        };
         if !self.engine.state().tabs.contains_key(&tab_id) {
             let revision = self.revision();
             return Ok(Patch {
@@ -213,7 +206,12 @@ impl<H: CefHost + 'static> AppRuntime<H> {
             });
         }
 
-        self.handle_intent(intent)
+        let patch = self.handle_intent(intent)?;
+        if should_capture_thumbnail {
+            self.capture_thumbnail_for_tab(tab_id)?;
+            self.cleanup_thumbnail_storage()?;
+        }
+        Ok(patch)
     }
 
     pub fn active_tab_id(&self, workspace_id: WorkspaceId) -> Option<TabId> {
@@ -245,6 +243,134 @@ impl<H: CefHost + 'static> AppRuntime<H> {
 
     fn resolve_active_profile_id(&self) -> Option<ProfileId> {
         self.engine.state().active_profile_id
+    }
+
+    fn sync_active_profile_content_view(&mut self) -> Result<(), RuntimeError<H::Error>> {
+        let active_profile_id = match self.resolve_active_profile_id() {
+            Some(profile_id) => profile_id,
+            None => {
+                self.set_profile_view_visibility(None)?;
+                return Ok(());
+            }
+        };
+
+        if let Some((tab_id, url)) = self.resolve_active_tab_target() {
+            self.ensure_single_content_view(tab_id, &url)?;
+            self.set_profile_view_visibility(Some(active_profile_id))?;
+            return Ok(());
+        }
+
+        if let Some(binding) = self.content_bindings.get(&active_profile_id).copied() {
+            self.host
+                .clear_content_view(binding.view_id)
+                .map_err(RuntimeError::Host)?;
+            self.host
+                .set_content_view_visible(binding.view_id, false)
+                .map_err(RuntimeError::Host)?;
+        }
+
+        self.set_profile_view_visibility(Some(active_profile_id))?;
+        Ok(())
+    }
+
+    fn set_profile_view_visibility(
+        &mut self,
+        active_profile_id: Option<ProfileId>,
+    ) -> Result<(), RuntimeError<H::Error>> {
+        let views: Vec<(ProfileId, ContentViewId)> = self
+            .content_bindings
+            .iter()
+            .map(|(profile_id, binding)| (*profile_id, binding.view_id))
+            .collect();
+        for (profile_id, view_id) in views {
+            let visible = active_profile_id == Some(profile_id);
+            self.host
+                .set_content_view_visible(view_id, visible)
+                .map_err(RuntimeError::Host)?;
+        }
+        Ok(())
+    }
+
+    fn capture_thumbnail_for_tab(&mut self, tab_id: TabId) -> Result<(), RuntimeError<H::Error>> {
+        let Some(tab) = self.engine.state().tabs.get(&tab_id).cloned() else {
+            self.thumbnail_lru.retain(|candidate| *candidate != tab_id);
+            return Ok(());
+        };
+        let data_url = build_thumbnail_data_url(&tab.title, &tab.url);
+        self.engine
+            .dispatch(Intent::ObserveTabThumbnail {
+                tab_id,
+                data_url: Some(data_url),
+            })
+            .map_err(RuntimeError::Engine)?;
+        self.touch_thumbnail_lru(tab_id);
+        Ok(())
+    }
+
+    fn touch_thumbnail_lru(&mut self, tab_id: TabId) {
+        if let Some(index) = self
+            .thumbnail_lru
+            .iter()
+            .position(|candidate| *candidate == tab_id)
+        {
+            self.thumbnail_lru.remove(index);
+        }
+        self.thumbnail_lru.push(tab_id);
+    }
+
+    fn cleanup_thumbnail_storage(&mut self) -> Result<(), RuntimeError<H::Error>> {
+        self.thumbnail_lru.retain(|tab_id| {
+            self.engine
+                .state()
+                .tabs
+                .get(tab_id)
+                .and_then(|tab| tab.thumbnail_data_url.as_ref())
+                .is_some()
+        });
+
+        while self.thumbnail_lru.len() > THUMBNAIL_MAX_ENTRIES {
+            let tab_id = self.thumbnail_lru.remove(0);
+            let has_thumbnail = self
+                .engine
+                .state()
+                .tabs
+                .get(&tab_id)
+                .and_then(|tab| tab.thumbnail_data_url.as_ref())
+                .is_some();
+            if !has_thumbnail {
+                continue;
+            }
+            self.engine
+                .dispatch(Intent::ObserveTabThumbnail {
+                    tab_id,
+                    data_url: None,
+                })
+                .map_err(RuntimeError::Engine)?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_deleted_profile_bindings(&mut self) -> Result<(), RuntimeError<H::Error>> {
+        let existing_profile_ids: std::collections::BTreeSet<ProfileId> =
+            self.engine.state().profiles.keys().copied().collect();
+        let removed_profile_ids: Vec<ProfileId> = self
+            .content_bindings
+            .keys()
+            .copied()
+            .filter(|profile_id| !existing_profile_ids.contains(profile_id))
+            .collect();
+
+        for profile_id in removed_profile_ids {
+            if let Some(binding) = self.content_bindings.remove(&profile_id) {
+                self.host
+                    .clear_content_view(binding.view_id)
+                    .map_err(RuntimeError::Host)?;
+                self.host
+                    .set_content_view_visible(binding.view_id, false)
+                    .map_err(RuntimeError::Host)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn ui_shell_state_json(&self) -> String {
@@ -334,6 +460,9 @@ impl<H: CefHost + 'static> AppRuntime<H> {
             json.push_str("\"id\":");
             json.push_str(&tab.id.0.to_string());
             json.push(',');
+            json.push_str("\"profile_id\":");
+            json.push_str(&tab.profile_id.0.to_string());
+            json.push(',');
             json.push_str("\"workspace_id\":");
             json.push_str(&tab.workspace_id.0.to_string());
             json.push(',');
@@ -345,6 +474,12 @@ impl<H: CefHost + 'static> AppRuntime<H> {
             json.push(',');
             json.push_str("\"loading\":");
             json.push_str(if tab.loading { "true" } else { "false" });
+            json.push(',');
+            json.push_str("\"thumbnail_data_url\":");
+            match &tab.thumbnail_data_url {
+                Some(value) => push_json_string(&mut json, value),
+                None => json.push_str("null"),
+            }
             json.push_str("}");
         }
         json.push_str("]}");
@@ -363,20 +498,24 @@ impl<H: CefHost + 'static> AppRuntime<H> {
             .get(&tab_id)
             .ok_or(RuntimeError::TabNotFound(tab_id))?;
         let workspace_id = tab.workspace_id;
+        let profile_id = tab.profile_id;
         if !self.engine.state().workspaces.contains_key(&workspace_id) {
             return Err(RuntimeError::WorkspaceNotFound(workspace_id));
         }
 
-        match self.content_binding {
+        match self.content_bindings.get(&profile_id).copied() {
             Some(mut binding) => {
                 self.host
                     .navigate_content_view(binding.view_id, tab_id, url)
                     .map_err(RuntimeError::Host)?;
                 self.host
-                    .set_content_view_visible(binding.view_id, true)
+                    .set_content_view_visible(
+                        binding.view_id,
+                        self.resolve_active_profile_id() == Some(profile_id),
+                    )
                     .map_err(RuntimeError::Host)?;
                 binding.tab_id = tab_id;
-                self.content_binding = Some(binding);
+                self.content_bindings.insert(profile_id, binding);
             }
             None => {
                 let view_id = self
@@ -384,9 +523,13 @@ impl<H: CefHost + 'static> AppRuntime<H> {
                     .create_content_view(self.window_id, tab_id, url)
                     .map_err(RuntimeError::Host)?;
                 self.host
-                    .set_content_view_visible(view_id, true)
+                    .set_content_view_visible(
+                        view_id,
+                        self.resolve_active_profile_id() == Some(profile_id),
+                    )
                     .map_err(RuntimeError::Host)?;
-                self.content_binding = Some(ContentBinding { view_id, tab_id });
+                self.content_bindings
+                    .insert(profile_id, ContentBinding { view_id, tab_id });
             }
         }
 
@@ -425,6 +568,48 @@ fn patch_updates_active_content(patch: &Patch) -> bool {
                 | PatchOp::SetActiveTab { .. }
         )
     })
+}
+
+fn build_thumbnail_data_url(title: &str, url: &str) -> String {
+    let title_line = if title.trim().is_empty() {
+        "Untitled Tab"
+    } else {
+        title.trim()
+    };
+    let subtitle = if url.trim().is_empty() {
+        "about:blank"
+    } else {
+        url.trim()
+    };
+    let title_line = escape_xml(title_line);
+    let subtitle = escape_xml(subtitle);
+    let svg = format!(
+        "<svg xmlns='http://www.w3.org/2000/svg' width='288' height='180' viewBox='0 0 288 180'><defs><linearGradient id='bg' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='#111b31'/><stop offset='100%' stop-color='#1f365f'/></linearGradient></defs><rect width='288' height='180' fill='url(#bg)'/><rect x='12' y='12' width='264' height='156' rx='10' fill='rgba(8,16,30,0.62)' stroke='rgba(126,164,255,0.35)'/><text x='20' y='74' fill='#e7efff' font-size='15' font-family='-apple-system, Segoe UI, sans-serif'>{title_line}</text><text x='20' y='101' fill='#9fb5e3' font-size='11' font-family='-apple-system, Segoe UI, sans-serif'>{subtitle}</text></svg>"
+    );
+    format!("data:image/svg+xml;utf8,{}", percent_encode_uri_component(&svg))
+}
+
+fn percent_encode_uri_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() + 32);
+    for byte in value.bytes() {
+        let keep = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
+        if keep {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn push_json_string(json: &mut String, value: &str) {
@@ -782,5 +967,105 @@ mod tests {
         assert!(patch.ops.is_empty());
         assert_eq!(patch.from_revision, revision_before);
         assert_eq!(patch.to_revision, revision_before);
+    }
+
+    #[test]
+    fn switching_profiles_uses_separate_content_views() {
+        let host = MockCefHost::default();
+        let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
+        let default_profile_id = runtime
+            .engine()
+            .state()
+            .active_profile_id
+            .expect("default profile should exist");
+        let default_workspace_id = runtime.default_workspace_id();
+
+        runtime
+            .handle_ui_command(UiCommand::NewTab {
+                workspace_id: default_workspace_id.0,
+                url: Some("https://one.example".to_owned()),
+                make_active: true,
+            })
+            .expect("default profile tab should be created");
+
+        runtime
+            .handle_ui_command(UiCommand::NewProfile {
+                name: "Work".to_owned(),
+            })
+            .expect("new profile should be created");
+        let second_profile_id = runtime
+            .engine()
+            .state()
+            .profiles
+            .keys()
+            .copied()
+            .find(|id| *id != default_profile_id)
+            .expect("second profile should exist");
+        let second_workspace_id = runtime
+            .engine()
+            .state()
+            .profiles
+            .get(&second_profile_id)
+            .and_then(|profile| profile.active_workspace_id)
+            .expect("second profile should have active workspace");
+
+        runtime
+            .handle_ui_command(UiCommand::NewTab {
+                workspace_id: second_workspace_id.0,
+                url: Some("https://two.example".to_owned()),
+                make_active: true,
+            })
+            .expect("second profile tab should be created");
+
+        runtime
+            .handle_ui_command(UiCommand::SwitchProfile {
+                profile_id: default_profile_id.0,
+            })
+            .expect("switching back to default profile should succeed");
+
+        let content_create_count = runtime
+            .host()
+            .events()
+            .iter()
+            .filter(|event| matches!(event, HostEvent::ContentViewCreated { .. }))
+            .count();
+        assert_eq!(content_create_count, 2);
+    }
+
+    #[test]
+    fn loading_complete_captures_thumbnail_placeholder() {
+        let host = MockCefHost::default();
+        let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
+        let workspace_id = runtime.default_workspace_id();
+
+        runtime
+            .handle_ui_command(UiCommand::NewTab {
+                workspace_id: workspace_id.0,
+                url: Some("https://thumbnail.example".to_owned()),
+                make_active: true,
+            })
+            .expect("tab should be created");
+        let tab_id = runtime
+            .active_tab_id(workspace_id)
+            .expect("tab should be active");
+
+        runtime
+            .handle_content_event(ContentEvent::LoadingChanged {
+                tab_id,
+                is_loading: false,
+            })
+            .expect("loading complete should update metadata");
+
+        let tab = runtime
+            .engine()
+            .state()
+            .tabs
+            .get(&tab_id)
+            .expect("tab should exist");
+        let data_url = tab
+            .thumbnail_data_url
+            .as_ref()
+            .expect("thumbnail placeholder should be captured");
+        assert!(data_url.starts_with("data:image/svg+xml;utf8,"));
     }
 }

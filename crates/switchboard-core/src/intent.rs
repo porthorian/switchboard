@@ -25,6 +25,20 @@ pub enum Intent {
         tab_id: TabId,
         is_loading: bool,
     },
+    ObserveTabThumbnail {
+        tab_id: TabId,
+        data_url: Option<String>,
+    },
+    NewProfile {
+        name: String,
+    },
+    DeleteProfile {
+        profile_id: ProfileId,
+    },
+    RenameProfile {
+        profile_id: ProfileId,
+        name: String,
+    },
     NewTab {
         workspace_id: WorkspaceId,
         url: Option<String>,

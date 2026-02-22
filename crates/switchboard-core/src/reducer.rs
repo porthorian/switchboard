@@ -8,6 +8,7 @@ pub enum ReduceError {
     ProfileNotFound(ProfileId),
     WorkspaceNotFound(WorkspaceId),
     TabNotFound(TabId),
+    CannotDeleteLastProfile(ProfileId),
     CannotDeleteLastWorkspace(WorkspaceId),
     CrossProfileMove {
         tab_id: TabId,
@@ -22,12 +23,175 @@ pub fn apply_intent(state: &mut BrowserState, intent: Intent) -> Result<Vec<Patc
 
     match intent {
         Intent::UiReady { .. } | Intent::FrameCommitted { .. } => {}
-        Intent::SwitchProfile { profile_id } => {
+        Intent::NewProfile { name } => {
+            let profile_id = state.add_profile(name);
+            let workspace_id = state
+                .add_workspace(profile_id, "Workspace 1")
+                .map_err(|_| ReduceError::ProfileNotFound(profile_id))?;
+            state.active_profile_id = Some(profile_id);
+            let profile = state
+                .profiles
+                .get(&profile_id)
+                .cloned()
+                .ok_or(ReduceError::ProfileNotFound(profile_id))?;
+            let workspace = state
+                .workspaces
+                .get(&workspace_id)
+                .cloned()
+                .ok_or(ReduceError::WorkspaceNotFound(workspace_id))?;
+            ops.push(PatchOp::UpsertProfile(profile));
+            ops.push(PatchOp::UpsertWorkspace(workspace));
+            ops.push(PatchOp::SetActiveProfile { profile_id });
+            ops.push(PatchOp::SetActiveWorkspace {
+                profile_id,
+                workspace_id,
+            });
+            ops.push(PatchOp::SetActiveTab {
+                workspace_id,
+                tab_id: None,
+            });
+        }
+        Intent::RenameProfile { profile_id, name } => {
+            let profile = state
+                .profiles
+                .get_mut(&profile_id)
+                .ok_or(ReduceError::ProfileNotFound(profile_id))?;
+            profile.name = name;
+            ops.push(PatchOp::UpsertProfile(profile.clone()));
+        }
+        Intent::DeleteProfile { profile_id } => {
             if !state.profiles.contains_key(&profile_id) {
                 return Err(ReduceError::ProfileNotFound(profile_id));
             }
+            if state.profiles.len() <= 1 {
+                return Err(ReduceError::CannotDeleteLastProfile(profile_id));
+            }
+
+            let profile = state
+                .profiles
+                .get(&profile_id)
+                .cloned()
+                .ok_or(ReduceError::ProfileNotFound(profile_id))?;
+
+            for workspace_id in profile.workspace_order {
+                if let Some(workspace) = state.workspaces.remove(&workspace_id) {
+                    for tab_id in workspace.tab_order {
+                        if state.tabs.remove(&tab_id).is_some() {
+                            ops.push(PatchOp::RemoveTab {
+                                tab_id,
+                                workspace_id,
+                            });
+                        }
+                    }
+                    ops.push(PatchOp::RemoveWorkspace {
+                        workspace_id,
+                        profile_id,
+                    });
+                }
+            }
+
+            state.profiles.remove(&profile_id);
+
+            if state.active_profile_id == Some(profile_id) {
+                let next_profile_id = state.profiles.keys().next().copied();
+                state.active_profile_id = next_profile_id;
+                if let Some(next_profile_id) = next_profile_id {
+                    ops.push(PatchOp::SetActiveProfile {
+                        profile_id: next_profile_id,
+                    });
+                    let active_workspace_id = state
+                        .profiles
+                        .get(&next_profile_id)
+                        .and_then(|profile| profile.active_workspace_id);
+                    if let Some(workspace_id) = active_workspace_id {
+                        let active_tab_id = state
+                            .workspaces
+                            .get(&workspace_id)
+                            .and_then(|workspace| workspace.active_tab_id);
+                        ops.push(PatchOp::SetActiveWorkspace {
+                            profile_id: next_profile_id,
+                            workspace_id,
+                        });
+                        ops.push(PatchOp::SetActiveTab {
+                            workspace_id,
+                            tab_id: active_tab_id,
+                        });
+                    }
+                }
+            }
+        }
+        Intent::SwitchProfile { profile_id } => {
+            let profile = state
+                .profiles
+                .get(&profile_id)
+                .cloned()
+                .ok_or(ReduceError::ProfileNotFound(profile_id))?;
+            let active_workspace_id = profile.active_workspace_id;
+            if state.active_profile_id == Some(profile_id) {
+                return Ok(ops);
+            }
             state.active_profile_id = Some(profile_id);
+            ops.push(PatchOp::UpsertProfile(profile));
             ops.push(PatchOp::SetActiveProfile { profile_id });
+            if let Some(workspace_id) = active_workspace_id {
+                let active_tab_id = state
+                    .workspaces
+                    .get(&workspace_id)
+                    .ok_or(ReduceError::WorkspaceNotFound(workspace_id))?
+                    .active_tab_id;
+                ops.push(PatchOp::SetActiveWorkspace {
+                    profile_id,
+                    workspace_id,
+                });
+                ops.push(PatchOp::SetActiveTab {
+                    workspace_id,
+                    tab_id: active_tab_id,
+                });
+            }
+        }
+        Intent::SwitchWorkspace { workspace_id } => {
+            let profile_id = state
+                .workspaces
+                .get(&workspace_id)
+                .ok_or(ReduceError::WorkspaceNotFound(workspace_id))?
+                .profile_id;
+            let profile_snapshot = {
+                let profile = state
+                    .profiles
+                    .get_mut(&profile_id)
+                    .ok_or(ReduceError::ProfileNotFound(profile_id))?;
+                profile.active_workspace_id = Some(workspace_id);
+                profile.clone()
+            };
+            state.active_profile_id = Some(profile_id);
+
+            let active_tab_id = state
+                .workspaces
+                .get(&workspace_id)
+                .ok_or(ReduceError::WorkspaceNotFound(workspace_id))?
+                .active_tab_id;
+
+            ops.push(PatchOp::UpsertProfile(profile_snapshot));
+            ops.push(PatchOp::SetActiveProfile { profile_id });
+            ops.push(PatchOp::SetActiveWorkspace {
+                profile_id,
+                workspace_id,
+            });
+            ops.push(PatchOp::SetActiveTab {
+                workspace_id,
+                tab_id: active_tab_id,
+            });
+        }
+        Intent::ObserveTabThumbnail { tab_id, data_url } => {
+            let tab = state
+                .tabs
+                .get_mut(&tab_id)
+                .ok_or(ReduceError::TabNotFound(tab_id))?;
+            if tab.thumbnail_data_url == data_url {
+                return Ok(ops);
+            }
+            tab.thumbnail_data_url = data_url;
+            ops.push(PatchOp::UpsertTab(tab.clone()));
         }
         Intent::NewWorkspace { profile_id, name } => {
             if !state.profiles.contains_key(&profile_id) {
@@ -137,29 +301,6 @@ pub fn apply_intent(state: &mut BrowserState, intent: Intent) -> Result<Vec<Patc
                 }
             }
         }
-        Intent::SwitchWorkspace { workspace_id } => {
-            let profile_id = state
-                .workspaces
-                .get(&workspace_id)
-                .ok_or(ReduceError::WorkspaceNotFound(workspace_id))?
-                .profile_id;
-            let profile_snapshot = {
-                let profile = state
-                    .profiles
-                    .get_mut(&profile_id)
-                    .ok_or(ReduceError::ProfileNotFound(profile_id))?;
-                profile.active_workspace_id = Some(workspace_id);
-                profile.clone()
-            };
-            state.active_profile_id = Some(profile_id);
-
-            ops.push(PatchOp::UpsertProfile(profile_snapshot));
-            ops.push(PatchOp::SetActiveProfile { profile_id });
-            ops.push(PatchOp::SetActiveWorkspace {
-                profile_id,
-                workspace_id,
-            });
-        }
         Intent::NewTab {
             workspace_id,
             url,
@@ -192,6 +333,7 @@ pub fn apply_intent(state: &mut BrowserState, intent: Intent) -> Result<Vec<Patc
                 url: url.unwrap_or_else(|| "about:blank".to_owned()),
                 title: String::new(),
                 loading: false,
+                thumbnail_data_url: None,
                 pinned: false,
                 muted: false,
                 runtime_state: if make_active {
