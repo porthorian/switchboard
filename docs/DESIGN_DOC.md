@@ -83,6 +83,26 @@ We operate with **separated contexts**:
 * Rust bridge enabled **only** for trusted UI frames under `app://ui/*`
 * UI assets bundled locally (no remote CDN dependencies in MVP)
 
+### 5.4 Security Objective (Non-Negotiable)
+
+Untrusted web content must never gain host-level control.
+
+Concrete requirement:
+
+* No website can trigger arbitrary native code execution, arbitrary local file access, or privileged OS actions through browser APIs.
+* Browser chrome actions must only be reachable via explicit trusted UI intents and strict allowlists.
+* Any unknown/invalid intent, malformed message, or unauthorized origin is rejected by default.
+
+### 5.5 Security Invariants
+
+These invariants must remain true across all milestones:
+
+* Default-deny bridge: only explicit command allowlist, argument validation, and origin checks.
+* Least privilege by context: content context has no privileged bridge surface.
+* Scheme isolation: `app://` resources remain inaccessible to web content.
+* Process boundary respect: CEF sandbox and multiprocess boundaries remain enabled and are not weakened for convenience.
+* Fail closed: on uncertainty, reject action and preserve isolation.
+
 ## 6. Product Model: Profiles & Workspaces
 
 ### 6.1 Profiles (Isolation)
@@ -436,6 +456,27 @@ Rust converts these into state mutations and emits patches.
 * provide secure autofill/credential-save integration points without breaking profile isolation
 * define policy boundaries for third-party credential providers and permissions
 * include UX for enabling/disabling providers per profile and handling fallback behavior
+
+### Milestone 15: Security hardening + abuse resistance
+
+* comprehensive audit of UI bridge allowlist and capability boundaries
+* tighten `app://` scheme protections, navigation guards, and resource loading policy
+* enforce stronger context isolation and least-privilege defaults across UI/content surfaces
+* add security-focused tests/checks (intent fuzzing, malformed message handling, regression suites)
+* release hardening checklist (dependency review, secure defaults, packaging/signing validation)
+* required go/no-go gates before release:
+  * no known path from web content to privileged bridge commands
+  * no known path to arbitrary file read/write via browser-exposed APIs
+  * no known path to arbitrary process execution from untrusted content
+  * all high/critical security findings resolved or explicitly risk-accepted
+
+### Milestone 16: Release readiness + distribution
+
+* production packaging pipeline for building distributable browser artifacts
+* application branding assets (app icon, bundle metadata, polished app identity)
+* GitHub Actions CI/CD workflows for build, test, signing, and release publishing
+* macOS distribution readiness (codesign/notarization/stapling verification)
+* documented release process (versioning, changelog, rollback, smoke-test checklist)
 
 ## 16. Open Questions (Later)
 
