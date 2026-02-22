@@ -423,6 +423,20 @@ Rust converts these into state mutations and emits patches.
 * conflict handling between content-page input and browser chrome shortcuts
 * user-configurable keybindings persisted in settings
 
+### Milestone 13: Developer tools integration
+
+* open Chromium DevTools for the active content tab from UI and keybindings
+* support developer workflows for website debugging (elements/network/console/sources)
+* allow internal debugging of browser shell/content behavior during development
+* stable DevTools window lifecycle across tab/workspace/profile switching
+
+### Milestone 14: Password manager ecosystem support
+
+* support user-selected password manager workflows (e.g., Bitwarden, LastPass, 1Password)
+* provide secure autofill/credential-save integration points without breaking profile isolation
+* define policy boundaries for third-party credential providers and permissions
+* include UX for enabling/disabling providers per profile and handling fallback behavior
+
 ## 16. Open Questions (Later)
 
 * Tab groups
