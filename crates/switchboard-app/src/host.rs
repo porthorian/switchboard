@@ -1116,9 +1116,6 @@ unsafe extern "C" fn switchboard_ui_on_jsdialog(
             with_stack_cef_string(&url, |value| unsafe {
                 cont(callback, 1, value);
             });
-            if env_flag(ENV_CEF_VERBOSE_ERRORS) {
-                eprintln!("switchboard-app: served active URI query -> {url}");
-            }
             1
         }
         Err(reason) => {
