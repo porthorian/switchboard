@@ -6,8 +6,9 @@ const backButton = document.getElementById("nav-back");
 const forwardButton = document.getElementById("nav-forward");
 const workspaceList = document.getElementById("workspace-list");
 const workspaceNew = document.getElementById("workspace-new");
+const workspaceTitleWrap = document.getElementById("workspace-title-wrap");
 const workspaceTitle = document.getElementById("workspace-title");
-const workspaceRename = document.getElementById("workspace-rename");
+const workspaceTitleInput = document.getElementById("workspace-title-input");
 const workspaceDelete = document.getElementById("workspace-delete");
 const tabList = document.getElementById("tab-list");
 const tabNew = document.getElementById("tab-new");
@@ -17,6 +18,9 @@ let forwardStack = [];
 let activeUri = normalizeUrl(localStorage.getItem(key)) || "https://youtube.com";
 let shellRevision = -1;
 let shellState = null;
+let editingWorkspaceId = null;
+let editingWorkspaceOriginalName = "";
+let pendingWorkspaceRenameId = null;
 
 function send(payload) {
   try {
@@ -212,12 +216,26 @@ function renderShellState(state) {
   const { activeWorkspace, activeTab, orderedWorkspaces, orderedTabs } = deriveActiveContext(state);
   const activeWorkspaceId = activeWorkspace ? activeWorkspace.id : null;
   const activeTabId = activeWorkspace ? activeWorkspace.active_tab_id : null;
+  const renameSyncResolved =
+    pendingWorkspaceRenameId !== null &&
+    activeWorkspaceId === pendingWorkspaceRenameId;
 
-  workspaceTitle.textContent = activeWorkspace ? activeWorkspace.name : "No Workspace";
+  if (editingWorkspaceId !== null && editingWorkspaceId !== activeWorkspaceId) {
+    cancelWorkspaceRename();
+  }
+  if (!workspaceTitleWrap.classList.contains("editing") || renameSyncResolved) {
+    workspaceTitle.textContent = activeWorkspace ? activeWorkspace.name : "No Workspace";
+  }
+  if (renameSyncResolved) {
+    pendingWorkspaceRenameId = null;
+  }
+
   renderWorkspaceRail(orderedWorkspaces, activeWorkspaceId);
   renderTabList(orderedTabs, activeTabId);
+
   tabNew.disabled = !activeWorkspaceId;
-  workspaceRename.disabled = !activeWorkspaceId;
+  workspaceTitleWrap.classList.toggle("disabled", !activeWorkspaceId);
+  workspaceTitleWrap.setAttribute("tabindex", activeWorkspaceId ? "0" : "-1");
   workspaceDelete.disabled = !activeWorkspaceId || orderedWorkspaces.length <= 1;
 
   if (activeTab && activeTab.url && document.activeElement !== input) {
@@ -255,15 +273,36 @@ function createWorkspace() {
   queueStateRefresh();
 }
 
-function renameActiveWorkspace() {
+function startWorkspaceRename() {
   if (!shellState) return;
   const { activeWorkspace } = deriveActiveContext(shellState);
   if (!activeWorkspace) return;
-  const nextName = window.prompt("Rename workspace", activeWorkspace.name || "");
-  if (nextName === null) return;
-  const trimmed = nextName.trim();
-  if (!trimmed || trimmed === activeWorkspace.name) return;
-  send(`rename_workspace ${activeWorkspace.id} ${trimmed}`);
+  workspaceTitleWrap.classList.remove("suppress-hint");
+  editingWorkspaceId = activeWorkspace.id;
+  editingWorkspaceOriginalName = activeWorkspace.name || "";
+  workspaceTitleWrap.classList.add("editing");
+  workspaceTitleInput.value = editingWorkspaceOriginalName;
+  workspaceTitleInput.focus();
+  workspaceTitleInput.select();
+}
+
+function cancelWorkspaceRename() {
+  editingWorkspaceId = null;
+  editingWorkspaceOriginalName = "";
+  workspaceTitleWrap.classList.remove("editing");
+  workspaceTitleWrap.classList.add("suppress-hint");
+  workspaceTitleInput.value = "";
+}
+
+function commitWorkspaceRename() {
+  if (editingWorkspaceId === null) return;
+  const workspaceId = editingWorkspaceId;
+  const originalName = editingWorkspaceOriginalName.trim();
+  const trimmed = workspaceTitleInput.value.trim();
+  cancelWorkspaceRename();
+  if (!trimmed || trimmed === originalName) return;
+  pendingWorkspaceRenameId = workspaceId;
+  send(`rename_workspace ${workspaceId} ${trimmed}`);
   queueStateRefresh();
 }
 
@@ -332,8 +371,43 @@ input.addEventListener("keydown", (event) => {
 backButton.addEventListener("click", goBack);
 forwardButton.addEventListener("click", goForward);
 workspaceNew.addEventListener("click", createWorkspace);
-workspaceRename.addEventListener("click", renameActiveWorkspace);
 workspaceDelete.addEventListener("click", deleteActiveWorkspace);
+workspaceTitleWrap.addEventListener("click", () => {
+  if (workspaceTitleWrap.classList.contains("disabled")) return;
+  if (workspaceTitleWrap.classList.contains("editing")) return;
+  startWorkspaceRename();
+});
+workspaceTitleWrap.addEventListener("keydown", (event) => {
+  if (workspaceTitleWrap.classList.contains("disabled")) return;
+  if (workspaceTitleWrap.classList.contains("editing")) return;
+  if (event.key !== "Enter" && event.key !== " ") return;
+  event.preventDefault();
+  startWorkspaceRename();
+});
+workspaceTitleInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    event.stopPropagation();
+    commitWorkspaceRename();
+    workspaceTitleInput.blur();
+    workspaceTitleWrap.blur();
+    return;
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    cancelWorkspaceRename();
+    return;
+  }
+});
+workspaceTitleInput.addEventListener("blur", () => {
+  commitWorkspaceRename();
+});
+workspaceTitleInput.addEventListener("click", (event) => {
+  event.stopPropagation();
+});
+workspaceTitleWrap.addEventListener("mouseleave", () => {
+  workspaceTitleWrap.classList.remove("suppress-hint");
+});
 workspaceList.addEventListener("click", handleWorkspaceClick);
 tabList.addEventListener("click", handleTabClick);
 tabNew.addEventListener("click", createTabInActiveWorkspace);

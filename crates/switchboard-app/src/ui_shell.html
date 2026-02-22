@@ -27,9 +27,12 @@
     </div>
     <div class="tab-pane">
       <div class="tab-pane-header">
-        <div id="workspace-title" class="workspace-title">Workspace</div>
+        <div id="workspace-title-wrap" class="workspace-title-wrap" role="button" tabindex="0" aria-label="Rename Workspace">
+          <span id="workspace-title" class="workspace-title">Workspace</span>
+          <input id="workspace-title-input" class="workspace-title-input" type="text" spellcheck="false" autocomplete="off" aria-label="Workspace Name">
+          <span class="workspace-title-hint">Rename Workspace</span>
+        </div>
         <div class="workspace-actions">
-          <button id="workspace-rename" class="workspace-action" type="button" title="Rename Workspace">Rename</button>
           <button id="workspace-delete" class="workspace-action danger" type="button" title="Delete Workspace">Delete</button>
         </div>
       </div>
