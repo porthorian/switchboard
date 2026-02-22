@@ -4,6 +4,8 @@ use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use switchboard_core::TabId;
 
 use crate::bridge::UiCommand;
@@ -406,6 +408,12 @@ extern "C" {
     fn objc_getClass(name: *const c_char) -> ObjcId;
     fn sel_registerName(name: *const c_char) -> ObjcSel;
     fn objc_msgSend();
+    fn class_addMethod(
+        cls: ObjcId,
+        name: ObjcSel,
+        imp: *const c_void,
+        types: *const c_char,
+    ) -> i8;
 }
 
 #[cfg(target_os = "macos")]
@@ -417,6 +425,9 @@ extern "C" {
 #[cfg(target_os = "macos")]
 #[link(name = "WebKit", kind = "framework")]
 extern "C" {}
+
+#[cfg(target_os = "macos")]
+static NSAPP_HANDLING_SEND_EVENT: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
@@ -686,6 +697,52 @@ unsafe extern "C" fn switchboard_app_on_register_custom_schemes(
     with_stack_cef_string(UI_SCHEME, |scheme_name| unsafe {
         let _ = add_custom_scheme(registrar, scheme_name, UI_SCHEME_OPTIONS as c_int);
     });
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_nsapp_is_handling_send_event(
+    _self: ObjcId,
+    _cmd: ObjcSel,
+) -> i8 {
+    if NSAPP_HANDLING_SEND_EVENT.load(Ordering::Relaxed) {
+        YES
+    } else {
+        NO
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_nsapp_set_handling_send_event(
+    _self: ObjcId,
+    _cmd: ObjcSel,
+    value: i8,
+) {
+    NSAPP_HANDLING_SEND_EVENT.store(value != NO, Ordering::Relaxed);
+}
+
+#[cfg(target_os = "macos")]
+fn install_nsapplication_event_shim() -> Result<(), HostError> {
+    unsafe {
+        let app_class = objc_class("NSApplication")?;
+        let is_handling_selector = selector("isHandlingSendEvent")?;
+        let set_handling_selector = selector("setHandlingSendEvent:")?;
+        let is_encoding = CString::new("c@:").expect("static signature should be valid");
+        let set_encoding = CString::new("v@:c").expect("static signature should be valid");
+
+        let _ = class_addMethod(
+            app_class,
+            is_handling_selector,
+            switchboard_nsapp_is_handling_send_event as *const c_void,
+            is_encoding.as_ptr(),
+        );
+        let _ = class_addMethod(
+            app_class,
+            set_handling_selector,
+            switchboard_nsapp_set_handling_send_event as *const c_void,
+            set_encoding.as_ptr(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1776,6 +1833,7 @@ impl NativeMacHost {
             if NSApplicationLoad() == NO {
                 return Err(HostError::Native("failed to load NSApplication".to_owned()));
             }
+            install_nsapplication_event_shim()?;
 
             let app_class = objc_class("NSApplication")?;
             let app = msg_send_id(app_class, selector("sharedApplication")?);
