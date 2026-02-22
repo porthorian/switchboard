@@ -2,25 +2,30 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
-use switchboard_core::{
-    BrowserState, Engine, EngineError, Intent, Patch, PatchOp, ProfileId, TabRuntimeState, TabId,
-    WorkspaceId,
-};
 #[cfg(test)]
 use std::convert::Infallible;
 #[cfg(test)]
 use switchboard_core::NoopPersistence;
+use switchboard_core::{
+    BrowserState, Engine, EngineError, Intent, Patch, PatchOp, ProfileId, SettingValue, TabId,
+    TabRuntimeState, WorkspaceId,
+};
 
 use crate::bridge::UiCommand;
 use crate::host::{
-    install_content_event_handler, install_ui_command_handler, install_ui_state_provider, CefHost,
-    ContentEvent, ContentViewId, UiViewId, WindowId,
+    install_content_event_handler, install_ui_command_handler, install_ui_state_provider,
+    install_window_event_handler, CefHost, ContentEvent, ContentViewId, UiViewId, WindowEvent,
+    WindowId, WindowSize,
 };
 #[cfg(not(test))]
 use crate::persistence::{AppPersistence, AppPersistenceError};
 
 const UI_SHELL_URL_BASE: &str = "app://ui";
 const THUMBNAIL_MAX_ENTRIES: usize = 120;
+const WINDOW_WIDTH_SETTING_KEY: &str = "window.width";
+const WINDOW_HEIGHT_SETTING_KEY: &str = "window.height";
+const WINDOW_MIN_WIDTH: u32 = 640;
+const WINDOW_MIN_HEIGHT: u32 = 480;
 
 #[cfg(test)]
 type RuntimePersistence = NoopPersistence;
@@ -78,10 +83,11 @@ impl<H: CefHost + 'static> AppRuntime<H> {
         };
 
         let workspace_id = ensure_bootstrap_state(&mut state);
+        let initial_window_size = restored_window_size(&state);
         let mut engine = Engine::with_state(persistence, state, 0);
 
         let window_id = host
-            .create_window("Switchboard")
+            .create_window("Switchboard", initial_window_size)
             .map_err(RuntimeError::Host)?;
         let ui_shell_url = format!("{UI_SHELL_URL_BASE}?v={}", std::process::id());
         let ui_view_id = host
@@ -135,6 +141,8 @@ impl<H: CefHost + 'static> AppRuntime<H> {
     where
         H::Error: Display,
     {
+        self.sync_active_profile_content_view()?;
+
         let runtime_ptr: *mut Self = &mut self;
         install_ui_command_handler(Some(Box::new(move |command| unsafe {
             if let Err(error) = (*runtime_ptr).handle_ui_command(command) {
@@ -149,11 +157,17 @@ impl<H: CefHost + 'static> AppRuntime<H> {
                 eprintln!("switchboard-app: content event failed: {error}");
             }
         })));
+        install_window_event_handler(Some(Box::new(move |event| unsafe {
+            if let Err(error) = (*runtime_ptr).handle_window_event(event) {
+                eprintln!("switchboard-app: window event failed: {error}");
+            }
+        })));
 
         let result = self.host.run_event_loop().map_err(RuntimeError::Host);
         install_ui_command_handler(None);
         install_ui_state_provider(None);
         install_content_event_handler(None);
+        install_window_event_handler(None);
         result
     }
 
@@ -244,6 +258,15 @@ impl<H: CefHost + 'static> AppRuntime<H> {
         Ok(patch)
     }
 
+    pub fn handle_window_event(
+        &mut self,
+        event: WindowEvent,
+    ) -> Result<Patch, RuntimeError<H::Error>> {
+        match event {
+            WindowEvent::Resized { width, height } => self.persist_window_size(width, height),
+        }
+    }
+
     pub fn active_tab_id(&self, workspace_id: WorkspaceId) -> Option<TabId> {
         self.engine
             .state()
@@ -273,6 +296,48 @@ impl<H: CefHost + 'static> AppRuntime<H> {
 
     fn resolve_active_profile_id(&self) -> Option<ProfileId> {
         self.engine.state().active_profile_id
+    }
+
+    fn persist_window_size(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<Patch, RuntimeError<H::Error>> {
+        let width = width.max(WINDOW_MIN_WIDTH);
+        let height = height.max(WINDOW_MIN_HEIGHT);
+        let width_value = i64::from(width);
+        let height_value = i64::from(height);
+
+        let state = self.engine.state();
+        let width_changed = setting_int(state, WINDOW_WIDTH_SETTING_KEY) != Some(width_value);
+        let height_changed = setting_int(state, WINDOW_HEIGHT_SETTING_KEY) != Some(height_value);
+        if !width_changed && !height_changed {
+            let revision = self.revision();
+            return Ok(Patch {
+                ops: Vec::new(),
+                from_revision: revision,
+                to_revision: revision,
+            });
+        }
+
+        let mut patch = Patch {
+            ops: Vec::new(),
+            from_revision: self.revision(),
+            to_revision: self.revision(),
+        };
+        if width_changed {
+            patch = self.handle_intent(Intent::SettingSet {
+                key: WINDOW_WIDTH_SETTING_KEY.to_owned(),
+                value: SettingValue::Int(width_value),
+            })?;
+        }
+        if height_changed {
+            patch = self.handle_intent(Intent::SettingSet {
+                key: WINDOW_HEIGHT_SETTING_KEY.to_owned(),
+                value: SettingValue::Int(height_value),
+            })?;
+        }
+        Ok(patch)
     }
 
     fn sync_active_profile_content_view(&mut self) -> Result<(), RuntimeError<H::Error>> {
@@ -567,6 +632,26 @@ impl<H: CefHost + 'static> AppRuntime<H> {
     }
 }
 
+fn restored_window_size(state: &BrowserState) -> WindowSize {
+    let defaults = WindowSize::default();
+    let width = setting_int(state, WINDOW_WIDTH_SETTING_KEY)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(defaults.width)
+        .max(WINDOW_MIN_WIDTH);
+    let height = setting_int(state, WINDOW_HEIGHT_SETTING_KEY)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(defaults.height)
+        .max(WINDOW_MIN_HEIGHT);
+    WindowSize { width, height }
+}
+
+fn setting_int(state: &BrowserState, key: &str) -> Option<i64> {
+    match state.settings.get(key) {
+        Some(SettingValue::Int(value)) => Some(*value),
+        _ => None,
+    }
+}
+
 fn ensure_bootstrap_state(state: &mut BrowserState) -> WorkspaceId {
     if state.profiles.is_empty() {
         let profile_id = state.add_profile("Default");
@@ -667,7 +752,9 @@ fn ensure_bootstrap_state(state: &mut BrowserState) -> WorkspaceId {
         return workspace_id;
     }
 
-    let profile_id = state.active_profile_id.unwrap_or_else(|| state.add_profile("Default"));
+    let profile_id = state
+        .active_profile_id
+        .unwrap_or_else(|| state.add_profile("Default"));
     let workspace_id = state
         .add_workspace(profile_id, "Workspace 1")
         .expect("profile must exist");
@@ -679,7 +766,9 @@ fn ensure_bootstrap_state(state: &mut BrowserState) -> WorkspaceId {
 impl<HError: Display> Display for RuntimeError<HError> {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
-            Self::PersistenceInit(message) => write!(f, "persistence initialization failed: {message}"),
+            Self::PersistenceInit(message) => {
+                write!(f, "persistence initialization failed: {message}")
+            }
             Self::Host(err) => write!(f, "host error: {err}"),
             Self::Engine(err) => write!(f, "engine error: {err:?}"),
             Self::NoActiveWorkspace => {
@@ -726,7 +815,10 @@ fn build_thumbnail_data_url(title: &str, url: &str) -> String {
     let svg = format!(
         "<svg xmlns='http://www.w3.org/2000/svg' width='288' height='180' viewBox='0 0 288 180'><defs><linearGradient id='bg' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='#111b31'/><stop offset='100%' stop-color='#1f365f'/></linearGradient></defs><rect width='288' height='180' fill='url(#bg)'/><rect x='12' y='12' width='264' height='156' rx='10' fill='rgba(8,16,30,0.62)' stroke='rgba(126,164,255,0.35)'/><text x='20' y='74' fill='#e7efff' font-size='15' font-family='-apple-system, Segoe UI, sans-serif'>{title_line}</text><text x='20' y='101' fill='#9fb5e3' font-size='11' font-family='-apple-system, Segoe UI, sans-serif'>{subtitle}</text></svg>"
     );
-    format!("data:image/svg+xml;utf8,{}", percent_encode_uri_component(&svg))
+    format!(
+        "data:image/svg+xml;utf8,{}",
+        percent_encode_uri_component(&svg)
+    )
 }
 
 fn percent_encode_uri_component(value: &str) -> String {
@@ -777,10 +869,122 @@ fn push_json_string(json: &mut String, value: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use crate::bridge::UiCommand;
-    use crate::host::{ContentEvent, HostEvent, MockCefHost};
+    use crate::host::{
+        CefHost, ContentEvent, ContentViewId, HostError, HostEvent, MockCefHost, UiViewId,
+        WindowEvent, WindowId, WindowSize,
+    };
+    use switchboard_core::TabId;
 
     use super::{AppRuntime, RuntimeError};
+
+    #[derive(Clone)]
+    struct RecordingHost {
+        next_window_id: u64,
+        next_ui_view_id: u64,
+        next_content_view_id: u64,
+        events: Rc<RefCell<Vec<HostEvent>>>,
+    }
+
+    impl RecordingHost {
+        fn new(events: Rc<RefCell<Vec<HostEvent>>>) -> Self {
+            Self {
+                next_window_id: 0,
+                next_ui_view_id: 0,
+                next_content_view_id: 0,
+                events,
+            }
+        }
+    }
+
+    impl CefHost for RecordingHost {
+        type Error = HostError;
+
+        fn create_window(
+            &mut self,
+            title: &str,
+            size: WindowSize,
+        ) -> Result<WindowId, Self::Error> {
+            self.next_window_id += 1;
+            let window_id = WindowId(self.next_window_id);
+            self.events.borrow_mut().push(HostEvent::WindowCreated {
+                window_id,
+                title: title.to_owned(),
+                size,
+            });
+            Ok(window_id)
+        }
+
+        fn create_ui_view(
+            &mut self,
+            window_id: WindowId,
+            url: &str,
+        ) -> Result<UiViewId, Self::Error> {
+            if !url.starts_with("app://ui") {
+                return Err(HostError::InvalidUiUrl(url.to_owned()));
+            }
+            self.next_ui_view_id += 1;
+            let view_id = UiViewId(self.next_ui_view_id);
+            self.events.borrow_mut().push(HostEvent::UiViewCreated {
+                window_id,
+                view_id,
+                url: url.to_owned(),
+            });
+            Ok(view_id)
+        }
+
+        fn create_content_view(
+            &mut self,
+            window_id: WindowId,
+            tab_id: TabId,
+            url: &str,
+        ) -> Result<ContentViewId, Self::Error> {
+            self.next_content_view_id += 1;
+            let view_id = ContentViewId(self.next_content_view_id);
+            self.events
+                .borrow_mut()
+                .push(HostEvent::ContentViewCreated {
+                    window_id,
+                    view_id,
+                    tab_id,
+                    url: url.to_owned(),
+                });
+            Ok(view_id)
+        }
+
+        fn navigate_content_view(
+            &mut self,
+            view_id: ContentViewId,
+            tab_id: TabId,
+            url: &str,
+        ) -> Result<(), Self::Error> {
+            self.events.borrow_mut().push(HostEvent::ContentNavigated {
+                view_id,
+                tab_id,
+                url: url.to_owned(),
+            });
+            Ok(())
+        }
+
+        fn set_content_view_visible(
+            &mut self,
+            _view_id: ContentViewId,
+            _visible: bool,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn clear_content_view(&mut self, _view_id: ContentViewId) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn run_event_loop(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn bootstrap_creates_window_and_ui_shell_view() {
@@ -1107,6 +1311,82 @@ mod tests {
         assert!(patch.ops.is_empty());
         assert_eq!(patch.from_revision, revision_before);
         assert_eq!(patch.to_revision, revision_before);
+    }
+
+    #[test]
+    fn run_hydrates_active_tab_when_bindings_are_missing() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let host = RecordingHost::new(events.clone());
+        let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
+        let workspace_id = runtime.default_workspace_id();
+
+        runtime
+            .handle_ui_command(UiCommand::NewTab {
+                workspace_id: workspace_id.0,
+                url: Some("https://restore.example".to_owned()),
+                make_active: true,
+            })
+            .expect("tab creation should succeed");
+
+        let initial_content_creates = events
+            .borrow()
+            .iter()
+            .filter(|event| matches!(event, HostEvent::ContentViewCreated { .. }))
+            .count();
+        assert_eq!(initial_content_creates, 1);
+
+        runtime.content_bindings.clear();
+        runtime.run().expect("run should succeed");
+
+        let post_run_content_creates = events
+            .borrow()
+            .iter()
+            .filter(|event| matches!(event, HostEvent::ContentViewCreated { .. }))
+            .count();
+        assert_eq!(post_run_content_creates, 2);
+    }
+
+    #[test]
+    fn window_resize_event_persists_settings() {
+        let host = MockCefHost::default();
+        let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
+
+        let patch = runtime
+            .handle_window_event(WindowEvent::Resized {
+                width: 1440,
+                height: 900,
+            })
+            .expect("window resize should persist");
+        assert!(
+            !patch.ops.is_empty(),
+            "first resize should emit settings patch ops"
+        );
+
+        let width = runtime
+            .engine()
+            .state()
+            .settings
+            .get("window.width")
+            .expect("width setting should exist");
+        let height = runtime
+            .engine()
+            .state()
+            .settings
+            .get("window.height")
+            .expect("height setting should exist");
+        assert_eq!(width, &switchboard_core::SettingValue::Int(1440));
+        assert_eq!(height, &switchboard_core::SettingValue::Int(900));
+
+        let revision_before = runtime.revision();
+        let noop_patch = runtime
+            .handle_window_event(WindowEvent::Resized {
+                width: 1440,
+                height: 900,
+            })
+            .expect("repeat resize should be a no-op");
+        assert!(noop_patch.ops.is_empty());
+        assert_eq!(noop_patch.from_revision, revision_before);
+        assert_eq!(noop_patch.to_revision, revision_before);
     }
 
     #[test]

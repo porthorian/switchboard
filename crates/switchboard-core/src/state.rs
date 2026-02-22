@@ -65,6 +65,8 @@ pub struct BrowserState {
     pub workspaces: BTreeMap<WorkspaceId, Workspace>,
     pub tabs: BTreeMap<TabId, Tab>,
     pub settings: BTreeMap<String, SettingValue>,
+    // Runtime-only warm pool LRU per profile (oldest -> newest).
+    pub warm_lru: BTreeMap<ProfileId, Vec<TabId>>,
     pub active_profile_id: Option<ProfileId>,
     next_profile_id: u64,
     next_workspace_id: u64,
@@ -78,6 +80,7 @@ impl Default for BrowserState {
             workspaces: BTreeMap::new(),
             tabs: BTreeMap::new(),
             settings: BTreeMap::new(),
+            warm_lru: BTreeMap::new(),
             active_profile_id: None,
             next_profile_id: 1,
             next_workspace_id: 1,
@@ -157,6 +160,37 @@ impl BrowserState {
         let id = ProfileId(self.next_profile_id);
         self.next_profile_id += 1;
         id
+    }
+
+    pub fn touch_warm_lru(&mut self, profile_id: ProfileId, tab_id: TabId) {
+        let entries = self.warm_lru.entry(profile_id).or_default();
+        entries.retain(|candidate| *candidate != tab_id);
+        entries.push(tab_id);
+    }
+
+    pub fn remove_from_warm_lru(&mut self, profile_id: ProfileId, tab_id: TabId) {
+        let mut should_remove_entry = false;
+        if let Some(entries) = self.warm_lru.get_mut(&profile_id) {
+            entries.retain(|candidate| *candidate != tab_id);
+            if entries.is_empty() {
+                should_remove_entry = true;
+            }
+        }
+        if should_remove_entry {
+            self.warm_lru.remove(&profile_id);
+        }
+    }
+
+    pub fn prune_warm_lru(&mut self) {
+        self.warm_lru.retain(|profile_id, tab_ids| {
+            tab_ids.retain(|tab_id| {
+                self.tabs
+                    .get(tab_id)
+                    .map(|tab| tab.profile_id == *profile_id)
+                    .unwrap_or(false)
+            });
+            !tab_ids.is_empty() && self.profiles.contains_key(profile_id)
+        });
     }
 
     pub fn recompute_next_ids(&mut self) {

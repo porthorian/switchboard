@@ -79,9 +79,7 @@ impl UiCommand {
                 )
             }
             Self::NewProfile { .. } => {
-                unreachable!(
-                    "NewProfile requires runtime defaults before intent dispatch"
-                )
+                unreachable!("NewProfile requires runtime defaults before intent dispatch")
             }
             Self::DeleteProfile { profile_id } => Intent::DeleteProfile {
                 profile_id: ProfileId(profile_id),

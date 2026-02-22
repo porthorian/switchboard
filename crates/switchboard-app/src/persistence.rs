@@ -156,8 +156,9 @@ impl SqliteStore {
 
     #[cfg(test)]
     fn open_memory() -> Result<Self, AppPersistenceError> {
-        let c_memory = CString::new(":memory:")
-            .map_err(|_| AppPersistenceError::InvalidData("invalid sqlite memory uri".to_owned()))?;
+        let c_memory = CString::new(":memory:").map_err(|_| {
+            AppPersistenceError::InvalidData("invalid sqlite memory uri".to_owned())
+        })?;
         let mut db = std::ptr::null_mut();
         let rc = unsafe {
             sqlite3_open_v2(
@@ -362,8 +363,13 @@ impl SqliteStore {
 
         let mut state = BrowserState::default();
 
-        for row in self.query_rows("SELECT id, name, active_workspace_id FROM profiles ORDER BY id;")? {
-            let id = ProfileId(parse_u64(required_cell(&row, 0, "profiles.id")?, "profiles.id")?);
+        for row in
+            self.query_rows("SELECT id, name, active_workspace_id FROM profiles ORDER BY id;")?
+        {
+            let id = ProfileId(parse_u64(
+                required_cell(&row, 0, "profiles.id")?,
+                "profiles.id",
+            )?);
             let name = required_cell(&row, 1, "profiles.name")?.to_owned();
             let active_workspace_id = optional_cell(&row, 2)
                 .map(|value| parse_u64(value, "profiles.active_workspace_id"))
@@ -396,10 +402,13 @@ impl SqliteStore {
             }
         }
 
-        for row in self.query_rows(
-            "SELECT id, profile_id, name, active_tab_id FROM workspaces ORDER BY id;",
-        )? {
-            let id = WorkspaceId(parse_u64(required_cell(&row, 0, "workspaces.id")?, "workspaces.id")?);
+        for row in self
+            .query_rows("SELECT id, profile_id, name, active_tab_id FROM workspaces ORDER BY id;")?
+        {
+            let id = WorkspaceId(parse_u64(
+                required_cell(&row, 0, "workspaces.id")?,
+                "workspaces.id",
+            )?);
             let profile_id = ProfileId(parse_u64(
                 required_cell(&row, 1, "workspaces.profile_id")?,
                 "workspaces.profile_id",
@@ -472,7 +481,8 @@ impl SqliteStore {
                     workspace_id,
                     url: required_cell(&row, 3, "tabs.url")?.to_owned(),
                     title: required_cell(&row, 4, "tabs.title")?.to_owned(),
-                    loading: parse_i64(required_cell(&row, 5, "tabs.loading")?, "tabs.loading")? != 0,
+                    loading: parse_i64(required_cell(&row, 5, "tabs.loading")?, "tabs.loading")?
+                        != 0,
                     thumbnail_data_url: optional_cell(&row, 6).map(ToOwned::to_owned),
                     pinned: parse_i64(required_cell(&row, 7, "tabs.pinned")?, "tabs.pinned")? != 0,
                     muted: parse_i64(required_cell(&row, 8, "tabs.muted")?, "tabs.muted")? != 0,
@@ -897,14 +907,12 @@ mod tests {
             "homepage".to_owned(),
             SettingValue::Text("https://example.com".to_owned()),
         );
-        state.settings.insert(
-            "restore_last_session".to_owned(),
-            SettingValue::Bool(true),
-        );
-        state.settings.insert(
-            "warm_pool_budget".to_owned(),
-            SettingValue::Int(8),
-        );
+        state
+            .settings
+            .insert("restore_last_session".to_owned(), SettingValue::Bool(true));
+        state
+            .settings
+            .insert("warm_pool_budget".to_owned(), SettingValue::Int(8));
         state.recompute_next_ids();
         state
     }

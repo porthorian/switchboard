@@ -383,14 +383,11 @@ pub struct cef_frame_t {
     pub del: Option<unsafe extern "C" fn(self_: *mut cef_frame_t)>,
     pub select_all: Option<unsafe extern "C" fn(self_: *mut cef_frame_t)>,
     pub view_source: Option<unsafe extern "C" fn(self_: *mut cef_frame_t)>,
-    pub get_source: Option<
-        unsafe extern "C" fn(self_: *mut cef_frame_t, visitor: *mut c_void),
-    >,
+    pub get_source: Option<unsafe extern "C" fn(self_: *mut cef_frame_t, visitor: *mut c_void)>,
     pub get_text: Option<unsafe extern "C" fn(self_: *mut cef_frame_t, visitor: *mut c_void)>,
     pub load_request:
         Option<unsafe extern "C" fn(self_: *mut cef_frame_t, request: *mut cef_request_t)>,
-    pub load_url:
-        Option<unsafe extern "C" fn(self_: *mut cef_frame_t, url: *const cef_string_t)>,
+    pub load_url: Option<unsafe extern "C" fn(self_: *mut cef_frame_t, url: *const cef_string_t)>,
     pub execute_java_script: Option<
         unsafe extern "C" fn(
             self_: *mut cef_frame_t,

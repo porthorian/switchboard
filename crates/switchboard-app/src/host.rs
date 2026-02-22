@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 #[cfg(target_os = "macos")]
-use std::sync::OnceLock;
-#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 use switchboard_core::TabId;
 
 use crate::bridge::UiCommand;
@@ -19,12 +19,28 @@ pub struct UiViewId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ContentViewId(pub u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Default for WindowSize {
+    fn default() -> Self {
+        Self {
+            width: DEFAULT_WINDOW_WIDTH_PX,
+            height: DEFAULT_WINDOW_HEIGHT_PX,
+        }
+    }
+}
+
 #[cfg(any(test, not(target_os = "macos")))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostEvent {
     WindowCreated {
         window_id: WindowId,
         title: String,
+        size: WindowSize,
     },
     UiViewCreated {
         window_id: WindowId,
@@ -72,7 +88,7 @@ impl Error for HostError {}
 pub trait CefHost {
     type Error;
 
-    fn create_window(&mut self, title: &str) -> Result<WindowId, Self::Error>;
+    fn create_window(&mut self, title: &str, size: WindowSize) -> Result<WindowId, Self::Error>;
 
     fn create_ui_view(&mut self, window_id: WindowId, url: &str) -> Result<UiViewId, Self::Error>;
 
@@ -104,6 +120,7 @@ pub trait CefHost {
 pub type UiCommandHandler = Box<dyn FnMut(UiCommand) + 'static>;
 pub type UiStateProvider = Box<dyn FnMut() -> String + 'static>;
 pub type ContentEventHandler = Box<dyn FnMut(ContentEvent) + 'static>;
+pub type WindowEventHandler = Box<dyn FnMut(WindowEvent) + 'static>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentEvent {
@@ -112,10 +129,16 @@ pub enum ContentEvent {
     LoadingChanged { tab_id: TabId, is_loading: bool },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowEvent {
+    Resized { width: u32, height: u32 },
+}
+
 thread_local! {
     static UI_COMMAND_HANDLER: RefCell<Option<UiCommandHandler>> = RefCell::new(None);
     static UI_STATE_PROVIDER: RefCell<Option<UiStateProvider>> = RefCell::new(None);
     static CONTENT_EVENT_HANDLER: RefCell<Option<ContentEventHandler>> = RefCell::new(None);
+    static WINDOW_EVENT_HANDLER: RefCell<Option<WindowEventHandler>> = RefCell::new(None);
     static ACTIVE_CONTENT_URI: RefCell<Option<String>> = const { RefCell::new(None) };
     static ACTIVE_CONTENT_TAB: RefCell<Option<TabId>> = const { RefCell::new(None) };
     #[cfg(target_os = "macos")]
@@ -136,6 +159,12 @@ pub fn install_ui_state_provider(provider: Option<UiStateProvider>) {
 
 pub fn install_content_event_handler(handler: Option<ContentEventHandler>) {
     CONTENT_EVENT_HANDLER.with(|slot| {
+        *slot.borrow_mut() = handler;
+    });
+}
+
+pub fn install_window_event_handler(handler: Option<WindowEventHandler>) {
+    WINDOW_EVENT_HANDLER.with(|slot| {
         *slot.borrow_mut() = handler;
     });
 }
@@ -161,6 +190,14 @@ fn query_ui_shell_state() -> String {
 
 fn emit_content_event(event: ContentEvent) {
     CONTENT_EVENT_HANDLER.with(|slot| {
+        if let Some(handler) = slot.borrow_mut().as_mut() {
+            handler(event);
+        }
+    });
+}
+
+fn emit_window_event(event: WindowEvent) {
+    WINDOW_EVENT_HANDLER.with(|slot| {
         if let Some(handler) = slot.borrow_mut().as_mut() {
             handler(event);
         }
@@ -225,12 +262,13 @@ impl MockCefHost {
 impl CefHost for MockCefHost {
     type Error = HostError;
 
-    fn create_window(&mut self, title: &str) -> Result<WindowId, Self::Error> {
+    fn create_window(&mut self, title: &str, size: WindowSize) -> Result<WindowId, Self::Error> {
         self.next_window_id += 1;
         let window_id = WindowId(self.next_window_id);
         self.events.push(HostEvent::WindowCreated {
             window_id,
             title: title.to_owned(),
+            size,
         });
         Ok(window_id)
     }
@@ -338,18 +376,13 @@ const YES: i8 = 1;
 #[cfg(target_os = "macos")]
 const NO: i8 = 0;
 
-#[cfg(target_os = "macos")]
-const WINDOW_WIDTH: f64 = 1280.0;
-#[cfg(target_os = "macos")]
-const WINDOW_HEIGHT: f64 = 840.0;
+const DEFAULT_WINDOW_WIDTH_PX: u32 = 1280;
+const DEFAULT_WINDOW_HEIGHT_PX: u32 = 840;
+
 #[cfg(target_os = "macos")]
 const UI_TOP_HEIGHT: f64 = 44.0;
 #[cfg(target_os = "macos")]
 const UI_LEFT_WIDTH: f64 = 320.0;
-#[cfg(target_os = "macos")]
-const CONTENT_WIDTH: f64 = WINDOW_WIDTH - UI_LEFT_WIDTH;
-#[cfg(target_os = "macos")]
-const CONTENT_HEIGHT: f64 = WINDOW_HEIGHT - UI_TOP_HEIGHT;
 #[cfg(target_os = "macos")]
 const DEFAULT_BACKGROUND_COLOR: u32 = 0xFF_FF_FF_FF;
 #[cfg(target_os = "macos")]
@@ -464,12 +497,7 @@ extern "C" {
     fn objc_getClass(name: *const c_char) -> ObjcId;
     fn sel_registerName(name: *const c_char) -> ObjcSel;
     fn objc_msgSend();
-    fn class_addMethod(
-        cls: ObjcId,
-        name: ObjcSel,
-        imp: *const c_void,
-        types: *const c_char,
-    ) -> i8;
+    fn class_addMethod(cls: ObjcId, name: ObjcSel, imp: *const c_void, types: *const c_char) -> i8;
 }
 
 #[cfg(target_os = "macos")]
@@ -758,10 +786,7 @@ unsafe extern "C" fn switchboard_app_on_register_custom_schemes(
 }
 
 #[cfg(target_os = "macos")]
-unsafe extern "C" fn switchboard_nsapp_is_handling_send_event(
-    _self: ObjcId,
-    _cmd: ObjcSel,
-) -> i8 {
+unsafe extern "C" fn switchboard_nsapp_is_handling_send_event(_self: ObjcId, _cmd: ObjcSel) -> i8 {
     if NSAPP_HANDLING_SEND_EVENT.load(Ordering::Relaxed) {
         YES
     } else {
@@ -850,6 +875,56 @@ unsafe extern "C" fn switchboard_nsapp_application_will_terminate(
 }
 
 #[cfg(target_os = "macos")]
+unsafe fn emit_window_size_from_notification(notification: ObjcId, skip_live_resize: bool) {
+    if notification == NIL {
+        return;
+    }
+
+    let object_sel = sel_registerName(b"object\0".as_ptr() as *const c_char);
+    if object_sel == NIL {
+        return;
+    }
+    let window = msg_send_id(notification, object_sel);
+    if window == NIL {
+        return;
+    }
+
+    if skip_live_resize {
+        let in_live_resize_sel = sel_registerName(b"inLiveResize\0".as_ptr() as *const c_char);
+        if in_live_resize_sel != NIL && msg_send_bool(window, in_live_resize_sel) != NO {
+            return;
+        }
+    }
+
+    let frame_sel = sel_registerName(b"frame\0".as_ptr() as *const c_char);
+    if frame_sel == NIL {
+        return;
+    }
+    let frame = msg_send_rect(window, frame_sel);
+    let width = frame.size.width.round().max(1.0) as u32;
+    let height = frame.size.height.round().max(1.0) as u32;
+    emit_window_event(WindowEvent::Resized { width, height });
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_nsapp_window_did_resize(
+    _self: ObjcId,
+    _cmd: ObjcSel,
+    notification: ObjcId,
+) {
+    emit_window_size_from_notification(notification, true);
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_nsapp_window_did_end_live_resize(
+    _self: ObjcId,
+    _cmd: ObjcSel,
+    notification: ObjcId,
+) {
+    emit_window_size_from_notification(notification, false);
+}
+
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn switchboard_nsapp_should_handle_reopen(
     self_: ObjcId,
     _cmd: ObjcSel,
@@ -859,8 +934,7 @@ unsafe extern "C" fn switchboard_nsapp_should_handle_reopen(
     if has_visible_windows == NO {
         let windows_sel = sel_registerName(b"windows\0".as_ptr() as *const c_char);
         let count_sel = sel_registerName(b"count\0".as_ptr() as *const c_char);
-        let object_at_index_sel =
-            sel_registerName(b"objectAtIndex:\0".as_ptr() as *const c_char);
+        let object_at_index_sel = sel_registerName(b"objectAtIndex:\0".as_ptr() as *const c_char);
         let make_key_and_order_front_sel =
             sel_registerName(b"makeKeyAndOrderFront:\0".as_ptr() as *const c_char);
         if windows_sel != NIL
@@ -889,10 +963,14 @@ fn install_nsapplication_suspend_shim() -> Result<(), HostError> {
     unsafe {
         let app_class = objc_class("NSApplication")?;
         let window_should_close_selector = selector("windowShouldClose:")?;
+        let window_did_resize_selector = selector("windowDidResize:")?;
+        let window_did_end_live_resize_selector = selector("windowDidEndLiveResize:")?;
         let should_handle_reopen_selector =
             selector("applicationShouldHandleReopen:hasVisibleWindows:")?;
         let will_terminate_selector = selector("applicationWillTerminate:")?;
         let window_close_encoding = CString::new("c@:@").expect("static signature should be valid");
+        let window_resize_encoding =
+            CString::new("v@:@").expect("static signature should be valid");
         let reopen_encoding = CString::new("c@:@c").expect("static signature should be valid");
         let will_terminate_encoding =
             CString::new("v@:@").expect("static signature should be valid");
@@ -902,6 +980,18 @@ fn install_nsapplication_suspend_shim() -> Result<(), HostError> {
             window_should_close_selector,
             switchboard_nsapp_window_should_close as *const c_void,
             window_close_encoding.as_ptr(),
+        );
+        let _ = class_addMethod(
+            app_class,
+            window_did_resize_selector,
+            switchboard_nsapp_window_did_resize as *const c_void,
+            window_resize_encoding.as_ptr(),
+        );
+        let _ = class_addMethod(
+            app_class,
+            window_did_end_live_resize_selector,
+            switchboard_nsapp_window_did_end_live_resize as *const c_void,
+            window_resize_encoding.as_ptr(),
         );
         let _ = class_addMethod(
             app_class,
@@ -971,14 +1061,18 @@ fn parse_ui_prompt_payload(payload: &str) -> Result<UiPromptAction, &'static str
             .trim()
             .parse::<u64>()
             .map_err(|_| "switch_profile requires a numeric profile id")?;
-        return Ok(UiPromptAction::Intent(UiCommand::SwitchProfile { profile_id }));
+        return Ok(UiPromptAction::Intent(UiCommand::SwitchProfile {
+            profile_id,
+        }));
     }
     if let Some(value) = trimmed.strip_prefix("delete_profile ") {
         let profile_id = value
             .trim()
             .parse::<u64>()
             .map_err(|_| "delete_profile requires a numeric profile id")?;
-        return Ok(UiPromptAction::Intent(UiCommand::DeleteProfile { profile_id }));
+        return Ok(UiPromptAction::Intent(UiCommand::DeleteProfile {
+            profile_id,
+        }));
     }
     if let Some(rest) = trimmed.strip_prefix("rename_profile ") {
         let mut parts = rest.trim().splitn(2, ' ');
@@ -988,10 +1082,7 @@ fn parse_ui_prompt_payload(payload: &str) -> Result<UiPromptAction, &'static str
             .trim()
             .parse::<u64>()
             .map_err(|_| "rename_profile requires a numeric profile id")?;
-        let name = parts
-            .next()
-            .ok_or("rename_profile requires a name")?
-            .trim();
+        let name = parts.next().ok_or("rename_profile requires a name")?.trim();
         if name.is_empty() {
             return Err("profile name cannot be empty");
         }
@@ -1461,7 +1552,10 @@ unsafe extern "C" fn switchboard_content_on_address_change(
     }
     set_active_content_uri(next.clone());
     if let Some(tab_id) = active_content_tab() {
-        emit_content_event(ContentEvent::UrlChanged { tab_id, url: next.clone() });
+        emit_content_event(ContentEvent::UrlChanged {
+            tab_id,
+            url: next.clone(),
+        });
     }
     if env_flag(ENV_CEF_VERBOSE_ERRORS) {
         eprintln!("switchboard-app: observed content URL change -> {next}");
@@ -2146,19 +2240,18 @@ impl NativeMacHost {
 impl CefHost for NativeMacHost {
     type Error = HostError;
 
-    fn create_window(&mut self, title: &str) -> Result<WindowId, Self::Error> {
+    fn create_window(&mut self, title: &str, size: WindowSize) -> Result<WindowId, Self::Error> {
         unsafe {
             let style = STYLE_TITLED
                 | STYLE_CLOSABLE
                 | STYLE_MINIATURIZABLE
                 | STYLE_RESIZABLE
                 | STYLE_FULL_SIZE_CONTENT_VIEW;
+            let width = f64::from(size.width.max(1));
+            let height = f64::from(size.height.max(1));
             let frame = NSRect {
                 origin: NSPoint { x: 0.0, y: 0.0 },
-                size: NSSize {
-                    width: WINDOW_WIDTH,
-                    height: WINDOW_HEIGHT,
-                },
+                size: NSSize { width, height },
             };
 
             let window_class = objc_class("NSWindow")?;
@@ -2176,7 +2269,11 @@ impl CefHost for NativeMacHost {
             }
 
             msg_send_void_bool(window, selector("setTitlebarAppearsTransparent:")?, YES);
-            msg_send_void_i64(window, selector("setTitleVisibility:")?, WINDOW_TITLE_HIDDEN);
+            msg_send_void_i64(
+                window,
+                selector("setTitleVisibility:")?,
+                WINDOW_TITLE_HIDDEN,
+            );
             msg_send_void_bool(window, selector("setMovableByWindowBackground:")?, YES);
             msg_send_void_id(window, selector("setDelegate:")?, self.app);
             msg_send_void(window, selector("center")?);
@@ -2210,14 +2307,15 @@ impl CefHost for NativeMacHost {
                 return Err(HostError::Native("window content view is nil".to_owned()));
             }
             msg_send_void_bool(root_view, selector("setAutoresizesSubviews:")?, YES);
+            let (root_width, root_height) = current_view_size(root_view)?;
 
             let view_class = objc_class("NSView")?;
             let view_alloc = msg_send_id(view_class, selector("alloc")?);
             let frame = NSRect {
                 origin: NSPoint { x: 0.0, y: 0.0 },
                 size: NSSize {
-                    width: WINDOW_WIDTH,
-                    height: WINDOW_HEIGHT,
+                    width: root_width,
+                    height: root_height,
                 },
             };
             let ui_view = msg_send_id_rect(view_alloc, selector("initWithFrame:")?, frame);
@@ -2231,7 +2329,7 @@ impl CefHost for NativeMacHost {
             );
 
             msg_send_void_id(root_view, selector("addSubview:")?, ui_view);
-            cef.create_browser_in_view(ui_view, url, cef.ui_client(), WINDOW_WIDTH, WINDOW_HEIGHT)?;
+            cef.create_browser_in_view(ui_view, url, cef.ui_client(), root_width, root_height)?;
 
             self.next_ui_view_id += 1;
             let view_id = UiViewId(self.next_ui_view_id);
@@ -2257,16 +2355,7 @@ impl CefHost for NativeMacHost {
                 return Err(HostError::Native("window content view is nil".to_owned()));
             }
             msg_send_void_bool(root_view, selector("setAutoresizesSubviews:")?, YES);
-            let frame = NSRect {
-                origin: NSPoint {
-                    x: UI_LEFT_WIDTH,
-                    y: 0.0,
-                },
-                size: NSSize {
-                    width: CONTENT_WIDTH,
-                    height: CONTENT_HEIGHT,
-                },
-            };
+            let frame = content_container_frame(root_view)?;
             let content_view = create_content_container(frame)?;
             msg_send_void_u64(
                 content_view,
@@ -2283,8 +2372,8 @@ impl CefHost for NativeMacHost {
                     content_view,
                     url,
                     client,
-                    CONTENT_WIDTH,
-                    CONTENT_HEIGHT,
+                    frame.size.width,
+                    frame.size.height,
                 ) {
                     free_content_cef_client(client);
                     return Err(error);
@@ -2372,27 +2461,29 @@ impl CefHost for NativeMacHost {
         view_id: ContentViewId,
         visible: bool,
     ) -> Result<(), Self::Error> {
-        let content_backend = self
-            .content_views
-            .get(&view_id)
-            .copied()
-            .ok_or_else(|| HostError::Native(format!("content view not found: {}", view_id.0)))?;
+        let content_backend =
+            self.content_views.get(&view_id).copied().ok_or_else(|| {
+                HostError::Native(format!("content view not found: {}", view_id.0))
+            })?;
         let container = match content_backend {
             ContentBackend::WebKit(view) | ContentBackend::Cef(view) => view,
         };
 
         unsafe {
-            msg_send_void_bool(container, selector("setHidden:")?, if visible { NO } else { YES });
+            msg_send_void_bool(
+                container,
+                selector("setHidden:")?,
+                if visible { NO } else { YES },
+            );
         }
         Ok(())
     }
 
     fn clear_content_view(&mut self, view_id: ContentViewId) -> Result<(), Self::Error> {
-        let content_backend = self
-            .content_views
-            .get(&view_id)
-            .copied()
-            .ok_or_else(|| HostError::Native(format!("content view not found: {}", view_id.0)))?;
+        let content_backend =
+            self.content_views.get(&view_id).copied().ok_or_else(|| {
+                HostError::Native(format!("content view not found: {}", view_id.0))
+            })?;
         unsafe {
             match content_backend {
                 ContentBackend::WebKit(view) => {
@@ -2484,6 +2575,20 @@ unsafe fn nsstring(value: &str) -> Result<ObjcId, HostError> {
 }
 
 #[cfg(target_os = "macos")]
+unsafe fn content_container_frame(root_view: ObjcId) -> Result<NSRect, HostError> {
+    let bounds = msg_send_rect(root_view, selector("bounds")?);
+    let width = (bounds.size.width - UI_LEFT_WIDTH).max(1.0);
+    let height = (bounds.size.height - UI_TOP_HEIGHT).max(1.0);
+    Ok(NSRect {
+        origin: NSPoint {
+            x: UI_LEFT_WIDTH,
+            y: 0.0,
+        },
+        size: NSSize { width, height },
+    })
+}
+
+#[cfg(target_os = "macos")]
 unsafe fn create_content_container(frame: NSRect) -> Result<ObjcId, HostError> {
     let view_class = objc_class("NSView")?;
     let view_alloc = msg_send_id(view_class, selector("alloc")?);
@@ -2519,10 +2624,7 @@ unsafe fn attach_wk_web_view(container: ObjcId, url: &str) -> Result<(), HostErr
     let web_view_alloc = msg_send_id(web_view_class, selector("alloc")?);
     let frame = NSRect {
         origin: NSPoint { x: 0.0, y: 0.0 },
-        size: NSSize {
-            width,
-            height,
-        },
+        size: NSSize { width, height },
     };
     let web_view = msg_send_id_rect_id(
         web_view_alloc,
@@ -2619,6 +2721,13 @@ unsafe fn load_url_in_web_view(web_view: ObjcId, url: &str) -> Result<(), HostEr
 #[cfg(target_os = "macos")]
 unsafe fn msg_send_id(receiver: ObjcId, selector: ObjcSel) -> ObjcId {
     let send: unsafe extern "C" fn(ObjcId, ObjcSel) -> ObjcId =
+        std::mem::transmute(objc_msgSend as *const ());
+    send(receiver, selector)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn msg_send_bool(receiver: ObjcId, selector: ObjcSel) -> i8 {
+    let send: unsafe extern "C" fn(ObjcId, ObjcSel) -> i8 =
         std::mem::transmute(objc_msgSend as *const ());
     send(receiver, selector)
 }
