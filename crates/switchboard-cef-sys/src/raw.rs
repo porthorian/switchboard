@@ -11,6 +11,8 @@ pub type cef_process_id_t = c_uint;
 pub type cef_errorcode_t = c_int;
 pub type cef_jsdialog_type_t = c_uint;
 pub type cef_scheme_options_t = c_uint;
+pub type cef_zoom_command_t = c_uint;
+pub type cef_file_dialog_mode_t = c_uint;
 pub type cef_string_userfree_t = *mut cef_string_t;
 pub type cef_string_list_t = *mut c_void;
 pub type cef_string_multimap_t = *mut c_void;
@@ -57,6 +59,13 @@ pub struct cef_rect_t {
 pub struct cef_size_t {
     pub width: c_int,
     pub height: c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct cef_point_t {
+    pub x: c_int,
+    pub y: c_int,
 }
 
 #[repr(C)]
@@ -310,6 +319,36 @@ pub struct cef_load_handler_t {
 }
 
 #[repr(C)]
+pub struct cef_run_file_dialog_callback_t {
+    pub _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct cef_download_image_callback_t {
+    pub _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct cef_pdf_print_settings_t {
+    pub _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct cef_pdf_print_callback_t {
+    pub _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct cef_registration_t {
+    pub _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct cef_dev_tools_message_observer_t {
+    pub _private: [u8; 0],
+}
+
+#[repr(C)]
 pub struct cef_print_handler_t {
     pub _private: [u8; 0],
 }
@@ -326,7 +365,109 @@ pub struct cef_request_handler_t {
 
 #[repr(C)]
 pub struct cef_browser_host_t {
-    pub _private: [u8; 0],
+    pub base: cef_base_ref_counted_t,
+    pub get_browser:
+        Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t) -> *mut cef_browser_t>,
+    pub close_browser:
+        Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t, force_close: c_int)>,
+    pub try_close_browser: Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t) -> c_int>,
+    pub is_ready_to_be_closed:
+        Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t) -> c_int>,
+    pub set_focus: Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t, focus: c_int)>,
+    pub get_window_handle:
+        Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t) -> cef_window_handle_t>,
+    pub get_opener_window_handle:
+        Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t) -> cef_window_handle_t>,
+    pub get_opener_identifier:
+        Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t) -> c_int>,
+    pub has_view: Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t) -> c_int>,
+    pub get_client:
+        Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t) -> *mut cef_client_t>,
+    pub get_request_context:
+        Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t) -> *mut cef_request_context_t>,
+    pub can_zoom: Option<
+        unsafe extern "C" fn(self_: *mut cef_browser_host_t, command: cef_zoom_command_t) -> c_int,
+    >,
+    pub zoom:
+        Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t, command: cef_zoom_command_t)>,
+    pub get_default_zoom_level: Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t) -> f64>,
+    pub get_zoom_level: Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t) -> f64>,
+    pub set_zoom_level:
+        Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t, zoom_level: f64)>,
+    pub run_file_dialog: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_browser_host_t,
+            mode: cef_file_dialog_mode_t,
+            title: *const cef_string_t,
+            default_file_path: *const cef_string_t,
+            accept_filters: cef_string_list_t,
+            callback: *mut cef_run_file_dialog_callback_t,
+        ),
+    >,
+    pub start_download:
+        Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t, url: *const cef_string_t)>,
+    pub download_image: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_browser_host_t,
+            image_url: *const cef_string_t,
+            is_favicon: c_int,
+            max_image_size: u32,
+            bypass_cache: c_int,
+            callback: *mut cef_download_image_callback_t,
+        ),
+    >,
+    pub print: Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t)>,
+    pub print_to_pdf: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_browser_host_t,
+            path: *const cef_string_t,
+            settings: *const cef_pdf_print_settings_t,
+            callback: *mut cef_pdf_print_callback_t,
+        ),
+    >,
+    pub find: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_browser_host_t,
+            search_text: *const cef_string_t,
+            forward: c_int,
+            match_case: c_int,
+            find_next: c_int,
+        ),
+    >,
+    pub stop_finding:
+        Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t, clear_selection: c_int)>,
+    pub show_dev_tools: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_browser_host_t,
+            window_info: *const cef_window_info_t,
+            client: *mut cef_client_t,
+            settings: *const cef_browser_settings_t,
+            inspect_element_at: *const cef_point_t,
+        ),
+    >,
+    pub close_dev_tools: Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t)>,
+    pub has_dev_tools: Option<unsafe extern "C" fn(self_: *mut cef_browser_host_t) -> c_int>,
+    pub send_dev_tools_message: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_browser_host_t,
+            message: *const c_void,
+            message_size: usize,
+        ) -> c_int,
+    >,
+    pub execute_dev_tools_method: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_browser_host_t,
+            message_id: c_int,
+            method: *const cef_string_t,
+            params: *mut cef_dictionary_value_t,
+        ) -> c_int,
+    >,
+    pub add_dev_tools_message_observer: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_browser_host_t,
+            observer: *mut cef_dev_tools_message_observer_t,
+        ) -> *mut cef_registration_t,
+    >,
 }
 
 #[repr(C)]

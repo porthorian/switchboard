@@ -49,6 +49,7 @@ pub enum UiCommand {
     CloseTab {
         tab_id: u64,
     },
+    ToggleDevTools,
     SettingSet {
         key: String,
         value: SettingValue,
@@ -111,6 +112,9 @@ impl UiCommand {
             Self::CloseTab { tab_id } => Intent::CloseTab {
                 tab_id: TabId(tab_id),
             },
+            Self::ToggleDevTools => {
+                unreachable!("ToggleDevTools is handled directly by the runtime host")
+            }
             Self::SettingSet { key, value } => Intent::SettingSet { key, value },
         }
     }

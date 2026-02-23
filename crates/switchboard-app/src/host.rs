@@ -115,6 +115,8 @@ pub trait CefHost {
         visible: bool,
     ) -> Result<(), Self::Error>;
 
+    fn toggle_dev_tools_for_active_content(&mut self) -> Result<(), Self::Error>;
+
     #[allow(dead_code)]
     fn clear_content_view(&mut self, view_id: ContentViewId) -> Result<(), Self::Error>;
 
@@ -155,6 +157,8 @@ thread_local! {
     static UI_SHELL_VIEW: RefCell<ObjcId> = const { RefCell::new(std::ptr::null_mut()) };
     #[cfg(target_os = "macos")]
     static ACTIVE_CONTENT_BROWSER: RefCell<*mut cef_browser_t> = const { RefCell::new(std::ptr::null_mut()) };
+    #[cfg(target_os = "macos")]
+    static CONTENT_BROWSERS_BY_TAB: RefCell<HashMap<TabId, *mut cef_browser_t>> = RefCell::new(HashMap::new());
 }
 
 pub fn install_ui_command_handler(handler: Option<UiCommandHandler>) {
@@ -280,6 +284,38 @@ fn set_active_content_browser(browser: *mut cef_browser_t) {
 }
 
 #[cfg(target_os = "macos")]
+fn active_content_browser() -> *mut cef_browser_t {
+    ACTIVE_CONTENT_BROWSER.with(|slot| *slot.borrow())
+}
+
+#[cfg(target_os = "macos")]
+fn remember_browser_for_active_tab(browser: *mut cef_browser_t) {
+    set_active_content_browser(browser);
+    if browser.is_null() {
+        return;
+    }
+    if let Some(tab_id) = active_content_tab() {
+        CONTENT_BROWSERS_BY_TAB.with(|slot| {
+            slot.borrow_mut().insert(tab_id, browser);
+        });
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn browser_for_tab(tab_id: TabId) -> *mut cef_browser_t {
+    CONTENT_BROWSERS_BY_TAB
+        .with(|slot| slot.borrow().get(&tab_id).copied())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[cfg(target_os = "macos")]
+fn forget_browser_for_tab(tab_id: TabId) {
+    CONTENT_BROWSERS_BY_TAB.with(|slot| {
+        slot.borrow_mut().remove(&tab_id);
+    });
+}
+
+#[cfg(target_os = "macos")]
 fn set_ui_view_handles(root_view: ObjcId, ui_view: ObjcId) {
     UI_ROOT_VIEW.with(|slot| {
         *slot.borrow_mut() = root_view;
@@ -390,6 +426,10 @@ impl CefHost for MockCefHost {
         _view_id: ContentViewId,
         _visible: bool,
     ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn toggle_dev_tools_for_active_content(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
 
@@ -1108,7 +1148,7 @@ enum UiPromptAction {
 
 #[cfg(target_os = "macos")]
 fn is_allowed_setting_key(key: &str) -> bool {
-    matches!(
+    let fixed_key_allowed = matches!(
         key,
         "search_engine"
             | "homepage"
@@ -1117,7 +1157,25 @@ fn is_allowed_setting_key(key: &str) -> bool {
             | "keybinding_close_tab"
             | "keybinding_command_palette"
             | "keybinding_focus_navigation"
-    )
+            | "keybinding_toggle_devtools"
+            | "password_manager.default_provider"
+            | "password_manager.default_autofill"
+            | "password_manager.default_save_prompt"
+            | "password_manager.default_fallback"
+    );
+    fixed_key_allowed
+        || is_profile_scoped_setting_key(key, "password_manager.provider.profile.")
+        || is_profile_scoped_setting_key(key, "password_manager.autofill.profile.")
+        || is_profile_scoped_setting_key(key, "password_manager.save_prompt.profile.")
+        || is_profile_scoped_setting_key(key, "password_manager.fallback.profile.")
+}
+
+#[cfg(target_os = "macos")]
+fn is_profile_scoped_setting_key(key: &str, prefix: &str) -> bool {
+    let Some(suffix) = key.strip_prefix(prefix) else {
+        return false;
+    };
+    !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
 }
 
 #[cfg(target_os = "macos")]
@@ -1263,6 +1321,9 @@ fn parse_ui_prompt_payload(payload: &str) -> Result<UiPromptAction, &'static str
             }));
         }
         return Err("navigate intents only allow http/https URLs");
+    }
+    if trimmed == "devtools_toggle" {
+        return Ok(UiPromptAction::Intent(UiCommand::ToggleDevTools));
     }
     if let Some(rest) = trimmed.strip_prefix("setting_set_text ") {
         let mut parts = rest.trim().splitn(2, ' ');
@@ -1709,7 +1770,7 @@ unsafe extern "C" fn switchboard_content_on_address_change(
         return;
     }
     if !browser.is_null() {
-        set_active_content_browser(browser);
+        remember_browser_for_active_tab(browser);
     }
     set_active_content_uri(next.clone());
     if let Some(tab_id) = active_content_tab() {
@@ -1730,7 +1791,7 @@ unsafe extern "C" fn switchboard_content_on_title_change(
     title: *const cef_string_t,
 ) {
     if !browser.is_null() {
-        set_active_content_browser(browser);
+        remember_browser_for_active_tab(browser);
     }
     let next = cef_string_to_owned(title);
     if let Some(tab_id) = active_content_tab() {
@@ -1749,7 +1810,7 @@ unsafe extern "C" fn switchboard_content_on_loading_progress_change(
 ) {
     let mut is_loading = progress < 0.999_999;
     if !browser.is_null() {
-        set_active_content_browser(browser);
+        remember_browser_for_active_tab(browser);
         if let Some(is_loading_fn) = (*browser).is_loading {
             is_loading = is_loading_fn(browser) != 0;
         }
@@ -2334,6 +2395,7 @@ pub struct NativeMacHost {
     windows: HashMap<WindowId, ObjcId>,
     ui_views: HashMap<UiViewId, ObjcId>,
     content_views: HashMap<ContentViewId, ContentBackend>,
+    content_view_tabs: HashMap<ContentViewId, TabId>,
     content_view_windows: HashMap<ContentViewId, WindowId>,
     cef_clients: HashMap<ContentViewId, *mut cef_client_t>,
     retired_cef_clients: Vec<*mut cef_client_t>,
@@ -2384,6 +2446,7 @@ impl NativeMacHost {
                 windows: HashMap::new(),
                 ui_views: HashMap::new(),
                 content_views: HashMap::new(),
+                content_view_tabs: HashMap::new(),
                 content_view_windows: HashMap::new(),
                 cef_clients: HashMap::new(),
                 retired_cef_clients: Vec::new(),
@@ -2559,6 +2622,7 @@ impl CefHost for NativeMacHost {
             self.next_content_view_id += 1;
             let view_id = ContentViewId(self.next_content_view_id);
             self.content_views.insert(view_id, backend);
+            self.content_view_tabs.insert(view_id, tab_id);
             self.content_view_windows.insert(view_id, window_id);
             if let Some(client) = cef_client {
                 self.cef_clients.insert(view_id, client);
@@ -2616,6 +2680,7 @@ impl CefHost for NativeMacHost {
             let title_value = nsstring(&format!("Switchboard - {url}"))?;
             msg_send_void_id(window, selector("setTitle:")?, title_value);
         }
+        self.content_view_tabs.insert(view_id, tab_id);
         Ok(())
     }
 
@@ -2638,6 +2703,70 @@ impl CefHost for NativeMacHost {
                 selector("setHidden:")?,
                 if visible { NO } else { YES },
             );
+        }
+        if visible {
+            if let Some(tab_id) = self.content_view_tabs.get(&view_id).copied() {
+                set_active_content_tab(Some(tab_id));
+                let mapped_browser = browser_for_tab(tab_id);
+                if !mapped_browser.is_null() {
+                    set_active_content_browser(mapped_browser);
+                } else {
+                    set_active_content_browser(std::ptr::null_mut());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn toggle_dev_tools_for_active_content(&mut self) -> Result<(), Self::Error> {
+        if self.cef.is_none() {
+            return Err(HostError::Native(
+                "DevTools require CEF runtime. Set SWITCHBOARD_CEF_DIST or SWITCHBOARD_CEF_LIBRARY."
+                    .to_owned(),
+            ));
+        }
+
+        let browser = active_content_tab()
+            .map(browser_for_tab)
+            .filter(|ptr| !ptr.is_null())
+            .unwrap_or_else(active_content_browser);
+        if browser.is_null() {
+            return Err(HostError::Native(
+                "no active content browser is available for DevTools".to_owned(),
+            ));
+        }
+
+        unsafe {
+            let get_host = (*browser)
+                .get_host
+                .ok_or_else(|| HostError::Native("CEF browser get_host unavailable".to_owned()))?;
+            let browser_host = get_host(browser);
+            if browser_host.is_null() {
+                return Err(HostError::Native(
+                    "CEF browser host unavailable for DevTools".to_owned(),
+                ));
+            }
+
+            let has_dev_tools = (*browser_host).has_dev_tools.ok_or_else(|| {
+                HostError::Native("CEF has_dev_tools callback unavailable".to_owned())
+            })?;
+            if has_dev_tools(browser_host) != 0 {
+                let close_dev_tools = (*browser_host).close_dev_tools.ok_or_else(|| {
+                    HostError::Native("CEF close_dev_tools callback unavailable".to_owned())
+                })?;
+                close_dev_tools(browser_host);
+            } else {
+                let show_dev_tools = (*browser_host).show_dev_tools.ok_or_else(|| {
+                    HostError::Native("CEF show_dev_tools callback unavailable".to_owned())
+                })?;
+                show_dev_tools(
+                    browser_host,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+            }
         }
         Ok(())
     }
@@ -2681,6 +2810,9 @@ impl CefHost for NativeMacHost {
             .remove(&view_id)
             .ok_or_else(|| HostError::Native(format!("content view not found: {}", view_id.0)))?;
         self.content_view_windows.remove(&view_id);
+        if let Some(tab_id) = self.content_view_tabs.remove(&view_id) {
+            forget_browser_for_tab(tab_id);
+        }
 
         unsafe {
             match content_backend {

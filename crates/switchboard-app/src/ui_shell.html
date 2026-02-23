@@ -18,6 +18,7 @@
         <input id="url" class="uri-input" autocomplete="off" spellcheck="false">
       </div>
       <div class="titlebar-tools">
+        <button id="devtools-toggle" class="devtools-toggle" type="button">DevTools</button>
         <button id="settings-toggle" class="settings-toggle" type="button" aria-haspopup="dialog" aria-expanded="false">Settings</button>
       </div>
     </div>
@@ -143,6 +144,44 @@
       <label class="settings-field settings-field-wide">
         <span class="settings-label">Shortcut: Focus Top Navigation</span>
         <input id="settings-keybinding-focus-nav" class="settings-input" type="text" spellcheck="false" autocomplete="off" placeholder="mod+l">
+      </label>
+      <label class="settings-field settings-field-wide">
+        <span class="settings-label">Shortcut: Toggle DevTools</span>
+        <input id="settings-keybinding-devtools" class="settings-input" type="text" spellcheck="false" autocomplete="off" placeholder="mod+shift+i">
+      </label>
+      <div class="settings-divider settings-field-wide">Password Manager</div>
+      <div id="settings-password-manager-profile-note" class="settings-note settings-field-wide">Applies to active profile.</div>
+      <label class="settings-field">
+        <span class="settings-label">Provider</span>
+        <select id="settings-password-manager-provider" class="settings-select">
+          <option value="builtin">Built-in</option>
+          <option value="bitwarden">Bitwarden</option>
+          <option value="1password">1Password</option>
+          <option value="lastpass">LastPass</option>
+          <option value="none">None</option>
+        </select>
+      </label>
+      <label class="settings-field">
+        <span class="settings-label">Autofill</span>
+        <select id="settings-password-manager-autofill" class="settings-select">
+          <option value="enabled">Enabled</option>
+          <option value="disabled">Disabled</option>
+        </select>
+      </label>
+      <label class="settings-field">
+        <span class="settings-label">Save Credential Prompts</span>
+        <select id="settings-password-manager-save-prompt" class="settings-select">
+          <option value="enabled">Enabled</option>
+          <option value="disabled">Disabled</option>
+        </select>
+      </label>
+      <label class="settings-field">
+        <span class="settings-label">Fallback Behavior</span>
+        <select id="settings-password-manager-fallback" class="settings-select">
+          <option value="builtin">Fallback to built-in</option>
+          <option value="prompt">Ask every time</option>
+          <option value="none">No fallback</option>
+        </select>
       </label>
     </div>
   </div>

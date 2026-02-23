@@ -32,6 +32,12 @@ const NEW_TAB_CUSTOM_URL_SETTING_KEY: &str = "new_tab_custom_url";
 const KEYBINDING_CLOSE_TAB_SETTING_KEY: &str = "keybinding_close_tab";
 const KEYBINDING_COMMAND_PALETTE_SETTING_KEY: &str = "keybinding_command_palette";
 const KEYBINDING_FOCUS_NAVIGATION_SETTING_KEY: &str = "keybinding_focus_navigation";
+const KEYBINDING_TOGGLE_DEVTOOLS_SETTING_KEY: &str = "keybinding_toggle_devtools";
+const PASSWORD_MANAGER_DEFAULT_PROVIDER_SETTING_KEY: &str = "password_manager.default_provider";
+const PASSWORD_MANAGER_DEFAULT_AUTOFILL_SETTING_KEY: &str = "password_manager.default_autofill";
+const PASSWORD_MANAGER_DEFAULT_SAVE_PROMPT_SETTING_KEY: &str =
+    "password_manager.default_save_prompt";
+const PASSWORD_MANAGER_DEFAULT_FALLBACK_SETTING_KEY: &str = "password_manager.default_fallback";
 const WINDOW_MIN_WIDTH: u32 = 640;
 const WINDOW_MIN_HEIGHT: u32 = 480;
 
@@ -208,6 +214,17 @@ impl<H: CefHost + 'static> AppRuntime<H> {
                 self.handle_intent(Intent::NewWorkspace { profile_id, name })
             }
             UiCommand::NewProfile { name } => self.handle_intent(Intent::NewProfile { name }),
+            UiCommand::ToggleDevTools => {
+                self.host
+                    .toggle_dev_tools_for_active_content()
+                    .map_err(RuntimeError::Host)?;
+                let revision = self.revision();
+                Ok(Patch {
+                    ops: Vec::new(),
+                    from_revision: revision,
+                    to_revision: revision,
+                })
+            }
             other => self.handle_intent(other.into_intent()),
         }
     }
@@ -653,6 +670,26 @@ fn ensure_default_settings(state: &mut BrowserState) {
         .settings
         .entry(KEYBINDING_FOCUS_NAVIGATION_SETTING_KEY.to_owned())
         .or_insert_with(|| SettingValue::Text("mod+l".to_owned()));
+    state
+        .settings
+        .entry(KEYBINDING_TOGGLE_DEVTOOLS_SETTING_KEY.to_owned())
+        .or_insert_with(|| SettingValue::Text("mod+shift+i".to_owned()));
+    state
+        .settings
+        .entry(PASSWORD_MANAGER_DEFAULT_PROVIDER_SETTING_KEY.to_owned())
+        .or_insert_with(|| SettingValue::Text("builtin".to_owned()));
+    state
+        .settings
+        .entry(PASSWORD_MANAGER_DEFAULT_AUTOFILL_SETTING_KEY.to_owned())
+        .or_insert_with(|| SettingValue::Text("enabled".to_owned()));
+    state
+        .settings
+        .entry(PASSWORD_MANAGER_DEFAULT_SAVE_PROMPT_SETTING_KEY.to_owned())
+        .or_insert_with(|| SettingValue::Text("enabled".to_owned()));
+    state
+        .settings
+        .entry(PASSWORD_MANAGER_DEFAULT_FALLBACK_SETTING_KEY.to_owned())
+        .or_insert_with(|| SettingValue::Text("builtin".to_owned()));
 }
 
 fn ensure_bootstrap_state(state: &mut BrowserState) -> WorkspaceId {
@@ -973,6 +1010,10 @@ mod tests {
             _view_id: ContentViewId,
             _visible: bool,
         ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn toggle_dev_tools_for_active_content(&mut self) -> Result<(), Self::Error> {
             Ok(())
         }
 
@@ -1498,6 +1539,11 @@ mod tests {
         assert!(initial.contains("\"keybinding_close_tab\":\"mod+w\""));
         assert!(initial.contains("\"keybinding_command_palette\":\"space\""));
         assert!(initial.contains("\"keybinding_focus_navigation\":\"mod+l\""));
+        assert!(initial.contains("\"keybinding_toggle_devtools\":\"mod+shift+i\""));
+        assert!(initial.contains("\"password_manager.default_provider\":\"builtin\""));
+        assert!(initial.contains("\"password_manager.default_autofill\":\"enabled\""));
+        assert!(initial.contains("\"password_manager.default_save_prompt\":\"enabled\""));
+        assert!(initial.contains("\"password_manager.default_fallback\":\"builtin\""));
 
         runtime
             .handle_ui_command(UiCommand::SettingSet {
@@ -1508,6 +1554,20 @@ mod tests {
 
         let updated = runtime.ui_shell_state_json();
         assert!(updated.contains("\"search_engine\":\"duckduckgo\""));
+    }
+
+    #[test]
+    fn toggle_devtools_is_state_noop() {
+        let host = MockCefHost::default();
+        let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
+        let revision = runtime.revision();
+
+        let patch = runtime
+            .handle_ui_command(UiCommand::ToggleDevTools)
+            .expect("devtools toggle should succeed");
+        assert!(patch.ops.is_empty());
+        assert_eq!(patch.from_revision, revision);
+        assert_eq!(patch.to_revision, revision);
     }
 
     #[test]

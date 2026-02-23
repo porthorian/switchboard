@@ -23,6 +23,7 @@ const workspaceTitleInput = document.getElementById("workspace-title-input");
 const workspaceDelete = document.getElementById("workspace-delete");
 const tabList = document.getElementById("tab-list");
 const tabNew = document.getElementById("tab-new");
+const devtoolsToggle = document.getElementById("devtools-toggle");
 const settingsToggle = document.getElementById("settings-toggle");
 const settingsBackdrop = document.getElementById("settings-backdrop");
 const commandBackdrop = document.getElementById("command-backdrop");
@@ -39,6 +40,22 @@ const settingsCustomUrl = document.getElementById("settings-custom-url");
 const settingsKeybindingCloseTab = document.getElementById("settings-keybinding-close-tab");
 const settingsKeybindingCommand = document.getElementById("settings-keybinding-command");
 const settingsKeybindingFocusNav = document.getElementById("settings-keybinding-focus-nav");
+const settingsKeybindingDevTools = document.getElementById("settings-keybinding-devtools");
+const settingsPasswordManagerProfileNote = document.getElementById(
+  "settings-password-manager-profile-note"
+);
+const settingsPasswordManagerProvider = document.getElementById(
+  "settings-password-manager-provider"
+);
+const settingsPasswordManagerAutofill = document.getElementById(
+  "settings-password-manager-autofill"
+);
+const settingsPasswordManagerSavePrompt = document.getElementById(
+  "settings-password-manager-save-prompt"
+);
+const settingsPasswordManagerFallback = document.getElementById(
+  "settings-password-manager-fallback"
+);
 
 const TAB_ROW_HEIGHT = 56;
 const TAB_OVERSCAN = 6;
@@ -50,6 +67,16 @@ const NEW_TAB_CUSTOM_URL_SETTING_KEY = "new_tab_custom_url";
 const KEYBINDING_CLOSE_TAB_SETTING_KEY = "keybinding_close_tab";
 const KEYBINDING_COMMAND_PALETTE_SETTING_KEY = "keybinding_command_palette";
 const KEYBINDING_FOCUS_NAVIGATION_SETTING_KEY = "keybinding_focus_navigation";
+const KEYBINDING_TOGGLE_DEVTOOLS_SETTING_KEY = "keybinding_toggle_devtools";
+const PASSWORD_MANAGER_DEFAULT_PROVIDER_SETTING_KEY = "password_manager.default_provider";
+const PASSWORD_MANAGER_DEFAULT_AUTOFILL_SETTING_KEY = "password_manager.default_autofill";
+const PASSWORD_MANAGER_DEFAULT_SAVE_PROMPT_SETTING_KEY =
+  "password_manager.default_save_prompt";
+const PASSWORD_MANAGER_DEFAULT_FALLBACK_SETTING_KEY = "password_manager.default_fallback";
+const PASSWORD_MANAGER_PROVIDER_PROFILE_PREFIX = "password_manager.provider.profile.";
+const PASSWORD_MANAGER_AUTOFILL_PROFILE_PREFIX = "password_manager.autofill.profile.";
+const PASSWORD_MANAGER_SAVE_PROMPT_PROFILE_PREFIX = "password_manager.save_prompt.profile.";
+const PASSWORD_MANAGER_FALLBACK_PROFILE_PREFIX = "password_manager.fallback.profile.";
 const DEFAULT_SEARCH_ENGINE = "google";
 const DEFAULT_HOMEPAGE = "https://youtube.com";
 const DEFAULT_NEW_TAB_BEHAVIOR = "homepage";
@@ -57,6 +84,10 @@ const DEFAULT_NEW_TAB_CUSTOM_URL = "https://example.com";
 const DEFAULT_KEYBINDING_CLOSE_TAB = "mod+w";
 const DEFAULT_KEYBINDING_COMMAND_PALETTE = "space";
 const DEFAULT_KEYBINDING_FOCUS_NAVIGATION = "mod+l";
+const DEFAULT_KEYBINDING_TOGGLE_DEVTOOLS = "mod+shift+i";
+const PASSWORD_MANAGER_PROVIDERS = new Set(["builtin", "bitwarden", "1password", "lastpass", "none"]);
+const PASSWORD_MANAGER_SWITCHES = new Set(["enabled", "disabled"]);
+const PASSWORD_MANAGER_FALLBACKS = new Set(["builtin", "prompt", "none"]);
 const SEARCH_ENGINE_URLS = Object.freeze({
   google: "https://www.google.com/search?q=%s",
   duckduckgo: "https://duckduckgo.com/?q=%s",
@@ -139,12 +170,49 @@ function normalizeNewTabBehavior(value) {
   return DEFAULT_NEW_TAB_BEHAVIOR;
 }
 
+function normalizePasswordManagerProvider(value) {
+  const candidate = (value || "").trim().toLowerCase();
+  return PASSWORD_MANAGER_PROVIDERS.has(candidate) ? candidate : "builtin";
+}
+
+function normalizePasswordManagerSwitch(value) {
+  const candidate = (value || "").trim().toLowerCase();
+  return PASSWORD_MANAGER_SWITCHES.has(candidate) ? candidate : "enabled";
+}
+
+function normalizePasswordManagerFallback(value) {
+  const candidate = (value || "").trim().toLowerCase();
+  return PASSWORD_MANAGER_FALLBACKS.has(candidate) ? candidate : "builtin";
+}
+
+function activeProfileIdFromState(sourceState = shellState) {
+  if (!sourceState) return null;
+  const profileId = sourceState.active_profile_id;
+  if (profileId === null || profileId === undefined) return null;
+  return String(profileId);
+}
+
+function profileScopedSettingKey(prefix, sourceState = shellState) {
+  const profileId = activeProfileIdFromState(sourceState);
+  if (!profileId) return null;
+  return `${prefix}${profileId}`;
+}
+
 function shellSettingText(keyName, fallback, sourceState = shellState) {
   if (!sourceState || !sourceState.settings || typeof sourceState.settings !== "object") {
     return fallback;
   }
   const value = sourceState.settings[keyName];
   return typeof value === "string" ? value : fallback;
+}
+
+function profileScopedSettingText(prefix, defaultKey, fallback, sourceState = shellState) {
+  const profileKey = profileScopedSettingKey(prefix, sourceState);
+  if (profileKey) {
+    const profileValue = shellSettingText(profileKey, "", sourceState);
+    if (profileValue) return profileValue;
+  }
+  return shellSettingText(defaultKey, fallback, sourceState);
 }
 
 function setLocalSettingValue(keyName, value) {
@@ -449,6 +517,97 @@ function syncSettingsControlsFromState(state) {
     settingsKeybindingFocusNav.value = keybindingFocusNav;
   }
 
+  const keybindingDevTools = normalizeKeybinding(
+    shellSettingText(
+      KEYBINDING_TOGGLE_DEVTOOLS_SETTING_KEY,
+      DEFAULT_KEYBINDING_TOGGLE_DEVTOOLS,
+      state
+    ),
+    DEFAULT_KEYBINDING_TOGGLE_DEVTOOLS
+  );
+  if (
+    document.activeElement !== settingsKeybindingDevTools &&
+    settingsKeybindingDevTools.value !== keybindingDevTools
+  ) {
+    settingsKeybindingDevTools.value = keybindingDevTools;
+  }
+
+  const activeProfileId = activeProfileIdFromState(state);
+  const activeProfile = (state.profiles || []).find(
+    (profile) => String(profile.id) === String(activeProfileId)
+  );
+  if (activeProfileId) {
+    settingsPasswordManagerProfileNote.textContent = `Applies to ${profileDisplayName(activeProfile)} (Profile ${activeProfileId}).`;
+  } else {
+    settingsPasswordManagerProfileNote.textContent = "No active profile.";
+  }
+
+  const provider = normalizePasswordManagerProvider(
+    profileScopedSettingText(
+      PASSWORD_MANAGER_PROVIDER_PROFILE_PREFIX,
+      PASSWORD_MANAGER_DEFAULT_PROVIDER_SETTING_KEY,
+      "builtin",
+      state
+    )
+  );
+  if (
+    document.activeElement !== settingsPasswordManagerProvider &&
+    settingsPasswordManagerProvider.value !== provider
+  ) {
+    settingsPasswordManagerProvider.value = provider;
+  }
+
+  const autofill = normalizePasswordManagerSwitch(
+    profileScopedSettingText(
+      PASSWORD_MANAGER_AUTOFILL_PROFILE_PREFIX,
+      PASSWORD_MANAGER_DEFAULT_AUTOFILL_SETTING_KEY,
+      "enabled",
+      state
+    )
+  );
+  if (
+    document.activeElement !== settingsPasswordManagerAutofill &&
+    settingsPasswordManagerAutofill.value !== autofill
+  ) {
+    settingsPasswordManagerAutofill.value = autofill;
+  }
+
+  const savePrompt = normalizePasswordManagerSwitch(
+    profileScopedSettingText(
+      PASSWORD_MANAGER_SAVE_PROMPT_PROFILE_PREFIX,
+      PASSWORD_MANAGER_DEFAULT_SAVE_PROMPT_SETTING_KEY,
+      "enabled",
+      state
+    )
+  );
+  if (
+    document.activeElement !== settingsPasswordManagerSavePrompt &&
+    settingsPasswordManagerSavePrompt.value !== savePrompt
+  ) {
+    settingsPasswordManagerSavePrompt.value = savePrompt;
+  }
+
+  const fallback = normalizePasswordManagerFallback(
+    profileScopedSettingText(
+      PASSWORD_MANAGER_FALLBACK_PROFILE_PREFIX,
+      PASSWORD_MANAGER_DEFAULT_FALLBACK_SETTING_KEY,
+      "builtin",
+      state
+    )
+  );
+  if (
+    document.activeElement !== settingsPasswordManagerFallback &&
+    settingsPasswordManagerFallback.value !== fallback
+  ) {
+    settingsPasswordManagerFallback.value = fallback;
+  }
+
+  const passwordControlsEnabled = Boolean(activeProfileId);
+  settingsPasswordManagerProvider.disabled = !passwordControlsEnabled;
+  settingsPasswordManagerAutofill.disabled = !passwordControlsEnabled;
+  settingsPasswordManagerSavePrompt.disabled = !passwordControlsEnabled;
+  settingsPasswordManagerFallback.disabled = !passwordControlsEnabled;
+
   settingsCustomUrlField.hidden = behavior !== "custom";
 }
 
@@ -481,6 +640,42 @@ function commitKeybindingSetting(inputElement, settingKey, fallback) {
   const normalized = normalizeKeybinding(inputElement.value, fallback);
   inputElement.value = normalized;
   commitTextSetting(settingKey, normalized);
+}
+
+function commitActiveProfileTextSetting(prefix, value) {
+  const profileKey = profileScopedSettingKey(prefix);
+  if (!profileKey) return;
+  const normalized = (value || "").trim();
+  if (!normalized) return;
+  const current = shellSettingText(profileKey, "");
+  if (current === normalized) return;
+  setLocalSettingValue(profileKey, normalized);
+  send(`setting_set_text ${profileKey} ${normalized}`);
+  queueStateRefresh();
+}
+
+function commitPasswordManagerProviderSetting() {
+  const normalized = normalizePasswordManagerProvider(settingsPasswordManagerProvider.value);
+  settingsPasswordManagerProvider.value = normalized;
+  commitActiveProfileTextSetting(PASSWORD_MANAGER_PROVIDER_PROFILE_PREFIX, normalized);
+}
+
+function commitPasswordManagerAutofillSetting() {
+  const normalized = normalizePasswordManagerSwitch(settingsPasswordManagerAutofill.value);
+  settingsPasswordManagerAutofill.value = normalized;
+  commitActiveProfileTextSetting(PASSWORD_MANAGER_AUTOFILL_PROFILE_PREFIX, normalized);
+}
+
+function commitPasswordManagerSavePromptSetting() {
+  const normalized = normalizePasswordManagerSwitch(settingsPasswordManagerSavePrompt.value);
+  settingsPasswordManagerSavePrompt.value = normalized;
+  commitActiveProfileTextSetting(PASSWORD_MANAGER_SAVE_PROMPT_PROFILE_PREFIX, normalized);
+}
+
+function commitPasswordManagerFallbackSetting() {
+  const normalized = normalizePasswordManagerFallback(settingsPasswordManagerFallback.value);
+  settingsPasswordManagerFallback.value = normalized;
+  commitActiveProfileTextSetting(PASSWORD_MANAGER_FALLBACK_PROFILE_PREFIX, normalized);
 }
 
 function syncUiOverlayVisibility() {
@@ -551,6 +746,10 @@ function focusTopNavigationInput() {
   closeCommandPanel();
   input.focus();
   input.select();
+}
+
+function toggleDevTools() {
+  send("devtools_toggle");
 }
 
 function workspaceBadge(name) {
@@ -1236,6 +1435,17 @@ function handleShortcutFocusNavigation(event) {
   return true;
 }
 
+function handleShortcutToggleDevTools(event) {
+  const binding = keybindingSetting(
+    KEYBINDING_TOGGLE_DEVTOOLS_SETTING_KEY,
+    DEFAULT_KEYBINDING_TOGGLE_DEVTOOLS
+  );
+  if (!keybindingMatchesEvent(binding, event)) return false;
+  event.preventDefault();
+  toggleDevTools();
+  return true;
+}
+
 function startHostSyncLoop() {
   function tick() {
     syncActiveUriFromHost();
@@ -1253,6 +1463,9 @@ input.addEventListener("keydown", (event) => {
 });
 backButton.addEventListener("click", goBack);
 forwardButton.addEventListener("click", goForward);
+devtoolsToggle.addEventListener("click", () => {
+  toggleDevTools();
+});
 settingsToggle.addEventListener("click", (event) => {
   event.stopPropagation();
   toggleSettingsPanel();
@@ -1331,6 +1544,30 @@ settingsKeybindingFocusNav.addEventListener("blur", () => {
     KEYBINDING_FOCUS_NAVIGATION_SETTING_KEY,
     DEFAULT_KEYBINDING_FOCUS_NAVIGATION
   );
+});
+settingsKeybindingDevTools.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  settingsKeybindingDevTools.blur();
+});
+settingsKeybindingDevTools.addEventListener("blur", () => {
+  commitKeybindingSetting(
+    settingsKeybindingDevTools,
+    KEYBINDING_TOGGLE_DEVTOOLS_SETTING_KEY,
+    DEFAULT_KEYBINDING_TOGGLE_DEVTOOLS
+  );
+});
+settingsPasswordManagerProvider.addEventListener("change", () => {
+  commitPasswordManagerProviderSetting();
+});
+settingsPasswordManagerAutofill.addEventListener("change", () => {
+  commitPasswordManagerAutofillSetting();
+});
+settingsPasswordManagerSavePrompt.addEventListener("change", () => {
+  commitPasswordManagerSavePromptSetting();
+});
+settingsPasswordManagerFallback.addEventListener("change", () => {
+  commitPasswordManagerFallbackSetting();
 });
 commandBackdrop.addEventListener("click", () => {
   closeCommandPanel();
@@ -1496,6 +1733,7 @@ document.addEventListener("keydown", (event) => {
   if (handleShortcutCommandPalette(event)) return;
   if (handleShortcutFocusNavigation(event)) return;
   if (handleShortcutCloseTab(event)) return;
+  if (handleShortcutToggleDevTools(event)) return;
 
   const hasPrimaryModifier = event.metaKey || event.ctrlKey;
   if (!hasPrimaryModifier || !event.shiftKey || event.altKey) return;

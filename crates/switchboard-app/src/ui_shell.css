@@ -34,7 +34,7 @@ body {
   width: 100%;
   display: grid;
   align-items: center;
-  grid-template-columns: 86px minmax(0, 1fr) 86px;
+  grid-template-columns: 86px minmax(0, 1fr) auto;
 }
 .titlebar-pad {
   width: 86px;
@@ -80,7 +80,9 @@ body {
   justify-self: end;
   display: inline-flex;
   align-items: center;
+  gap: 8px;
 }
+.devtools-toggle,
 .settings-toggle {
   height: 30px;
   border: 1px solid #404f6b;
@@ -92,7 +94,14 @@ body {
   padding: 0 10px;
   cursor: pointer;
 }
+.devtools-toggle:hover,
 .settings-toggle:hover {
+  border-color: #5f8bff;
+  background: #1a2c4a;
+}
+.devtools-toggle:focus-visible,
+.settings-toggle:focus-visible {
+  outline: none;
   border-color: #5f8bff;
   background: #1a2c4a;
 }
@@ -237,6 +246,21 @@ body {
   font-size: 11px;
   color: #95a7cb;
   font-weight: 700;
+}
+.settings-divider {
+  margin-top: 2px;
+  padding: 8px 2px 2px;
+  border-top: 1px solid #30435f;
+  font-size: 12px;
+  font-weight: 800;
+  color: #d6e3ff;
+  letter-spacing: 0.02em;
+}
+.settings-note {
+  margin: 0;
+  padding: 0 2px;
+  font-size: 11px;
+  color: #94a7cd;
 }
 .settings-input,
 .settings-select {
