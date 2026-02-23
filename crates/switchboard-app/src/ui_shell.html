@@ -80,6 +80,21 @@
     </div>
   </div>
   <div id="settings-backdrop" class="settings-backdrop" hidden></div>
+  <div id="command-backdrop" class="command-backdrop" hidden></div>
+  <div id="command-panel" class="command-panel" role="dialog" aria-label="Navigation Command Bar" hidden>
+    <form id="command-form" class="command-form">
+      <label class="command-label" for="command-input">Search or enter address</label>
+      <input
+        id="command-input"
+        class="command-input"
+        type="text"
+        autocomplete="off"
+        spellcheck="false"
+        placeholder="Search or enter address"
+      >
+      <p class="command-hint">Enter to navigate, Esc to close</p>
+    </form>
+  </div>
   <div id="settings-panel" class="settings-panel" role="dialog" aria-label="Browser Settings" hidden>
     <div class="settings-panel-header">
       <div>
@@ -116,6 +131,18 @@
       <label id="settings-custom-url-field" class="settings-field settings-field-wide">
         <span class="settings-label">Custom New Tab URL</span>
         <input id="settings-custom-url" class="settings-input" type="text" spellcheck="false" autocomplete="off">
+      </label>
+      <label class="settings-field">
+        <span class="settings-label">Shortcut: Close Active Tab</span>
+        <input id="settings-keybinding-close-tab" class="settings-input" type="text" spellcheck="false" autocomplete="off" placeholder="mod+w">
+      </label>
+      <label class="settings-field">
+        <span class="settings-label">Shortcut: Command Bar</span>
+        <input id="settings-keybinding-command" class="settings-input" type="text" spellcheck="false" autocomplete="off" placeholder="space">
+      </label>
+      <label class="settings-field settings-field-wide">
+        <span class="settings-label">Shortcut: Focus Top Navigation</span>
+        <input id="settings-keybinding-focus-nav" class="settings-input" type="text" spellcheck="false" autocomplete="off" placeholder="mod+l">
       </label>
     </div>
   </div>

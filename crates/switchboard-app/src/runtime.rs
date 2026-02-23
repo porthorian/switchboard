@@ -29,6 +29,9 @@ const SEARCH_ENGINE_SETTING_KEY: &str = "search_engine";
 const HOMEPAGE_SETTING_KEY: &str = "homepage";
 const NEW_TAB_BEHAVIOR_SETTING_KEY: &str = "new_tab_behavior";
 const NEW_TAB_CUSTOM_URL_SETTING_KEY: &str = "new_tab_custom_url";
+const KEYBINDING_CLOSE_TAB_SETTING_KEY: &str = "keybinding_close_tab";
+const KEYBINDING_COMMAND_PALETTE_SETTING_KEY: &str = "keybinding_command_palette";
+const KEYBINDING_FOCUS_NAVIGATION_SETTING_KEY: &str = "keybinding_focus_navigation";
 const WINDOW_MIN_WIDTH: u32 = 640;
 const WINDOW_MIN_HEIGHT: u32 = 480;
 
@@ -638,6 +641,18 @@ fn ensure_default_settings(state: &mut BrowserState) {
         .settings
         .entry(NEW_TAB_CUSTOM_URL_SETTING_KEY.to_owned())
         .or_insert_with(|| SettingValue::Text("https://example.com".to_owned()));
+    state
+        .settings
+        .entry(KEYBINDING_CLOSE_TAB_SETTING_KEY.to_owned())
+        .or_insert_with(|| SettingValue::Text("mod+w".to_owned()));
+    state
+        .settings
+        .entry(KEYBINDING_COMMAND_PALETTE_SETTING_KEY.to_owned())
+        .or_insert_with(|| SettingValue::Text("space".to_owned()));
+    state
+        .settings
+        .entry(KEYBINDING_FOCUS_NAVIGATION_SETTING_KEY.to_owned())
+        .or_insert_with(|| SettingValue::Text("mod+l".to_owned()));
 }
 
 fn ensure_bootstrap_state(state: &mut BrowserState) -> WorkspaceId {
@@ -1480,6 +1495,9 @@ mod tests {
         assert!(initial.contains("\"search_engine\":\"google\""));
         assert!(initial.contains("\"homepage\":\"https://youtube.com\""));
         assert!(initial.contains("\"new_tab_behavior\":\"homepage\""));
+        assert!(initial.contains("\"keybinding_close_tab\":\"mod+w\""));
+        assert!(initial.contains("\"keybinding_command_palette\":\"space\""));
+        assert!(initial.contains("\"keybinding_focus_navigation\":\"mod+l\""));
 
         runtime
             .handle_ui_command(UiCommand::SettingSet {

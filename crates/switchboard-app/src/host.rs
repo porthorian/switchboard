@@ -1110,7 +1110,13 @@ enum UiPromptAction {
 fn is_allowed_setting_key(key: &str) -> bool {
     matches!(
         key,
-        "search_engine" | "homepage" | "new_tab_behavior" | "new_tab_custom_url"
+        "search_engine"
+            | "homepage"
+            | "new_tab_behavior"
+            | "new_tab_custom_url"
+            | "keybinding_close_tab"
+            | "keybinding_command_palette"
+            | "keybinding_focus_navigation"
     )
 }
 

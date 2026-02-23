@@ -25,6 +25,10 @@ const tabList = document.getElementById("tab-list");
 const tabNew = document.getElementById("tab-new");
 const settingsToggle = document.getElementById("settings-toggle");
 const settingsBackdrop = document.getElementById("settings-backdrop");
+const commandBackdrop = document.getElementById("command-backdrop");
+const commandPanel = document.getElementById("command-panel");
+const commandForm = document.getElementById("command-form");
+const commandInput = document.getElementById("command-input");
 const settingsPanel = document.getElementById("settings-panel");
 const settingsClose = document.getElementById("settings-close");
 const settingsSearchEngine = document.getElementById("settings-search-engine");
@@ -32,6 +36,9 @@ const settingsHomepage = document.getElementById("settings-homepage");
 const settingsNewTabBehavior = document.getElementById("settings-new-tab-behavior");
 const settingsCustomUrlField = document.getElementById("settings-custom-url-field");
 const settingsCustomUrl = document.getElementById("settings-custom-url");
+const settingsKeybindingCloseTab = document.getElementById("settings-keybinding-close-tab");
+const settingsKeybindingCommand = document.getElementById("settings-keybinding-command");
+const settingsKeybindingFocusNav = document.getElementById("settings-keybinding-focus-nav");
 
 const TAB_ROW_HEIGHT = 56;
 const TAB_OVERSCAN = 6;
@@ -40,10 +47,16 @@ const SEARCH_ENGINE_SETTING_KEY = "search_engine";
 const HOMEPAGE_SETTING_KEY = "homepage";
 const NEW_TAB_BEHAVIOR_SETTING_KEY = "new_tab_behavior";
 const NEW_TAB_CUSTOM_URL_SETTING_KEY = "new_tab_custom_url";
+const KEYBINDING_CLOSE_TAB_SETTING_KEY = "keybinding_close_tab";
+const KEYBINDING_COMMAND_PALETTE_SETTING_KEY = "keybinding_command_palette";
+const KEYBINDING_FOCUS_NAVIGATION_SETTING_KEY = "keybinding_focus_navigation";
 const DEFAULT_SEARCH_ENGINE = "google";
 const DEFAULT_HOMEPAGE = "https://youtube.com";
 const DEFAULT_NEW_TAB_BEHAVIOR = "homepage";
 const DEFAULT_NEW_TAB_CUSTOM_URL = "https://example.com";
+const DEFAULT_KEYBINDING_CLOSE_TAB = "mod+w";
+const DEFAULT_KEYBINDING_COMMAND_PALETTE = "space";
+const DEFAULT_KEYBINDING_FOCUS_NAVIGATION = "mod+l";
 const SEARCH_ENGINE_URLS = Object.freeze({
   google: "https://www.google.com/search?q=%s",
   duckduckgo: "https://duckduckgo.com/?q=%s",
@@ -52,6 +65,23 @@ const SEARCH_ENGINE_URLS = Object.freeze({
   kagi: "https://kagi.com/search?q=%s",
   startpage: "https://www.startpage.com/do/dsearch?query=%s",
 });
+const KEYBINDING_MODIFIERS = Object.freeze(["mod", "ctrl", "meta", "alt", "shift"]);
+const KEYBINDING_SPECIAL_KEYS = new Set([
+  "space",
+  "enter",
+  "escape",
+  "tab",
+  "backspace",
+  "delete",
+  "arrowup",
+  "arrowdown",
+  "arrowleft",
+  "arrowright",
+  "home",
+  "end",
+  "pageup",
+  "pagedown",
+]);
 
 let backStack = [];
 let forwardStack = [];
@@ -72,6 +102,8 @@ let profileMenuOpen = false;
 let profileEditorMode = null;
 let profileEditorTargetId = null;
 let settingsPanelOpen = false;
+let commandPanelOpen = false;
+let uiOverlayVisible = false;
 
 function send(payload) {
   try {
@@ -171,6 +203,102 @@ function normalizeConfiguredUrl(value, fallback) {
   return `https://${raw}`;
 }
 
+function normalizeKeyToken(value) {
+  const raw = String(value || "").toLowerCase();
+  if (raw === " " || raw === "spacebar") return "space";
+  const token = raw.trim();
+  if (!token) return "";
+  if (token === "esc") return "escape";
+  if (token === "return") return "enter";
+  if (KEYBINDING_SPECIAL_KEYS.has(token)) return token;
+  if (token.length === 1 && !/\s/.test(token)) return token;
+  return "";
+}
+
+function parseKeybinding(value) {
+  const raw = (value || "").trim().toLowerCase();
+  if (!raw) return null;
+  const parts = raw.split("+").map((part) => part.trim()).filter(Boolean);
+  if (parts.length === 0) return null;
+
+  const modifiers = new Set();
+  let keyToken = "";
+  for (const part of parts) {
+    if (KEYBINDING_MODIFIERS.includes(part)) {
+      modifiers.add(part);
+      continue;
+    }
+    if (keyToken) return null;
+    keyToken = normalizeKeyToken(part);
+  }
+  if (!keyToken) return null;
+
+  const orderedModifiers = KEYBINDING_MODIFIERS.filter((modifier) =>
+    modifiers.has(modifier)
+  );
+  return {
+    key: keyToken,
+    modifiers: orderedModifiers,
+    normalized: [...orderedModifiers, keyToken].join("+"),
+  };
+}
+
+function normalizeKeybinding(value, fallback) {
+  const parsed = parseKeybinding(value);
+  if (parsed) return parsed.normalized;
+  const parsedFallback = parseKeybinding(fallback);
+  return parsedFallback ? parsedFallback.normalized : "";
+}
+
+function eventKeyToken(event) {
+  return normalizeKeyToken(event.key);
+}
+
+function keybindingMatchesEvent(binding, event) {
+  const parsed = parseKeybinding(binding);
+  if (!parsed) return false;
+  const keyToken = eventKeyToken(event);
+  if (!keyToken || keyToken !== parsed.key) return false;
+
+  const modifiers = new Set(parsed.modifiers);
+  const hasPrimary = event.metaKey || event.ctrlKey;
+  if (modifiers.has("mod")) {
+    if (!hasPrimary) return false;
+  } else if (hasPrimary) {
+    return false;
+  }
+
+  if (modifiers.has("ctrl")) {
+    if (!event.ctrlKey) return false;
+  } else if (!modifiers.has("mod") && event.ctrlKey) {
+    return false;
+  }
+
+  if (modifiers.has("meta")) {
+    if (!event.metaKey) return false;
+  } else if (!modifiers.has("mod") && event.metaKey) {
+    return false;
+  }
+
+  if (modifiers.has("alt")) {
+    if (!event.altKey) return false;
+  } else if (event.altKey) {
+    return false;
+  }
+
+  if (modifiers.has("shift")) {
+    if (!event.shiftKey) return false;
+  } else if (event.shiftKey) {
+    return false;
+  }
+
+  return true;
+}
+
+function keybindingSetting(settingKey, fallback) {
+  return normalizeKeybinding(shellSettingText(settingKey, fallback), fallback);
+}
+
 function renderUri() {
   input.value = activeUri;
   backButton.disabled = backStack.length === 0;
@@ -225,7 +353,9 @@ function goForward() {
 }
 
 function syncActiveUriFromHost() {
-  if (document.hidden || document.activeElement === input) return;
+  if (document.hidden || document.activeElement === input || document.activeElement === commandInput) {
+    return;
+  }
   const response = send("query_active_uri");
   const hostUri = normalizeUrl(response);
   if (!hostUri || hostUri === activeUri) return;
@@ -274,6 +404,51 @@ function syncSettingsControlsFromState(state) {
     settingsCustomUrl.value = customUrl;
   }
 
+  const keybindingCloseTab = normalizeKeybinding(
+    shellSettingText(
+      KEYBINDING_CLOSE_TAB_SETTING_KEY,
+      DEFAULT_KEYBINDING_CLOSE_TAB,
+      state
+    ),
+    DEFAULT_KEYBINDING_CLOSE_TAB
+  );
+  if (
+    document.activeElement !== settingsKeybindingCloseTab &&
+    settingsKeybindingCloseTab.value !== keybindingCloseTab
+  ) {
+    settingsKeybindingCloseTab.value = keybindingCloseTab;
+  }
+
+  const keybindingCommand = normalizeKeybinding(
+    shellSettingText(
+      KEYBINDING_COMMAND_PALETTE_SETTING_KEY,
+      DEFAULT_KEYBINDING_COMMAND_PALETTE,
+      state
+    ),
+    DEFAULT_KEYBINDING_COMMAND_PALETTE
+  );
+  if (
+    document.activeElement !== settingsKeybindingCommand &&
+    settingsKeybindingCommand.value !== keybindingCommand
+  ) {
+    settingsKeybindingCommand.value = keybindingCommand;
+  }
+
+  const keybindingFocusNav = normalizeKeybinding(
+    shellSettingText(
+      KEYBINDING_FOCUS_NAVIGATION_SETTING_KEY,
+      DEFAULT_KEYBINDING_FOCUS_NAVIGATION,
+      state
+    ),
+    DEFAULT_KEYBINDING_FOCUS_NAVIGATION
+  );
+  if (
+    document.activeElement !== settingsKeybindingFocusNav &&
+    settingsKeybindingFocusNav.value !== keybindingFocusNav
+  ) {
+    settingsKeybindingFocusNav.value = keybindingFocusNav;
+  }
+
   settingsCustomUrlField.hidden = behavior !== "custom";
 }
 
@@ -302,23 +477,36 @@ function commitCustomNewTabUrlSetting() {
   commitTextSetting(NEW_TAB_CUSTOM_URL_SETTING_KEY, normalized);
 }
 
+function commitKeybindingSetting(inputElement, settingKey, fallback) {
+  const normalized = normalizeKeybinding(inputElement.value, fallback);
+  inputElement.value = normalized;
+  commitTextSetting(settingKey, normalized);
+}
+
+function syncUiOverlayVisibility() {
+  const nextVisible = settingsPanelOpen || commandPanelOpen;
+  if (nextVisible === uiOverlayVisible) return;
+  uiOverlayVisible = nextVisible;
+  send(nextVisible ? "ui_overlay on" : "ui_overlay off");
+}
+
 function openSettingsPanel() {
   if (settingsPanelOpen) return;
-  send("ui_overlay on");
   settingsPanelOpen = true;
   settingsBackdrop.hidden = false;
   settingsPanel.hidden = false;
   settingsToggle.setAttribute("aria-expanded", "true");
   syncSettingsControlsFromState(shellState);
+  syncUiOverlayVisibility();
 }
 
 function closeSettingsPanel() {
   if (!settingsPanelOpen) return;
-  send("ui_overlay off");
   settingsPanelOpen = false;
   settingsBackdrop.hidden = true;
   settingsPanel.hidden = true;
   settingsToggle.setAttribute("aria-expanded", "false");
+  syncUiOverlayVisibility();
 }
 
 function toggleSettingsPanel() {
@@ -327,6 +515,42 @@ function toggleSettingsPanel() {
   } else {
     openSettingsPanel();
   }
+}
+
+function openCommandPanel() {
+  if (commandPanelOpen) return;
+  if (settingsPanelOpen) closeSettingsPanel();
+  closeProfileMenu();
+  commandPanelOpen = true;
+  commandBackdrop.hidden = false;
+  commandPanel.hidden = false;
+  commandInput.value = activeUri;
+  syncUiOverlayVisibility();
+  window.requestAnimationFrame(() => {
+    commandInput.focus();
+    commandInput.select();
+  });
+}
+
+function closeCommandPanel() {
+  if (!commandPanelOpen) return;
+  commandPanelOpen = false;
+  commandBackdrop.hidden = true;
+  commandPanel.hidden = true;
+  syncUiOverlayVisibility();
+}
+
+function navigateFromCommandPanel() {
+  const next = normalizeNavigationInput(commandInput.value);
+  if (!next) return;
+  closeCommandPanel();
+  navigateTo(next, true);
+}
+
+function focusTopNavigationInput() {
+  closeCommandPanel();
+  input.focus();
+  input.select();
 }
 
 function workspaceBadge(name) {
@@ -357,6 +581,23 @@ function isTextInputTarget(target) {
   if (target instanceof HTMLTextAreaElement) return true;
   if (target instanceof HTMLElement && target.isContentEditable) return true;
   return false;
+}
+
+function shouldIgnoreGlobalShortcutTarget(target) {
+  if (!target) return false;
+  if (isTextInputTarget(target)) return true;
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.closest("#settings-panel")) return true;
+  if (target.closest(".profile-menu")) return true;
+  return false;
+}
+
+function closeActiveTabFromShortcut() {
+  if (!shellState) return;
+  const { activeTab } = deriveActiveContext(shellState);
+  if (!activeTab) return;
+  send(`close_tab ${activeTab.id}`);
+  queueStateRefresh();
 }
 
 function profileMenuItems() {
@@ -962,6 +1203,39 @@ function handleTabClick(event) {
   queueStateRefresh();
 }
 
+function handleShortcutCloseTab(event) {
+  const binding = keybindingSetting(
+    KEYBINDING_CLOSE_TAB_SETTING_KEY,
+    DEFAULT_KEYBINDING_CLOSE_TAB
+  );
+  if (!keybindingMatchesEvent(binding, event)) return false;
+  event.preventDefault();
+  closeActiveTabFromShortcut();
+  return true;
+}
+
+function handleShortcutCommandPalette(event) {
+  const binding = keybindingSetting(
+    KEYBINDING_COMMAND_PALETTE_SETTING_KEY,
+    DEFAULT_KEYBINDING_COMMAND_PALETTE
+  );
+  if (!keybindingMatchesEvent(binding, event)) return false;
+  event.preventDefault();
+  openCommandPanel();
+  return true;
+}
+
+function handleShortcutFocusNavigation(event) {
+  const binding = keybindingSetting(
+    KEYBINDING_FOCUS_NAVIGATION_SETTING_KEY,
+    DEFAULT_KEYBINDING_FOCUS_NAVIGATION
+  );
+  if (!keybindingMatchesEvent(binding, event)) return false;
+  event.preventDefault();
+  focusTopNavigationInput();
+  return true;
+}
+
 function startHostSyncLoop() {
   function tick() {
     syncActiveUriFromHost();
@@ -1021,6 +1295,54 @@ settingsCustomUrl.addEventListener("keydown", (event) => {
 });
 settingsCustomUrl.addEventListener("blur", () => {
   commitCustomNewTabUrlSetting();
+});
+settingsKeybindingCloseTab.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  settingsKeybindingCloseTab.blur();
+});
+settingsKeybindingCloseTab.addEventListener("blur", () => {
+  commitKeybindingSetting(
+    settingsKeybindingCloseTab,
+    KEYBINDING_CLOSE_TAB_SETTING_KEY,
+    DEFAULT_KEYBINDING_CLOSE_TAB
+  );
+});
+settingsKeybindingCommand.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  settingsKeybindingCommand.blur();
+});
+settingsKeybindingCommand.addEventListener("blur", () => {
+  commitKeybindingSetting(
+    settingsKeybindingCommand,
+    KEYBINDING_COMMAND_PALETTE_SETTING_KEY,
+    DEFAULT_KEYBINDING_COMMAND_PALETTE
+  );
+});
+settingsKeybindingFocusNav.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  settingsKeybindingFocusNav.blur();
+});
+settingsKeybindingFocusNav.addEventListener("blur", () => {
+  commitKeybindingSetting(
+    settingsKeybindingFocusNav,
+    KEYBINDING_FOCUS_NAVIGATION_SETTING_KEY,
+    DEFAULT_KEYBINDING_FOCUS_NAVIGATION
+  );
+});
+commandBackdrop.addEventListener("click", () => {
+  closeCommandPanel();
+});
+commandForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  navigateFromCommandPanel();
+});
+commandPanel.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  event.preventDefault();
+  closeCommandPanel();
 });
 profileNew.addEventListener("click", createProfile);
 profileMenuButton.addEventListener("click", (event) => {
@@ -1164,10 +1486,17 @@ document.addEventListener("pointerdown", (event) => {
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     closeProfileMenu();
+    closeCommandPanel();
     closeSettingsPanel();
     return;
   }
-  if (isTextInputTarget(event.target)) return;
+
+  if (commandPanelOpen || settingsPanelOpen) return;
+  if (shouldIgnoreGlobalShortcutTarget(event.target)) return;
+  if (handleShortcutCommandPalette(event)) return;
+  if (handleShortcutFocusNavigation(event)) return;
+  if (handleShortcutCloseTab(event)) return;
+
   const hasPrimaryModifier = event.metaKey || event.ctrlKey;
   if (!hasPrimaryModifier || !event.shiftKey || event.altKey) return;
 
