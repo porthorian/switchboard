@@ -23,6 +23,9 @@ pub enum ReduceError {
 const WARM_POOL_BUDGET_KEY: &str = "warm_pool_budget";
 const DEFAULT_WARM_POOL_BUDGET: usize = 8;
 const MAX_WARM_POOL_BUDGET: usize = 32;
+const HOMEPAGE_KEY: &str = "homepage";
+const NEW_TAB_BEHAVIOR_KEY: &str = "new_tab_behavior";
+const NEW_TAB_CUSTOM_URL_KEY: &str = "new_tab_custom_url";
 
 pub fn apply_intent(state: &mut BrowserState, intent: Intent) -> Result<Vec<PatchOp>, ReduceError> {
     let mut ops = Vec::new();
@@ -344,11 +347,12 @@ pub fn apply_intent(state: &mut BrowserState, intent: Intent) -> Result<Vec<Patc
             }
 
             let tab_id = state.allocate_tab_id();
+            let resolved_url = url.unwrap_or_else(|| resolve_new_tab_url(state, workspace_id));
             let tab = Tab {
                 id: tab_id,
                 profile_id,
                 workspace_id,
-                url: url.unwrap_or_else(|| "about:blank".to_owned()),
+                url: resolved_url,
                 title: String::new(),
                 loading: false,
                 thumbnail_data_url: None,
@@ -785,4 +789,56 @@ fn warm_pool_budget(state: &BrowserState) -> usize {
         }
         _ => DEFAULT_WARM_POOL_BUDGET,
     }
+}
+
+fn resolve_new_tab_url(state: &BrowserState, workspace_id: WorkspaceId) -> String {
+    let behavior = setting_text(state, NEW_TAB_BEHAVIOR_KEY)
+        .unwrap_or("homepage")
+        .to_ascii_lowercase();
+    match behavior.as_str() {
+        "blank" => "about:blank".to_owned(),
+        "homepage" => resolve_homepage_url(state),
+        "custom" => setting_text(state, NEW_TAB_CUSTOM_URL_KEY)
+            .and_then(normalize_configured_url)
+            .unwrap_or_else(|| resolve_homepage_url(state)),
+        "workspace_default" => state
+            .workspaces
+            .get(&workspace_id)
+            .and_then(|workspace| workspace.active_tab_id)
+            .and_then(|tab_id| state.tabs.get(&tab_id))
+            .map(|tab| tab.url.clone())
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(|| resolve_homepage_url(state)),
+        _ => resolve_homepage_url(state),
+    }
+}
+
+fn resolve_homepage_url(state: &BrowserState) -> String {
+    setting_text(state, HOMEPAGE_KEY)
+        .and_then(normalize_configured_url)
+        .unwrap_or_else(|| "about:blank".to_owned())
+}
+
+fn setting_text<'a>(state: &'a BrowserState, key: &str) -> Option<&'a str> {
+    match state.settings.get(key) {
+        Some(SettingValue::Text(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn normalize_configured_url(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("about:blank") {
+        return Some("about:blank".to_owned());
+    }
+    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        return Some(trimmed.to_owned());
+    }
+    if trimmed.contains("://") {
+        return None;
+    }
+    Some(format!("https://{trimmed}"))
 }

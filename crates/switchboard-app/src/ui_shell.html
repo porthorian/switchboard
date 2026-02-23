@@ -17,7 +17,9 @@
         <button id="nav-forward" class="nav-btn" type="button" aria-label="Forward">&gt;</button>
         <input id="url" class="uri-input" autocomplete="off" spellcheck="false">
       </div>
-      <div class="titlebar-pad"></div>
+      <div class="titlebar-tools">
+        <button id="settings-toggle" class="settings-toggle" type="button" aria-haspopup="dialog" aria-expanded="false">Settings</button>
+      </div>
     </div>
   </div>
   <div class="leftshell">
@@ -75,6 +77,46 @@
       </div>
       <div id="tab-list" class="tab-list"></div>
       <button id="tab-new" class="tab-new" type="button">+ New Page</button>
+    </div>
+  </div>
+  <div id="settings-backdrop" class="settings-backdrop" hidden></div>
+  <div id="settings-panel" class="settings-panel" role="dialog" aria-label="Browser Settings" hidden>
+    <div class="settings-panel-header">
+      <div>
+        <h2 class="settings-panel-title">Browser Settings</h2>
+        <p class="settings-panel-subtitle">Preferences that shape default navigation behavior.</p>
+      </div>
+      <button id="settings-close" class="settings-close" type="button" aria-label="Close Settings">×</button>
+    </div>
+    <div class="settings-grid">
+      <label class="settings-field">
+        <span class="settings-label">Default Search Engine</span>
+        <select id="settings-search-engine" class="settings-select">
+          <option value="google">Google</option>
+          <option value="duckduckgo">DuckDuckGo</option>
+          <option value="bing">Bing</option>
+          <option value="brave">Brave</option>
+          <option value="kagi">Kagi</option>
+          <option value="startpage">Startpage</option>
+        </select>
+      </label>
+      <label class="settings-field">
+        <span class="settings-label">New Tab Behavior</span>
+        <select id="settings-new-tab-behavior" class="settings-select">
+          <option value="homepage">Homepage</option>
+          <option value="blank">Blank</option>
+          <option value="custom">Custom URL</option>
+          <option value="workspace_default">Workspace Default</option>
+        </select>
+      </label>
+      <label class="settings-field settings-field-wide">
+        <span class="settings-label">Homepage</span>
+        <input id="settings-homepage" class="settings-input" type="text" spellcheck="false" autocomplete="off">
+      </label>
+      <label id="settings-custom-url-field" class="settings-field settings-field-wide">
+        <span class="settings-label">Custom New Tab URL</span>
+        <input id="settings-custom-url" class="settings-input" type="text" spellcheck="false" autocomplete="off">
+      </label>
     </div>
   </div>
   <script>

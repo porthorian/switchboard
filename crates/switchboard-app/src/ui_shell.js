@@ -23,10 +23,35 @@ const workspaceTitleInput = document.getElementById("workspace-title-input");
 const workspaceDelete = document.getElementById("workspace-delete");
 const tabList = document.getElementById("tab-list");
 const tabNew = document.getElementById("tab-new");
+const settingsToggle = document.getElementById("settings-toggle");
+const settingsBackdrop = document.getElementById("settings-backdrop");
+const settingsPanel = document.getElementById("settings-panel");
+const settingsClose = document.getElementById("settings-close");
+const settingsSearchEngine = document.getElementById("settings-search-engine");
+const settingsHomepage = document.getElementById("settings-homepage");
+const settingsNewTabBehavior = document.getElementById("settings-new-tab-behavior");
+const settingsCustomUrlField = document.getElementById("settings-custom-url-field");
+const settingsCustomUrl = document.getElementById("settings-custom-url");
 
 const TAB_ROW_HEIGHT = 56;
 const TAB_OVERSCAN = 6;
 const TAB_LIST_PADDING_Y = 8;
+const SEARCH_ENGINE_SETTING_KEY = "search_engine";
+const HOMEPAGE_SETTING_KEY = "homepage";
+const NEW_TAB_BEHAVIOR_SETTING_KEY = "new_tab_behavior";
+const NEW_TAB_CUSTOM_URL_SETTING_KEY = "new_tab_custom_url";
+const DEFAULT_SEARCH_ENGINE = "google";
+const DEFAULT_HOMEPAGE = "https://youtube.com";
+const DEFAULT_NEW_TAB_BEHAVIOR = "homepage";
+const DEFAULT_NEW_TAB_CUSTOM_URL = "https://example.com";
+const SEARCH_ENGINE_URLS = Object.freeze({
+  google: "https://www.google.com/search?q=%s",
+  duckduckgo: "https://duckduckgo.com/?q=%s",
+  bing: "https://www.bing.com/search?q=%s",
+  brave: "https://search.brave.com/search?q=%s",
+  kagi: "https://kagi.com/search?q=%s",
+  startpage: "https://www.startpage.com/do/dsearch?query=%s",
+});
 
 let backStack = [];
 let forwardStack = [];
@@ -46,6 +71,7 @@ let virtualRenderKey = "";
 let profileMenuOpen = false;
 let profileEditorMode = null;
 let profileEditorTargetId = null;
+let settingsPanelOpen = false;
 
 function send(payload) {
   try {
@@ -60,6 +86,88 @@ function normalizeUrl(value) {
   if (!raw) return "";
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw)) return raw;
   if (raw.includes("://")) return raw;
+  return `https://${raw}`;
+}
+
+function normalizeSearchEngine(value) {
+  const candidate = (value || "").trim().toLowerCase();
+  return SEARCH_ENGINE_URLS[candidate] ? candidate : DEFAULT_SEARCH_ENGINE;
+}
+
+function normalizeNewTabBehavior(value) {
+  const candidate = (value || "").trim().toLowerCase();
+  if (
+    candidate === "blank" ||
+    candidate === "homepage" ||
+    candidate === "custom" ||
+    candidate === "workspace_default"
+  ) {
+    return candidate;
+  }
+  return DEFAULT_NEW_TAB_BEHAVIOR;
+}
+
+function shellSettingText(keyName, fallback, sourceState = shellState) {
+  if (!sourceState || !sourceState.settings || typeof sourceState.settings !== "object") {
+    return fallback;
+  }
+  const value = sourceState.settings[keyName];
+  return typeof value === "string" ? value : fallback;
+}
+
+function setLocalSettingValue(keyName, value) {
+  if (!shellState || !shellState.settings || typeof shellState.settings !== "object") {
+    return;
+  }
+  shellState.settings[keyName] = value;
+}
+
+function searchUrlForQuery(query) {
+  const engine = normalizeSearchEngine(
+    shellSettingText(SEARCH_ENGINE_SETTING_KEY, DEFAULT_SEARCH_ENGINE)
+  );
+  const template = SEARCH_ENGINE_URLS[engine] || SEARCH_ENGINE_URLS[DEFAULT_SEARCH_ENGINE];
+  return template.replace("%s", encodeURIComponent(query));
+}
+
+function normalizeNavigationInput(value) {
+  const raw = (value || "").trim();
+  if (!raw) return "";
+
+  if (raw.startsWith("http://") || raw.startsWith("https://")) {
+    return raw;
+  }
+
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw)) {
+    return searchUrlForQuery(raw);
+  }
+
+  if (/\s/.test(raw)) {
+    return searchUrlForQuery(raw);
+  }
+
+  const lower = raw.toLowerCase();
+  if (
+    lower.startsWith("localhost") ||
+    lower.startsWith("127.0.0.1") ||
+    lower.startsWith("[::1]")
+  ) {
+    return `http://${raw}`;
+  }
+
+  if (raw.includes(".")) {
+    return `https://${raw}`;
+  }
+
+  return searchUrlForQuery(raw);
+}
+
+function normalizeConfiguredUrl(value, fallback) {
+  const raw = (value || "").trim();
+  if (!raw) return fallback;
+  if (raw.toLowerCase() === "about:blank") return "about:blank";
+  if (raw.startsWith("http://") || raw.startsWith("https://")) return raw;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw)) return fallback;
   return `https://${raw}`;
 }
 
@@ -93,7 +201,7 @@ function navigateTo(next, pushHistory) {
 }
 
 function navigateFromInput() {
-  const next = normalizeUrl(input.value);
+  const next = normalizeNavigationInput(input.value);
   if (!next) return;
   navigateTo(next, true);
 }
@@ -130,6 +238,94 @@ function parseShellState(raw) {
     return JSON.parse(raw);
   } catch (_error) {
     return null;
+  }
+}
+
+function syncSettingsControlsFromState(state) {
+  if (!state || !state.settings || typeof state.settings !== "object") return;
+
+  const searchEngine = normalizeSearchEngine(
+    shellSettingText(SEARCH_ENGINE_SETTING_KEY, DEFAULT_SEARCH_ENGINE, state)
+  );
+  if (settingsSearchEngine.value !== searchEngine) {
+    settingsSearchEngine.value = searchEngine;
+  }
+
+  const homepage = normalizeConfiguredUrl(
+    shellSettingText(HOMEPAGE_SETTING_KEY, DEFAULT_HOMEPAGE, state),
+    DEFAULT_HOMEPAGE
+  );
+  if (document.activeElement !== settingsHomepage && settingsHomepage.value !== homepage) {
+    settingsHomepage.value = homepage;
+  }
+
+  const behavior = normalizeNewTabBehavior(
+    shellSettingText(NEW_TAB_BEHAVIOR_SETTING_KEY, DEFAULT_NEW_TAB_BEHAVIOR, state)
+  );
+  if (settingsNewTabBehavior.value !== behavior) {
+    settingsNewTabBehavior.value = behavior;
+  }
+
+  const customUrl = normalizeConfiguredUrl(
+    shellSettingText(NEW_TAB_CUSTOM_URL_SETTING_KEY, DEFAULT_NEW_TAB_CUSTOM_URL, state),
+    DEFAULT_NEW_TAB_CUSTOM_URL
+  );
+  if (document.activeElement !== settingsCustomUrl && settingsCustomUrl.value !== customUrl) {
+    settingsCustomUrl.value = customUrl;
+  }
+
+  settingsCustomUrlField.hidden = behavior !== "custom";
+}
+
+function commitTextSetting(keyName, value) {
+  const sanitized = (value || "").replace(/\r?\n/g, " ").trim();
+  if (!sanitized) return;
+  const current = shellSettingText(keyName, "");
+  if (sanitized === current) return;
+  setLocalSettingValue(keyName, sanitized);
+  send(`setting_set_text ${keyName} ${sanitized}`);
+  queueStateRefresh();
+}
+
+function commitHomepageSetting() {
+  const normalized = normalizeConfiguredUrl(settingsHomepage.value, DEFAULT_HOMEPAGE);
+  settingsHomepage.value = normalized;
+  commitTextSetting(HOMEPAGE_SETTING_KEY, normalized);
+}
+
+function commitCustomNewTabUrlSetting() {
+  const normalized = normalizeConfiguredUrl(
+    settingsCustomUrl.value,
+    DEFAULT_NEW_TAB_CUSTOM_URL
+  );
+  settingsCustomUrl.value = normalized;
+  commitTextSetting(NEW_TAB_CUSTOM_URL_SETTING_KEY, normalized);
+}
+
+function openSettingsPanel() {
+  if (settingsPanelOpen) return;
+  send("ui_overlay on");
+  settingsPanelOpen = true;
+  settingsBackdrop.hidden = false;
+  settingsPanel.hidden = false;
+  settingsToggle.setAttribute("aria-expanded", "true");
+  syncSettingsControlsFromState(shellState);
+}
+
+function closeSettingsPanel() {
+  if (!settingsPanelOpen) return;
+  send("ui_overlay off");
+  settingsPanelOpen = false;
+  settingsBackdrop.hidden = true;
+  settingsPanel.hidden = true;
+  settingsToggle.setAttribute("aria-expanded", "false");
+}
+
+function toggleSettingsPanel() {
+  if (settingsPanelOpen) {
+    closeSettingsPanel();
+  } else {
+    openSettingsPanel();
   }
 }
 
@@ -493,6 +689,7 @@ function renderShellState(state) {
   if (activeTab && activeTab.url && document.activeElement !== input) {
     setActiveUri(normalizeUrl(activeTab.url), false);
   }
+  syncSettingsControlsFromState(state);
 }
 
 function syncShellStateFromHost(force) {
@@ -782,6 +979,49 @@ input.addEventListener("keydown", (event) => {
 });
 backButton.addEventListener("click", goBack);
 forwardButton.addEventListener("click", goForward);
+settingsToggle.addEventListener("click", (event) => {
+  event.stopPropagation();
+  toggleSettingsPanel();
+});
+settingsClose.addEventListener("click", () => {
+  closeSettingsPanel();
+});
+settingsBackdrop.addEventListener("click", () => {
+  closeSettingsPanel();
+});
+settingsPanel.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  event.preventDefault();
+  closeSettingsPanel();
+  settingsToggle.focus();
+});
+settingsSearchEngine.addEventListener("change", () => {
+  const next = normalizeSearchEngine(settingsSearchEngine.value);
+  settingsSearchEngine.value = next;
+  commitTextSetting(SEARCH_ENGINE_SETTING_KEY, next);
+});
+settingsNewTabBehavior.addEventListener("change", () => {
+  const next = normalizeNewTabBehavior(settingsNewTabBehavior.value);
+  settingsNewTabBehavior.value = next;
+  settingsCustomUrlField.hidden = next !== "custom";
+  commitTextSetting(NEW_TAB_BEHAVIOR_SETTING_KEY, next);
+});
+settingsHomepage.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  settingsHomepage.blur();
+});
+settingsHomepage.addEventListener("blur", () => {
+  commitHomepageSetting();
+});
+settingsCustomUrl.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  settingsCustomUrl.blur();
+});
+settingsCustomUrl.addEventListener("blur", () => {
+  commitCustomNewTabUrlSetting();
+});
 profileNew.addEventListener("click", createProfile);
 profileMenuButton.addEventListener("click", (event) => {
   event.stopPropagation();
@@ -915,9 +1155,16 @@ document.addEventListener("pointerdown", (event) => {
   if (event.target.closest(".profile-menu")) return;
   closeProfileMenu();
 });
+document.addEventListener("pointerdown", (event) => {
+  if (!settingsPanelOpen) return;
+  if (event.target.closest("#settings-panel")) return;
+  if (event.target.closest("#settings-toggle")) return;
+  closeSettingsPanel();
+});
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     closeProfileMenu();
+    closeSettingsPanel();
     return;
   }
   if (isTextInputTarget(event.target)) return;

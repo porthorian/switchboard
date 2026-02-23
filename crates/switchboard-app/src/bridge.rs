@@ -1,4 +1,4 @@
-use switchboard_core::{Intent, ProfileId, TabId, WorkspaceId};
+use switchboard_core::{Intent, ProfileId, SettingValue, TabId, WorkspaceId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
@@ -48,6 +48,10 @@ pub enum UiCommand {
     },
     CloseTab {
         tab_id: u64,
+    },
+    SettingSet {
+        key: String,
+        value: SettingValue,
     },
 }
 
@@ -107,6 +111,7 @@ impl UiCommand {
             Self::CloseTab { tab_id } => Intent::CloseTab {
                 tab_id: TabId(tab_id),
             },
+            Self::SettingSet { key, value } => Intent::SettingSet { key, value },
         }
     }
 }

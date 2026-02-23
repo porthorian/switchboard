@@ -820,4 +820,156 @@ mod tests {
             assert_lifecycle_invariants(engine.state());
         }
     }
+
+    #[test]
+    fn new_tab_uses_homepage_setting_when_behavior_is_homepage() {
+        let (mut engine, workspace_id) = seeded_engine();
+        engine
+            .dispatch(Intent::SettingSet {
+                key: "homepage".to_owned(),
+                value: SettingValue::Text("https://home.example".to_owned()),
+            })
+            .expect("homepage setting should be applied");
+        engine
+            .dispatch(Intent::SettingSet {
+                key: "new_tab_behavior".to_owned(),
+                value: SettingValue::Text("homepage".to_owned()),
+            })
+            .expect("new tab behavior setting should be applied");
+
+        engine
+            .dispatch(Intent::NewTab {
+                workspace_id,
+                url: None,
+                make_active: true,
+            })
+            .expect("new tab should succeed");
+        let active_tab_id = first_tab_id(&engine, workspace_id);
+        let tab = engine
+            .state()
+            .tabs
+            .get(&active_tab_id)
+            .expect("active tab should exist");
+        assert_eq!(tab.url, "https://home.example");
+    }
+
+    #[test]
+    fn new_tab_uses_workspace_default_behavior() {
+        let (mut engine, workspace_id) = seeded_engine();
+        engine
+            .dispatch(Intent::SettingSet {
+                key: "new_tab_behavior".to_owned(),
+                value: SettingValue::Text("workspace_default".to_owned()),
+            })
+            .expect("new tab behavior should be applied");
+
+        engine
+            .dispatch(Intent::NewTab {
+                workspace_id,
+                url: Some("https://source.example".to_owned()),
+                make_active: true,
+            })
+            .expect("source tab should be created");
+        let source_tab_id = first_tab_id(&engine, workspace_id);
+
+        engine
+            .dispatch(Intent::NewTab {
+                workspace_id,
+                url: None,
+                make_active: true,
+            })
+            .expect("new tab should be created with workspace default");
+        let cloned_tab_id = engine
+            .state()
+            .workspaces
+            .get(&workspace_id)
+            .expect("workspace should exist")
+            .active_tab_id
+            .expect("new tab should be active");
+        let source_url = engine
+            .state()
+            .tabs
+            .get(&source_tab_id)
+            .expect("source tab should exist")
+            .url
+            .clone();
+        let cloned_url = engine
+            .state()
+            .tabs
+            .get(&cloned_tab_id)
+            .expect("cloned tab should exist")
+            .url
+            .clone();
+        assert_eq!(cloned_url, source_url);
+    }
+
+    #[test]
+    fn new_tab_uses_blank_behavior() {
+        let (mut engine, workspace_id) = seeded_engine();
+        engine
+            .dispatch(Intent::SettingSet {
+                key: "new_tab_behavior".to_owned(),
+                value: SettingValue::Text("blank".to_owned()),
+            })
+            .expect("new tab behavior should be applied");
+
+        engine
+            .dispatch(Intent::NewTab {
+                workspace_id,
+                url: None,
+                make_active: true,
+            })
+            .expect("new tab should be created");
+
+        let tab_id = engine
+            .state()
+            .workspaces
+            .get(&workspace_id)
+            .and_then(|workspace| workspace.active_tab_id)
+            .expect("new tab should be active");
+        let tab = engine
+            .state()
+            .tabs
+            .get(&tab_id)
+            .expect("new tab should exist");
+        assert_eq!(tab.url, "about:blank");
+    }
+
+    #[test]
+    fn new_tab_uses_custom_url_behavior() {
+        let (mut engine, workspace_id) = seeded_engine();
+        engine
+            .dispatch(Intent::SettingSet {
+                key: "new_tab_custom_url".to_owned(),
+                value: SettingValue::Text("https://custom.example/path".to_owned()),
+            })
+            .expect("custom URL should be applied");
+        engine
+            .dispatch(Intent::SettingSet {
+                key: "new_tab_behavior".to_owned(),
+                value: SettingValue::Text("custom".to_owned()),
+            })
+            .expect("new tab behavior should be applied");
+
+        engine
+            .dispatch(Intent::NewTab {
+                workspace_id,
+                url: None,
+                make_active: true,
+            })
+            .expect("new tab should be created");
+
+        let tab_id = engine
+            .state()
+            .workspaces
+            .get(&workspace_id)
+            .and_then(|workspace| workspace.active_tab_id)
+            .expect("new tab should be active");
+        let tab = engine
+            .state()
+            .tabs
+            .get(&tab_id)
+            .expect("new tab should exist");
+        assert_eq!(tab.url, "https://custom.example/path");
+    }
 }

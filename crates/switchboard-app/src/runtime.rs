@@ -25,6 +25,10 @@ const UI_SHELL_URL_BASE: &str = "app://ui";
 const THUMBNAIL_MAX_ENTRIES: usize = 120;
 const WINDOW_WIDTH_SETTING_KEY: &str = "window.width";
 const WINDOW_HEIGHT_SETTING_KEY: &str = "window.height";
+const SEARCH_ENGINE_SETTING_KEY: &str = "search_engine";
+const HOMEPAGE_SETTING_KEY: &str = "homepage";
+const NEW_TAB_BEHAVIOR_SETTING_KEY: &str = "new_tab_behavior";
+const NEW_TAB_CUSTOM_URL_SETTING_KEY: &str = "new_tab_custom_url";
 const WINDOW_MIN_WIDTH: u32 = 640;
 const WINDOW_MIN_HEIGHT: u32 = 480;
 
@@ -359,9 +363,6 @@ impl<H: CefHost + 'static> AppRuntime<H> {
         for tab_id in stale_tabs {
             if let Some(binding) = self.tab_bindings.remove(&tab_id) {
                 self.host
-                    .clear_content_view(binding.content.view_id)
-                    .map_err(RuntimeError::Host)?;
-                self.host
                     .destroy_content_view(binding.content.view_id)
                     .map_err(RuntimeError::Host)?;
             }
@@ -583,7 +584,19 @@ impl<H: CefHost + 'static> AppRuntime<H> {
             }
             json.push_str("}");
         }
-        json.push_str("]}");
+        json.push_str("],");
+        json.push_str("\"settings\":{");
+        let mut first = true;
+        for (key, value) in &state.settings {
+            if !first {
+                json.push(',');
+            }
+            first = false;
+            push_json_string(&mut json, key);
+            json.push(':');
+            push_json_setting_value(&mut json, value);
+        }
+        json.push_str("}}");
         json
     }
 }
@@ -608,16 +621,37 @@ fn setting_int(state: &BrowserState, key: &str) -> Option<i64> {
     }
 }
 
+fn ensure_default_settings(state: &mut BrowserState) {
+    state
+        .settings
+        .entry(SEARCH_ENGINE_SETTING_KEY.to_owned())
+        .or_insert_with(|| SettingValue::Text("google".to_owned()));
+    state
+        .settings
+        .entry(HOMEPAGE_SETTING_KEY.to_owned())
+        .or_insert_with(|| SettingValue::Text("https://youtube.com".to_owned()));
+    state
+        .settings
+        .entry(NEW_TAB_BEHAVIOR_SETTING_KEY.to_owned())
+        .or_insert_with(|| SettingValue::Text("homepage".to_owned()));
+    state
+        .settings
+        .entry(NEW_TAB_CUSTOM_URL_SETTING_KEY.to_owned())
+        .or_insert_with(|| SettingValue::Text("https://example.com".to_owned()));
+}
+
 fn ensure_bootstrap_state(state: &mut BrowserState) -> WorkspaceId {
     if state.profiles.is_empty() {
         let profile_id = state.add_profile("Default");
         let workspace_id = state
             .add_workspace(profile_id, "Workspace 1")
             .expect("bootstrap profile must exist");
+        ensure_default_settings(state);
         state.recompute_next_ids();
         return workspace_id;
     }
 
+    ensure_default_settings(state);
     state.recompute_next_ids();
 
     if state
@@ -715,6 +749,7 @@ fn ensure_bootstrap_state(state: &mut BrowserState) -> WorkspaceId {
         .add_workspace(profile_id, "Workspace 1")
         .expect("profile must exist");
     state.active_profile_id = Some(profile_id);
+    ensure_default_settings(state);
     state.recompute_next_ids();
     workspace_id
 }
@@ -806,6 +841,14 @@ fn push_json_string(json: &mut String, value: &str) {
         }
     }
     json.push('"');
+}
+
+fn push_json_setting_value(json: &mut String, value: &SettingValue) {
+    match value {
+        SettingValue::Bool(flag) => json.push_str(if *flag { "true" } else { "false" }),
+        SettingValue::Int(number) => json.push_str(&number.to_string()),
+        SettingValue::Text(text) => push_json_string(json, text),
+    }
 }
 
 #[cfg(test)]
@@ -1425,6 +1468,28 @@ mod tests {
         assert!(state_json.contains(&format!("\"revision\":{latest_revision}")));
         assert!(state_json.contains("\"tabs\":["));
         assert!(state_json.contains("https://resync.example/latest"));
+    }
+
+    #[test]
+    fn shell_state_json_exposes_settings_and_updates_after_setting_set() {
+        let host = MockCefHost::default();
+        let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
+
+        let initial = runtime.ui_shell_state_json();
+        assert!(initial.contains("\"settings\":{"));
+        assert!(initial.contains("\"search_engine\":\"google\""));
+        assert!(initial.contains("\"homepage\":\"https://youtube.com\""));
+        assert!(initial.contains("\"new_tab_behavior\":\"homepage\""));
+
+        runtime
+            .handle_ui_command(UiCommand::SettingSet {
+                key: "search_engine".to_owned(),
+                value: SettingValue::Text("duckduckgo".to_owned()),
+            })
+            .expect("setting update should succeed");
+
+        let updated = runtime.ui_shell_state_json();
+        assert!(updated.contains("\"search_engine\":\"duckduckgo\""));
     }
 
     #[test]

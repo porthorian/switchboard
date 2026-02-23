@@ -1,12 +1,12 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
-use switchboard_core::TabId;
+use switchboard_core::{SettingValue, TabId};
 
 use crate::bridge::UiCommand;
 
@@ -115,6 +115,7 @@ pub trait CefHost {
         visible: bool,
     ) -> Result<(), Self::Error>;
 
+    #[allow(dead_code)]
     fn clear_content_view(&mut self, view_id: ContentViewId) -> Result<(), Self::Error>;
 
     fn destroy_content_view(&mut self, view_id: ContentViewId) -> Result<(), Self::Error>;
@@ -143,9 +144,15 @@ thread_local! {
     static UI_COMMAND_HANDLER: RefCell<Option<UiCommandHandler>> = RefCell::new(None);
     static UI_STATE_PROVIDER: RefCell<Option<UiStateProvider>> = RefCell::new(None);
     static CONTENT_EVENT_HANDLER: RefCell<Option<ContentEventHandler>> = RefCell::new(None);
+    static CONTENT_EVENT_QUEUE: RefCell<VecDeque<ContentEvent>> = RefCell::new(VecDeque::new());
+    static CONTENT_EVENT_DISPATCHING: Cell<bool> = const { Cell::new(false) };
     static WINDOW_EVENT_HANDLER: RefCell<Option<WindowEventHandler>> = RefCell::new(None);
     static ACTIVE_CONTENT_URI: RefCell<Option<String>> = const { RefCell::new(None) };
     static ACTIVE_CONTENT_TAB: RefCell<Option<TabId>> = const { RefCell::new(None) };
+    #[cfg(target_os = "macos")]
+    static UI_ROOT_VIEW: RefCell<ObjcId> = const { RefCell::new(std::ptr::null_mut()) };
+    #[cfg(target_os = "macos")]
+    static UI_SHELL_VIEW: RefCell<ObjcId> = const { RefCell::new(std::ptr::null_mut()) };
     #[cfg(target_os = "macos")]
     static ACTIVE_CONTENT_BROWSER: RefCell<*mut cef_browser_t> = const { RefCell::new(std::ptr::null_mut()) };
 }
@@ -194,10 +201,40 @@ fn query_ui_shell_state() -> String {
 }
 
 fn emit_content_event(event: ContentEvent) {
-    CONTENT_EVENT_HANDLER.with(|slot| {
-        if let Some(handler) = slot.borrow_mut().as_mut() {
-            handler(event);
+    CONTENT_EVENT_QUEUE.with(|queue| {
+        queue.borrow_mut().push_back(event);
+    });
+
+    CONTENT_EVENT_DISPATCHING.with(|dispatching| {
+        if dispatching.get() {
+            return;
         }
+        dispatching.set(true);
+
+        loop {
+            let next_event = CONTENT_EVENT_QUEUE.with(|queue| queue.borrow_mut().pop_front());
+            let Some(next_event) = next_event else {
+                break;
+            };
+
+            CONTENT_EVENT_HANDLER.with(|slot| {
+                let mut handler_opt = {
+                    let mut slot_ref = slot.borrow_mut();
+                    slot_ref.take()
+                };
+
+                if let Some(handler) = handler_opt.as_mut() {
+                    handler(next_event);
+                }
+
+                let mut slot_ref = slot.borrow_mut();
+                if slot_ref.is_none() {
+                    *slot_ref = handler_opt;
+                }
+            });
+        }
+
+        dispatching.set(false);
     });
 }
 
@@ -243,8 +280,32 @@ fn set_active_content_browser(browser: *mut cef_browser_t) {
 }
 
 #[cfg(target_os = "macos")]
-fn active_content_browser() -> *mut cef_browser_t {
-    ACTIVE_CONTENT_BROWSER.with(|slot| *slot.borrow())
+fn set_ui_view_handles(root_view: ObjcId, ui_view: ObjcId) {
+    UI_ROOT_VIEW.with(|slot| {
+        *slot.borrow_mut() = root_view;
+    });
+    UI_SHELL_VIEW.with(|slot| {
+        *slot.borrow_mut() = ui_view;
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn set_ui_overlay_visible(visible: bool) -> Result<(), HostError> {
+    let root_view = UI_ROOT_VIEW.with(|slot| *slot.borrow());
+    let ui_view = UI_SHELL_VIEW.with(|slot| *slot.borrow());
+    if root_view == NIL || ui_view == NIL {
+        return Ok(());
+    }
+    unsafe {
+        msg_send_void_id_i64_id(
+            root_view,
+            selector("addSubview:positioned:relativeTo:")?,
+            ui_view,
+            if visible { 1 } else { -1 },
+            NIL,
+        );
+    }
+    Ok(())
 }
 
 #[cfg(any(test, not(target_os = "macos")))]
@@ -1041,7 +1102,16 @@ enum UiPromptAction {
     Intent(UiCommand),
     QueryActiveUri,
     QueryShellState,
+    UiOverlay { visible: bool },
     UiReady,
+}
+
+#[cfg(target_os = "macos")]
+fn is_allowed_setting_key(key: &str) -> bool {
+    matches!(
+        key,
+        "search_engine" | "homepage" | "new_tab_behavior" | "new_tab_custom_url"
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -1188,6 +1258,71 @@ fn parse_ui_prompt_payload(payload: &str) -> Result<UiPromptAction, &'static str
         }
         return Err("navigate intents only allow http/https URLs");
     }
+    if let Some(rest) = trimmed.strip_prefix("setting_set_text ") {
+        let mut parts = rest.trim().splitn(2, ' ');
+        let key = parts
+            .next()
+            .ok_or("setting_set_text requires a key")?
+            .trim();
+        if key.is_empty() || !is_allowed_setting_key(key) {
+            return Err("setting key is not in allowlist");
+        }
+        let value = parts
+            .next()
+            .ok_or("setting_set_text requires a value")?
+            .trim();
+        return Ok(UiPromptAction::Intent(UiCommand::SettingSet {
+            key: key.to_owned(),
+            value: SettingValue::Text(value.to_owned()),
+        }));
+    }
+    if let Some(rest) = trimmed.strip_prefix("setting_set_int ") {
+        let mut parts = rest.trim().splitn(2, ' ');
+        let key = parts.next().ok_or("setting_set_int requires a key")?.trim();
+        if key.is_empty() || !is_allowed_setting_key(key) {
+            return Err("setting key is not in allowlist");
+        }
+        let value = parts
+            .next()
+            .ok_or("setting_set_int requires a value")?
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| "setting_set_int value must be integer")?;
+        return Ok(UiPromptAction::Intent(UiCommand::SettingSet {
+            key: key.to_owned(),
+            value: SettingValue::Int(value),
+        }));
+    }
+    if let Some(rest) = trimmed.strip_prefix("setting_set_bool ") {
+        let mut parts = rest.trim().splitn(2, ' ');
+        let key = parts
+            .next()
+            .ok_or("setting_set_bool requires a key")?
+            .trim();
+        if key.is_empty() || !is_allowed_setting_key(key) {
+            return Err("setting key is not in allowlist");
+        }
+        let raw = parts
+            .next()
+            .ok_or("setting_set_bool requires a value")?
+            .trim()
+            .to_ascii_lowercase();
+        let value = match raw.as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => return Err("setting_set_bool value must be true/false"),
+        };
+        return Ok(UiPromptAction::Intent(UiCommand::SettingSet {
+            key: key.to_owned(),
+            value: SettingValue::Bool(value),
+        }));
+    }
+    if trimmed == "ui_overlay on" {
+        return Ok(UiPromptAction::UiOverlay { visible: true });
+    }
+    if trimmed == "ui_overlay off" {
+        return Ok(UiPromptAction::UiOverlay { visible: false });
+    }
     if trimmed.starts_with("ui_ready ") {
         return Ok(UiPromptAction::UiReady);
     }
@@ -1227,6 +1362,15 @@ unsafe extern "C" fn switchboard_ui_on_jsdialog(
         Ok(UiPromptAction::UiReady) => {
             if !suppress_message.is_null() {
                 *suppress_message = 1;
+            }
+            0
+        }
+        Ok(UiPromptAction::UiOverlay { visible }) => {
+            if !suppress_message.is_null() {
+                *suppress_message = 1;
+            }
+            if let Err(error) = set_ui_overlay_visible(visible) {
+                eprintln!("switchboard-app: failed to set UI overlay visible={visible}: {error}");
             }
             0
         }
@@ -2186,6 +2330,7 @@ pub struct NativeMacHost {
     content_views: HashMap<ContentViewId, ContentBackend>,
     content_view_windows: HashMap<ContentViewId, WindowId>,
     cef_clients: HashMap<ContentViewId, *mut cef_client_t>,
+    retired_cef_clients: Vec<*mut cef_client_t>,
 }
 
 #[cfg(target_os = "macos")]
@@ -2235,6 +2380,7 @@ impl NativeMacHost {
                 content_views: HashMap::new(),
                 content_view_windows: HashMap::new(),
                 cef_clients: HashMap::new(),
+                retired_cef_clients: Vec::new(),
             })
         }
     }
@@ -2340,6 +2486,7 @@ impl CefHost for NativeMacHost {
             );
 
             msg_send_void_id(root_view, selector("addSubview:")?, ui_view);
+            set_ui_view_handles(root_view, ui_view);
             cef.create_browser_in_view(ui_view, url, cef.ui_client(), root_width, root_height)?;
 
             self.next_ui_view_id += 1;
@@ -2442,21 +2589,20 @@ impl CefHost for NativeMacHost {
                     set_active_content_uri(url.to_owned());
                 }
                 ContentBackend::Cef(view) => {
-                    if !navigate_active_cef_browser(url) {
-                        let cef = self.cef.as_ref().ok_or_else(|| {
-                            HostError::Native("CEF runtime unavailable".to_owned())
-                        })?;
-                        let client = self.cef_clients.get(&view_id).copied().ok_or_else(|| {
-                            HostError::Native(format!(
-                                "CEF client missing for content view: {}",
-                                view_id.0
-                            ))
-                        })?;
-                        set_active_content_browser(std::ptr::null_mut());
-                        remove_all_subviews(view)?;
-                        let (width, height) = current_view_size(view)?;
-                        cef.create_browser_in_view(view, url, client, width, height)?;
-                    }
+                    let cef = self
+                        .cef
+                        .as_ref()
+                        .ok_or_else(|| HostError::Native("CEF runtime unavailable".to_owned()))?;
+                    let client = self.cef_clients.get(&view_id).copied().ok_or_else(|| {
+                        HostError::Native(format!(
+                            "CEF client missing for content view: {}",
+                            view_id.0
+                        ))
+                    })?;
+                    set_active_content_browser(std::ptr::null_mut());
+                    remove_all_subviews(view)?;
+                    let (width, height) = current_view_size(view)?;
+                    cef.create_browser_in_view(view, url, client, width, height)?;
                     set_active_content_tab(Some(tab_id));
                     set_active_content_uri(url.to_owned());
                 }
@@ -2501,21 +2647,20 @@ impl CefHost for NativeMacHost {
                     attach_wk_web_view(view, "about:blank")?;
                 }
                 ContentBackend::Cef(view) => {
-                    if !navigate_active_cef_browser("about:blank") {
-                        let cef = self.cef.as_ref().ok_or_else(|| {
-                            HostError::Native("CEF runtime unavailable".to_owned())
-                        })?;
-                        let client = self.cef_clients.get(&view_id).copied().ok_or_else(|| {
-                            HostError::Native(format!(
-                                "CEF client missing for content view: {}",
-                                view_id.0
-                            ))
-                        })?;
-                        set_active_content_browser(std::ptr::null_mut());
-                        remove_all_subviews(view)?;
-                        let (width, height) = current_view_size(view)?;
-                        cef.create_browser_in_view(view, "about:blank", client, width, height)?;
-                    }
+                    let cef = self
+                        .cef
+                        .as_ref()
+                        .ok_or_else(|| HostError::Native("CEF runtime unavailable".to_owned()))?;
+                    let client = self.cef_clients.get(&view_id).copied().ok_or_else(|| {
+                        HostError::Native(format!(
+                            "CEF client missing for content view: {}",
+                            view_id.0
+                        ))
+                    })?;
+                    set_active_content_browser(std::ptr::null_mut());
+                    remove_all_subviews(view)?;
+                    let (width, height) = current_view_size(view)?;
+                    cef.create_browser_in_view(view, "about:blank", client, width, height)?;
                 }
             }
         }
@@ -2541,9 +2686,9 @@ impl CefHost for NativeMacHost {
         }
 
         if let Some(client) = self.cef_clients.remove(&view_id) {
-            unsafe {
-                free_content_cef_client(client);
-            }
+            // CEF may still dispatch late callbacks while the browser tears down.
+            // Defer freeing until full CEF shutdown to avoid use-after-free crashes.
+            self.retired_cef_clients.push(client);
         }
 
         set_active_content_tab(None);
@@ -2566,6 +2711,10 @@ impl CefHost for NativeMacHost {
                 for client in self.cef_clients.values().copied() {
                     free_content_cef_client(client);
                 }
+                for client in self.retired_cef_clients.drain(..) {
+                    free_content_cef_client(client);
+                }
+                self.cef_clients.clear();
                 cef.shutdown();
                 self.cef = None;
                 set_active_content_tab(None);
@@ -2686,14 +2835,13 @@ unsafe fn remove_all_subviews(view: ObjcId) -> Result<(), HostError> {
         return Ok(());
     }
 
-    loop {
-        let count = msg_send_usize(subviews, selector("count")?);
-        if count == 0 {
-            break;
-        }
-        let child = msg_send_id_usize(subviews, selector("objectAtIndex:")?, 0);
+    // NSView.subviews can be returned as an immutable snapshot array. Iterate that
+    // snapshot once instead of polling count in a loop, which can otherwise hang.
+    let count = msg_send_usize(subviews, selector("count")?);
+    for index in (0..count).rev() {
+        let child = msg_send_id_usize(subviews, selector("objectAtIndex:")?, index);
         if child == NIL {
-            break;
+            continue;
         }
         msg_send_void(child, selector("removeFromSuperview")?);
     }
@@ -2707,33 +2855,6 @@ unsafe fn current_view_size(view: ObjcId) -> Result<(f64, f64), HostError> {
     let width = bounds.size.width.max(1.0);
     let height = bounds.size.height.max(1.0);
     Ok((width, height))
-}
-
-#[cfg(target_os = "macos")]
-unsafe fn navigate_active_cef_browser(url: &str) -> bool {
-    let browser = active_content_browser();
-    if browser.is_null() {
-        return false;
-    }
-    if let Some(is_valid) = (*browser).is_valid {
-        if is_valid(browser) == 0 {
-            return false;
-        }
-    }
-    let Some(get_main_frame) = (*browser).get_main_frame else {
-        return false;
-    };
-    let frame = get_main_frame(browser);
-    if frame.is_null() {
-        return false;
-    }
-    let Some(load_url) = (*frame).load_url else {
-        return false;
-    };
-    with_stack_cef_string(url, |cef_url| unsafe {
-        load_url(frame, cef_url);
-    });
-    true
 }
 
 #[cfg(target_os = "macos")]
@@ -2872,6 +2993,19 @@ unsafe fn msg_send_void_u64(receiver: ObjcId, selector: ObjcSel, arg: u64) {
     let send: unsafe extern "C" fn(ObjcId, ObjcSel, u64) =
         std::mem::transmute(objc_msgSend as *const ());
     send(receiver, selector, arg);
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn msg_send_void_id_i64_id(
+    receiver: ObjcId,
+    selector: ObjcSel,
+    view: ObjcId,
+    ordering_mode: i64,
+    relative_to: ObjcId,
+) {
+    let send: unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId, i64, ObjcId) =
+        std::mem::transmute(objc_msgSend as *const ());
+    send(receiver, selector, view, ordering_mode, relative_to);
 }
 
 #[cfg(not(target_os = "macos"))]
