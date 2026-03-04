@@ -1009,6 +1009,15 @@ const ENV_CEF_AUTOPLAY_POLICY: &str = "SWITCHBOARD_CEF_AUTOPLAY_POLICY";
 const DEFAULT_CEF_AUTOPLAY_POLICY: &str = "no-user-gesture-required";
 #[cfg(target_os = "macos")]
 const DEFAULT_CEF_API_VERSION: i32 = 14500;
+#[cfg(target_os = "macos")]
+const CEF_RELEASE_RUNTIME_FILES: &[&str] = &[
+    "libffmpeg.dylib",
+    "libEGL.dylib",
+    "libGLESv2.dylib",
+    "libvk_swiftshader.dylib",
+    "libcef_sandbox.dylib",
+    "vk_swiftshader_icd.json",
+];
 
 #[cfg(target_os = "macos")]
 const STYLE_TITLED: u64 = 1 << 0;
@@ -2766,6 +2775,11 @@ impl CefRuntime {
             std::env::set_var("TMPDIR", &config.temp_dir);
             std::env::set_var("TEMP", &config.temp_dir);
             std::env::set_var("TMP", &config.temp_dir);
+            if !has_cef_ffmpeg_runtime_library(&config) {
+                eprintln!(
+                    "switchboard-app: warning: libffmpeg.dylib was not found in the configured CEF distribution; H264/AAC livestream playback (for example YouTube Live) may fail"
+                );
+            }
             stage_cef_runtime_libraries(&config)?;
 
             let mut settings_strings = Vec::new();
@@ -2969,11 +2983,6 @@ fn describe_optional_path(path: &Option<PathBuf>) -> String {
 
 #[cfg(target_os = "macos")]
 fn stage_cef_runtime_libraries(config: &CefConfig) -> Result<(), HostError> {
-    let source_dir = config.framework_dir_path.join("Libraries");
-    if !source_dir.is_dir() {
-        return Ok(());
-    }
-
     let subprocess = config
         .browser_subprocess_path
         .as_ref()
@@ -2985,45 +2994,83 @@ fn stage_cef_runtime_libraries(config: &CefConfig) -> Result<(), HostError> {
         ))
     })?;
 
-    for entry in std::fs::read_dir(&source_dir).map_err(|error| {
-        HostError::Native(format!(
-            "failed reading CEF Libraries dir {}: {error}",
-            source_dir.display()
-        ))
-    })? {
-        let entry = entry.map_err(|error| {
+    let framework_libraries_dir = config.framework_dir_path.join("Libraries");
+    if framework_libraries_dir.is_dir() {
+        for entry in std::fs::read_dir(&framework_libraries_dir).map_err(|error| {
             HostError::Native(format!(
-                "failed iterating CEF Libraries dir {}: {error}",
-                source_dir.display()
+                "failed reading CEF Libraries dir {}: {error}",
+                framework_libraries_dir.display()
             ))
-        })?;
-        let source = entry.path();
-        if !source.is_file() {
-            continue;
-        }
-
-        let file_name = entry.file_name();
-        let target = target_dir.join(file_name);
-        if target.exists() {
-            continue;
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            if std::os::unix::fs::symlink(&source, &target).is_ok() {
+        })? {
+            let entry = entry.map_err(|error| {
+                HostError::Native(format!(
+                    "failed iterating CEF Libraries dir {}: {error}",
+                    framework_libraries_dir.display()
+                ))
+            })?;
+            let source = entry.path();
+            if !source.is_file() {
                 continue;
             }
+            stage_cef_runtime_file(&source, &target_dir.join(entry.file_name()))?;
         }
+    }
 
-        std::fs::copy(&source, &target).map_err(|error| {
+    if let Some(release_dir) = config.framework_dir_path.parent() {
+        for file_name in CEF_RELEASE_RUNTIME_FILES {
+            let source = release_dir.join(file_name);
+            if source.is_file() {
+                stage_cef_runtime_file(&source, &target_dir.join(file_name))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn has_cef_ffmpeg_runtime_library(config: &CefConfig) -> bool {
+    let framework_candidate = config.framework_dir_path.join("Libraries").join("libffmpeg.dylib");
+    if framework_candidate.is_file() {
+        return true;
+    }
+
+    config
+        .framework_dir_path
+        .parent()
+        .map(|release_dir| release_dir.join("libffmpeg.dylib").is_file())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn stage_cef_runtime_file(source: &Path, target: &Path) -> Result<(), HostError> {
+    if source == target {
+        return Ok(());
+    }
+
+    if std::fs::symlink_metadata(target).is_ok() {
+        std::fs::remove_file(target).map_err(|error| {
             HostError::Native(format!(
-                "failed staging CEF runtime lib {} -> {}: {error}",
-                source.display(),
+                "failed replacing staged CEF runtime lib {}: {error}",
                 target.display()
             ))
         })?;
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        if std::os::unix::fs::symlink(source, target).is_ok() {
+            return Ok(());
+        }
+    }
+
+    std::fs::copy(source, target).map_err(|error| {
+        HostError::Native(format!(
+            "failed staging CEF runtime lib {} -> {}: {error}",
+            source.display(),
+            target.display()
+        ))
+    })?;
     Ok(())
 }
 

@@ -49,6 +49,11 @@ Optional overrides:
 - `SWITCHBOARD_CEF_AUTOPLAY_POLICY` (optional Chromium `--autoplay-policy=<value>`, defaults to `no-user-gesture-required`)
 - `SWITCHBOARD_CEF_VERBOSE_ERRORS` (`1` to include raw loader details)
 
+Media playback note:
+- YouTube Live and other livestreams often require H264/AAC support.
+- If your CEF build does not include `libffmpeg.dylib` with proprietary codecs enabled, livestream playback can fail with "Your browser can't play this video."
+- Switchboard stages runtime libs from both `Chromium Embedded Framework.framework/Libraries` and the CEF `Release` directory (including `libffmpeg.dylib` when present) into the subprocess directory at startup.
+
 Note on macOS keychain prompts:
 - CEF/Chromium uses the login keychain by default (`Chromium Safe Storage` entry).
 - Upstream Chromium does not provide a simple runtime switch for a custom keychain name like `Switchboard`; that requires deeper platform customization.
