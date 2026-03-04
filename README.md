@@ -46,6 +46,7 @@ Optional overrides:
 - `SWITCHBOARD_CEF_TMPDIR`
 - `SWITCHBOARD_CEF_USE_MOCK_KEYCHAIN` (`1/true` to force `--use-mock-keychain`, defaults to enabled in debug builds)
 - `SWITCHBOARD_CEF_PASSWORD_STORE` (optional Chromium `--password-store=<value>`, e.g. `basic` for dev)
+- `SWITCHBOARD_CEF_AUTOPLAY_POLICY` (optional Chromium `--autoplay-policy=<value>`, defaults to `no-user-gesture-required`)
 - `SWITCHBOARD_CEF_VERBOSE_ERRORS` (`1` to include raw loader details)
 
 Note on macOS keychain prompts:

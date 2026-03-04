@@ -522,6 +522,10 @@ const ENV_CEF_USE_MOCK_KEYCHAIN: &str = "SWITCHBOARD_CEF_USE_MOCK_KEYCHAIN";
 #[cfg(target_os = "macos")]
 const ENV_CEF_PASSWORD_STORE: &str = "SWITCHBOARD_CEF_PASSWORD_STORE";
 #[cfg(target_os = "macos")]
+const ENV_CEF_AUTOPLAY_POLICY: &str = "SWITCHBOARD_CEF_AUTOPLAY_POLICY";
+#[cfg(target_os = "macos")]
+const DEFAULT_CEF_AUTOPLAY_POLICY: &str = "no-user-gesture-required";
+#[cfg(target_os = "macos")]
 const DEFAULT_CEF_API_VERSION: i32 = 14500;
 
 #[cfg(target_os = "macos")]
@@ -1968,11 +1972,18 @@ impl CefRuntime {
                     upsert_cef_switch_with_value(&mut cef_args, "--password-store", trimmed);
                 }
             }
+            let autoplay_policy = std::env::var(ENV_CEF_AUTOPLAY_POLICY)
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| DEFAULT_CEF_AUTOPLAY_POLICY.to_owned());
+            upsert_cef_switch_with_value(&mut cef_args, "--autoplay-policy", &autoplay_policy);
             if verbose_errors {
                 eprintln!(
-                    "switchboard-app: CEF launch switches mock_keychain={} password_store={}",
+                    "switchboard-app: CEF launch switches mock_keychain={} password_store={} autoplay_policy={}",
                     use_mock_keychain,
-                    std::env::var(ENV_CEF_PASSWORD_STORE).unwrap_or_else(|_| "unset".to_owned())
+                    std::env::var(ENV_CEF_PASSWORD_STORE).unwrap_or_else(|_| "unset".to_owned()),
+                    autoplay_policy
                 );
             }
 
