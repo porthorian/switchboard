@@ -135,6 +135,8 @@ let profileEditorTargetId = null;
 let settingsPanelOpen = false;
 let commandPanelOpen = false;
 let uiOverlayVisible = false;
+let websiteKeybindingsActive = false;
+let hostKeybindingsSignature = "";
 
 function send(payload) {
   try {
@@ -367,6 +369,25 @@ function keybindingSetting(settingKey, fallback) {
   return normalizeKeybinding(shellSettingText(settingKey, fallback), fallback);
 }
 
+function syncHostKeybindings(
+  closeTabBinding,
+  commandPaletteBinding,
+  focusNavigationBinding,
+  toggleDevToolsBinding
+) {
+  const signature = [
+    closeTabBinding,
+    commandPaletteBinding,
+    focusNavigationBinding,
+    toggleDevToolsBinding,
+  ].join("|");
+  if (signature === hostKeybindingsSignature) return;
+  hostKeybindingsSignature = signature;
+  send(
+    `keybindings_sync ${closeTabBinding} ${commandPaletteBinding} ${focusNavigationBinding} ${toggleDevToolsBinding}`
+  );
+}
+
 function renderUri() {
   input.value = activeUri;
   backButton.disabled = backStack.length === 0;
@@ -531,6 +552,12 @@ function syncSettingsControlsFromState(state) {
   ) {
     settingsKeybindingDevTools.value = keybindingDevTools;
   }
+  syncHostKeybindings(
+    keybindingCloseTab,
+    keybindingCommand,
+    keybindingFocusNav,
+    keybindingDevTools
+  );
 
   const activeProfileId = activeProfileIdFromState(state);
   const activeProfile = (state.profiles || []).find(
@@ -683,6 +710,34 @@ function syncUiOverlayVisibility() {
   if (nextVisible === uiOverlayVisible) return;
   uiOverlayVisible = nextVisible;
   send(nextVisible ? "ui_overlay on" : "ui_overlay off");
+  syncWebsiteKeybindingsActive();
+}
+
+function setWebsiteKeybindingsActive(active) {
+  if (websiteKeybindingsActive === active) return;
+  websiteKeybindingsActive = active;
+  send(active ? "website_keybindings on" : "website_keybindings off");
+}
+
+function syncWebsiteKeybindingsActive() {
+  if (uiOverlayVisible || settingsPanelOpen || commandPanelOpen || document.hidden) {
+    setWebsiteKeybindingsActive(false);
+    return;
+  }
+  if (!document.hasFocus()) {
+    setWebsiteKeybindingsActive(true);
+    return;
+  }
+  const activeElement = document.activeElement;
+  if (
+    !activeElement ||
+    activeElement === document.body ||
+    activeElement === document.documentElement
+  ) {
+    setWebsiteKeybindingsActive(true);
+    return;
+  }
+  setWebsiteKeybindingsActive(false);
 }
 
 function openSettingsPanel() {
@@ -746,6 +801,7 @@ function focusTopNavigationInput() {
   closeCommandPanel();
   input.focus();
   input.select();
+  syncWebsiteKeybindingsActive();
 }
 
 function toggleDevTools() {
@@ -1709,6 +1765,15 @@ tabList.addEventListener("scroll", () => {
   scheduleVirtualTabListRender();
 }, { passive: true });
 tabNew.addEventListener("click", createTabInActiveWorkspace);
+document.addEventListener("focusin", () => {
+  syncWebsiteKeybindingsActive();
+});
+document.addEventListener("focusout", () => {
+  window.setTimeout(syncWebsiteKeybindingsActive, 0);
+});
+document.addEventListener("pointerdown", () => {
+  setWebsiteKeybindingsActive(false);
+}, { capture: true });
 document.addEventListener("pointerdown", (event) => {
   if (!profileMenuOpen) return;
   if (event.target.closest(".profile-menu")) return;
@@ -1755,6 +1820,27 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
+window.__switchboardHostShortcut = (action) => {
+  const normalized = String(action || "").trim().toLowerCase();
+  if (normalized === "command_palette") {
+    openCommandPanel();
+    return true;
+  }
+  if (normalized === "focus_navigation") {
+    focusTopNavigationInput();
+    return true;
+  }
+  if (normalized === "close_tab") {
+    closeActiveTabFromShortcut();
+    return true;
+  }
+  if (normalized === "toggle_devtools") {
+    toggleDevTools();
+    return true;
+  }
+  return false;
+};
+
 renderUri();
 send("ui_ready 0.1.0-dev");
 syncShellStateFromHost(true);
@@ -1763,13 +1849,19 @@ startHostSyncLoop();
 window.addEventListener("focus", () => {
   syncShellStateFromHost(true);
   syncActiveUriFromHost();
+  syncWebsiteKeybindingsActive();
+});
+window.addEventListener("blur", () => {
+  syncWebsiteKeybindingsActive();
 });
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
     syncShellStateFromHost(true);
     syncActiveUriFromHost();
   }
+  syncWebsiteKeybindingsActive();
 });
 window.addEventListener("resize", () => {
   scheduleVirtualTabListRender();
 });
+syncWebsiteKeybindingsActive();

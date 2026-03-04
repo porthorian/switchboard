@@ -142,6 +142,129 @@ pub enum WindowEvent {
     Resized { width: u32, height: u32 },
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Keybinding {
+    modifiers: KeybindingModifiers,
+    key: KeyToken,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct KeybindingModifiers {
+    mod_key: bool,
+    ctrl: bool,
+    meta: bool,
+    alt: bool,
+    shift: bool,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyToken {
+    Character(char),
+    Space,
+    Enter,
+    Escape,
+    Tab,
+    Backspace,
+    Delete,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct BrowserShortcutBindings {
+    close_tab: Keybinding,
+    command_palette: Keybinding,
+    focus_navigation: Keybinding,
+    toggle_devtools: Keybinding,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiShortcutAction {
+    CloseTab,
+    CommandPalette,
+    FocusNavigation,
+    ToggleDevTools,
+}
+
+#[cfg(target_os = "macos")]
+impl UiShortcutAction {
+    fn host_token(self) -> &'static str {
+        match self {
+            Self::CloseTab => "close_tab",
+            Self::CommandPalette => "command_palette",
+            Self::FocusNavigation => "focus_navigation",
+            Self::ToggleDevTools => "toggle_devtools",
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+const DEFAULT_KEYBINDING_CLOSE_TAB: Keybinding = Keybinding {
+    modifiers: KeybindingModifiers {
+        mod_key: true,
+        ctrl: false,
+        meta: false,
+        alt: false,
+        shift: false,
+    },
+    key: KeyToken::Character('w'),
+};
+
+#[cfg(target_os = "macos")]
+const DEFAULT_KEYBINDING_COMMAND_PALETTE: Keybinding = Keybinding {
+    modifiers: KeybindingModifiers {
+        mod_key: false,
+        ctrl: false,
+        meta: false,
+        alt: false,
+        shift: false,
+    },
+    key: KeyToken::Space,
+};
+
+#[cfg(target_os = "macos")]
+const DEFAULT_KEYBINDING_FOCUS_NAVIGATION: Keybinding = Keybinding {
+    modifiers: KeybindingModifiers {
+        mod_key: true,
+        ctrl: false,
+        meta: false,
+        alt: false,
+        shift: false,
+    },
+    key: KeyToken::Character('l'),
+};
+
+#[cfg(target_os = "macos")]
+const DEFAULT_KEYBINDING_TOGGLE_DEVTOOLS: Keybinding = Keybinding {
+    modifiers: KeybindingModifiers {
+        mod_key: true,
+        ctrl: false,
+        meta: false,
+        alt: false,
+        shift: true,
+    },
+    key: KeyToken::Character('i'),
+};
+
+#[cfg(target_os = "macos")]
+const DEFAULT_BROWSER_SHORTCUT_BINDINGS: BrowserShortcutBindings = BrowserShortcutBindings {
+    close_tab: DEFAULT_KEYBINDING_CLOSE_TAB,
+    command_palette: DEFAULT_KEYBINDING_COMMAND_PALETTE,
+    focus_navigation: DEFAULT_KEYBINDING_FOCUS_NAVIGATION,
+    toggle_devtools: DEFAULT_KEYBINDING_TOGGLE_DEVTOOLS,
+};
+
 thread_local! {
     static UI_COMMAND_HANDLER: RefCell<Option<UiCommandHandler>> = RefCell::new(None);
     static UI_STATE_PROVIDER: RefCell<Option<UiStateProvider>> = RefCell::new(None);
@@ -155,6 +278,14 @@ thread_local! {
     static UI_ROOT_VIEW: RefCell<ObjcId> = const { RefCell::new(std::ptr::null_mut()) };
     #[cfg(target_os = "macos")]
     static UI_SHELL_VIEW: RefCell<ObjcId> = const { RefCell::new(std::ptr::null_mut()) };
+    #[cfg(target_os = "macos")]
+    static UI_SHELL_BROWSER: RefCell<*mut cef_browser_t> = const { RefCell::new(std::ptr::null_mut()) };
+    #[cfg(target_os = "macos")]
+    static ACTIVE_CONTENT_CONTAINER: RefCell<ObjcId> = const { RefCell::new(std::ptr::null_mut()) };
+    #[cfg(target_os = "macos")]
+    static WEBSITE_KEYBINDINGS_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    #[cfg(target_os = "macos")]
+    static BROWSER_SHORTCUT_BINDINGS: RefCell<BrowserShortcutBindings> = const { RefCell::new(DEFAULT_BROWSER_SHORTCUT_BINDINGS) };
     #[cfg(target_os = "macos")]
     static ACTIVE_CONTENT_BROWSER: RefCell<*mut cef_browser_t> = const { RefCell::new(std::ptr::null_mut()) };
     #[cfg(target_os = "macos")]
@@ -316,6 +447,262 @@ fn forget_browser_for_tab(tab_id: TabId) {
 }
 
 #[cfg(target_os = "macos")]
+fn set_ui_shell_browser(browser: *mut cef_browser_t) {
+    UI_SHELL_BROWSER.with(|slot| {
+        *slot.borrow_mut() = browser;
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn remember_ui_shell_browser(browser: *mut cef_browser_t) {
+    if browser.is_null() {
+        return;
+    }
+    set_ui_shell_browser(browser);
+}
+
+#[cfg(target_os = "macos")]
+fn ui_shell_browser() -> *mut cef_browser_t {
+    UI_SHELL_BROWSER.with(|slot| *slot.borrow())
+}
+
+#[cfg(target_os = "macos")]
+fn set_browser_shortcut_bindings(
+    close_tab: &str,
+    command_palette: &str,
+    focus_navigation: &str,
+    toggle_devtools: &str,
+) {
+    let parsed = BrowserShortcutBindings {
+        close_tab: parse_keybinding(close_tab).unwrap_or(DEFAULT_KEYBINDING_CLOSE_TAB),
+        command_palette: parse_keybinding(command_palette)
+            .unwrap_or(DEFAULT_KEYBINDING_COMMAND_PALETTE),
+        focus_navigation: parse_keybinding(focus_navigation)
+            .unwrap_or(DEFAULT_KEYBINDING_FOCUS_NAVIGATION),
+        toggle_devtools: parse_keybinding(toggle_devtools)
+            .unwrap_or(DEFAULT_KEYBINDING_TOGGLE_DEVTOOLS),
+    };
+    BROWSER_SHORTCUT_BINDINGS.with(|slot| {
+        *slot.borrow_mut() = parsed;
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn browser_shortcut_bindings() -> BrowserShortcutBindings {
+    BROWSER_SHORTCUT_BINDINGS.with(|slot| *slot.borrow())
+}
+
+#[cfg(target_os = "macos")]
+fn parse_keybinding(value: &str) -> Option<Keybinding> {
+    let raw = value.trim().to_ascii_lowercase();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut modifiers = KeybindingModifiers::default();
+    let mut key = None;
+    for part in raw.split('+').map(str::trim).filter(|part| !part.is_empty()) {
+        match part {
+            "mod" => modifiers.mod_key = true,
+            "ctrl" => modifiers.ctrl = true,
+            "meta" => modifiers.meta = true,
+            "alt" => modifiers.alt = true,
+            "shift" => modifiers.shift = true,
+            _ => {
+                if key.is_some() {
+                    return None;
+                }
+                key = parse_key_token(part);
+            }
+        }
+    }
+    Some(Keybinding {
+        modifiers,
+        key: key?,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn parse_key_token(value: &str) -> Option<KeyToken> {
+    let normalized = match value {
+        "spacebar" => "space",
+        "esc" => "escape",
+        "return" => "enter",
+        other => other,
+    };
+    match normalized {
+        "space" => Some(KeyToken::Space),
+        "enter" => Some(KeyToken::Enter),
+        "escape" => Some(KeyToken::Escape),
+        "tab" => Some(KeyToken::Tab),
+        "backspace" => Some(KeyToken::Backspace),
+        "delete" => Some(KeyToken::Delete),
+        "arrowup" => Some(KeyToken::ArrowUp),
+        "arrowdown" => Some(KeyToken::ArrowDown),
+        "arrowleft" => Some(KeyToken::ArrowLeft),
+        "arrowright" => Some(KeyToken::ArrowRight),
+        "home" => Some(KeyToken::Home),
+        "end" => Some(KeyToken::End),
+        "pageup" => Some(KeyToken::PageUp),
+        "pagedown" => Some(KeyToken::PageDown),
+        _ => {
+            let mut chars = normalized.chars();
+            let ch = chars.next()?;
+            if chars.next().is_some() || ch.is_whitespace() {
+                return None;
+            }
+            Some(KeyToken::Character(ch.to_ascii_lowercase()))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn keybinding_matches_event(binding: Keybinding, event: &cef_key_event_t_switchboard) -> bool {
+    let Some(event_key) = event_key_token(event) else {
+        return false;
+    };
+    if event_key != binding.key {
+        return false;
+    }
+
+    let has_ctrl = (event.modifiers & CEF_EVENTFLAG_CONTROL_DOWN) != 0;
+    let has_meta = (event.modifiers & CEF_EVENTFLAG_COMMAND_DOWN) != 0;
+    let has_alt = (event.modifiers & CEF_EVENTFLAG_ALT_DOWN) != 0;
+    let has_shift = (event.modifiers & CEF_EVENTFLAG_SHIFT_DOWN) != 0;
+    let has_primary = has_ctrl || has_meta;
+
+    if binding.modifiers.mod_key {
+        if !has_primary {
+            return false;
+        }
+    } else if has_primary {
+        return false;
+    }
+
+    if binding.modifiers.ctrl {
+        if !has_ctrl {
+            return false;
+        }
+    } else if !binding.modifiers.mod_key && has_ctrl {
+        return false;
+    }
+
+    if binding.modifiers.meta {
+        if !has_meta {
+            return false;
+        }
+    } else if !binding.modifiers.mod_key && has_meta {
+        return false;
+    }
+
+    if binding.modifiers.alt {
+        if !has_alt {
+            return false;
+        }
+    } else if has_alt {
+        return false;
+    }
+
+    if binding.modifiers.shift {
+        if !has_shift {
+            return false;
+        }
+    } else if has_shift {
+        return false;
+    }
+
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn event_key_token(event: &cef_key_event_t_switchboard) -> Option<KeyToken> {
+    match event.windows_key_code {
+        VK_BACK => Some(KeyToken::Backspace),
+        VK_TAB => Some(KeyToken::Tab),
+        VK_RETURN => Some(KeyToken::Enter),
+        VK_ESCAPE => Some(KeyToken::Escape),
+        VK_SPACE => Some(KeyToken::Space),
+        VK_PRIOR => Some(KeyToken::PageUp),
+        VK_NEXT => Some(KeyToken::PageDown),
+        VK_END => Some(KeyToken::End),
+        VK_HOME => Some(KeyToken::Home),
+        VK_LEFT => Some(KeyToken::ArrowLeft),
+        VK_UP => Some(KeyToken::ArrowUp),
+        VK_RIGHT => Some(KeyToken::ArrowRight),
+        VK_DOWN => Some(KeyToken::ArrowDown),
+        VK_DELETE => Some(KeyToken::Delete),
+        VK_0..=VK_9 => {
+            let code = u32::try_from(event.windows_key_code).ok()?;
+            let ch = char::from_u32(code)?.to_ascii_lowercase();
+            Some(KeyToken::Character(ch))
+        }
+        VK_A..=VK_Z => {
+            let code = u32::try_from(event.windows_key_code).ok()?;
+            let ch = char::from_u32(code)?.to_ascii_lowercase();
+            Some(KeyToken::Character(ch))
+        }
+        _ => {
+            let unmodified = char::from_u32(u32::from(event.unmodified_character))
+                .filter(|ch| !ch.is_whitespace())
+                .map(|ch| ch.to_ascii_lowercase());
+            if let Some(ch) = unmodified {
+                return Some(KeyToken::Character(ch));
+            }
+            char::from_u32(u32::from(event.character))
+                .filter(|ch| !ch.is_whitespace())
+                .map(|ch| KeyToken::Character(ch.to_ascii_lowercase()))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn fallback_shortcut_action(event: &cef_key_event_t_switchboard) -> Option<UiShortcutAction> {
+    let bindings = browser_shortcut_bindings();
+    if keybinding_matches_event(bindings.command_palette, event) {
+        return Some(UiShortcutAction::CommandPalette);
+    }
+    if keybinding_matches_event(bindings.focus_navigation, event) {
+        return Some(UiShortcutAction::FocusNavigation);
+    }
+    if keybinding_matches_event(bindings.close_tab, event) {
+        return Some(UiShortcutAction::CloseTab);
+    }
+    if keybinding_matches_event(bindings.toggle_devtools, event) {
+        return Some(UiShortcutAction::ToggleDevTools);
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_ui_shortcut_action(action: UiShortcutAction) -> bool {
+    let browser = ui_shell_browser();
+    if browser.is_null() {
+        return false;
+    }
+    unsafe {
+        let Some(get_main_frame) = (*browser).get_main_frame else {
+            return false;
+        };
+        let frame = get_main_frame(browser);
+        if frame.is_null() {
+            return false;
+        }
+        let Some(execute_js) = (*frame).execute_java_script else {
+            return false;
+        };
+        let script = format!(
+            "window.__switchboardHostShortcut && window.__switchboardHostShortcut(\"{}\");",
+            action.host_token()
+        );
+        with_stack_cef_string(&script, |code| {
+            with_stack_cef_string("app://ui/host-shortcut", |script_url| {
+                execute_js(frame, code, script_url, 0);
+            });
+        });
+    }
+    true
+}
+
+#[cfg(target_os = "macos")]
 fn set_ui_view_handles(root_view: ObjcId, ui_view: ObjcId) {
     UI_ROOT_VIEW.with(|slot| {
         *slot.borrow_mut() = root_view;
@@ -340,6 +727,100 @@ fn set_ui_overlay_visible(visible: bool) -> Result<(), HostError> {
             if visible { 1 } else { -1 },
             NIL,
         );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn set_website_keybindings_active(active: bool) -> Result<(), HostError> {
+    let changed = WEBSITE_KEYBINDINGS_ACTIVE.with(|slot| {
+        if slot.get() == active {
+            false
+        } else {
+            slot.set(active);
+            true
+        }
+    });
+    if !changed {
+        return Ok(());
+    }
+    let container = ACTIVE_CONTENT_CONTAINER.with(|slot| *slot.borrow());
+    if container == NIL {
+        return Ok(());
+    }
+    apply_content_keybindings_border(container, active)
+}
+
+#[cfg(target_os = "macos")]
+fn set_active_content_container(container: ObjcId) -> Result<(), HostError> {
+    let previous = ACTIVE_CONTENT_CONTAINER.with(|slot| {
+        let mut slot_ref = slot.borrow_mut();
+        let previous = *slot_ref;
+        *slot_ref = container;
+        previous
+    });
+    if previous == container {
+        return Ok(());
+    }
+    if previous != NIL {
+        apply_content_keybindings_border(previous, false)?;
+    }
+    if container != NIL {
+        let active = WEBSITE_KEYBINDINGS_ACTIVE.with(|slot| slot.get());
+        apply_content_keybindings_border(container, active)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clear_active_content_container_if_matches(container: ObjcId) -> Result<(), HostError> {
+    let is_active = ACTIVE_CONTENT_CONTAINER.with(|slot| *slot.borrow() == container);
+    if !is_active {
+        return Ok(());
+    }
+    set_active_content_container(NIL)
+}
+
+#[cfg(target_os = "macos")]
+fn apply_content_keybindings_border(container: ObjcId, active: bool) -> Result<(), HostError> {
+    if container == NIL {
+        return Ok(());
+    }
+    unsafe {
+        msg_send_void_bool(container, selector("setWantsLayer:")?, YES);
+        let layer = msg_send_id(container, selector("layer")?);
+        if layer == NIL {
+            return Ok(());
+        }
+        msg_send_void_bool(layer, selector("setMasksToBounds:")?, if active { YES } else { NO });
+        msg_send_void_f64(
+            layer,
+            selector("setCornerRadius:")?,
+            if active {
+                WEBSITE_KEYBINDINGS_BORDER_RADIUS_PX
+            } else {
+                0.0
+            },
+        );
+        msg_send_void_f64(
+            layer,
+            selector("setBorderWidth:")?,
+            if active {
+                WEBSITE_KEYBINDINGS_BORDER_WIDTH_PX
+            } else {
+                0.0
+            },
+        );
+        if active {
+            let ns_color = objc_class("NSColor")?;
+            let border_color = msg_send_id(ns_color, selector("systemPinkColor")?);
+            if border_color != NIL {
+                let cg_color = msg_send_id(border_color, selector("CGColor")?);
+                if cg_color != NIL {
+                    msg_send_void_id(layer, selector("setBorderColor:")?, cg_color);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -468,9 +949,10 @@ use switchboard_cef_sys::loader::CefLibrary;
 use switchboard_cef_sys::raw::{
     cef_app_t, cef_base_ref_counted_t, cef_browser_host_create_browser_fn, cef_browser_settings_t,
     cef_browser_t, cef_callback_t, cef_client_t, cef_display_handler_t, cef_frame_t,
-    cef_jsdialog_callback_t, cef_jsdialog_handler_t, cef_main_args_t, cef_rect_t, cef_request_t,
-    cef_resource_handler_t, cef_response_t, cef_scheme_handler_factory_t, cef_scheme_registrar_t,
-    cef_settings_t, cef_string_t, cef_string_utf16_t, cef_window_info_t, CEF_RUNTIME_STYLE_ALLOY,
+    cef_jsdialog_callback_t, cef_jsdialog_handler_t, cef_keyboard_handler_t, cef_main_args_t,
+    cef_rect_t, cef_request_t, cef_resource_handler_t, cef_response_t,
+    cef_scheme_handler_factory_t, cef_scheme_registrar_t, cef_settings_t, cef_string_t,
+    cef_string_utf16_t, cef_window_info_t, CEF_RUNTIME_STYLE_ALLOY,
     CEF_SCHEME_OPTION_CORS_ENABLED, CEF_SCHEME_OPTION_DISPLAY_ISOLATED,
     CEF_SCHEME_OPTION_FETCH_ENABLED, CEF_SCHEME_OPTION_SECURE, CEF_SCHEME_OPTION_STANDARD,
     JSDIALOGTYPE_PROMPT,
@@ -570,6 +1052,101 @@ const UI_SHELL_CSS: &str = include_str!("ui_shell.css");
 const UI_SHELL_JS: &str = include_str!("ui_shell.js");
 #[cfg(target_os = "macos")]
 static UI_SHELL_BODY_BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+#[cfg(target_os = "macos")]
+const WEBSITE_KEYBINDINGS_BORDER_WIDTH_PX: f64 = 2.0;
+#[cfg(target_os = "macos")]
+const WEBSITE_KEYBINDINGS_BORDER_RADIUS_PX: f64 = 10.0;
+#[cfg(target_os = "macos")]
+const CEF_KEYEVENT_RAWKEYDOWN: c_int = 0;
+#[cfg(target_os = "macos")]
+const CEF_KEYEVENT_KEYDOWN: c_int = 1;
+#[cfg(target_os = "macos")]
+const CEF_EVENTFLAG_SHIFT_DOWN: u32 = 1 << 1;
+#[cfg(target_os = "macos")]
+const CEF_EVENTFLAG_CONTROL_DOWN: u32 = 1 << 2;
+#[cfg(target_os = "macos")]
+const CEF_EVENTFLAG_ALT_DOWN: u32 = 1 << 3;
+#[cfg(target_os = "macos")]
+const CEF_EVENTFLAG_COMMAND_DOWN: u32 = 1 << 7;
+#[cfg(target_os = "macos")]
+const CEF_EVENTFLAG_IS_REPEAT: u32 = 1 << 13;
+#[cfg(target_os = "macos")]
+const VK_BACK: c_int = 0x08;
+#[cfg(target_os = "macos")]
+const VK_TAB: c_int = 0x09;
+#[cfg(target_os = "macos")]
+const VK_RETURN: c_int = 0x0D;
+#[cfg(target_os = "macos")]
+const VK_ESCAPE: c_int = 0x1B;
+#[cfg(target_os = "macos")]
+const VK_SPACE: c_int = 0x20;
+#[cfg(target_os = "macos")]
+const VK_PRIOR: c_int = 0x21;
+#[cfg(target_os = "macos")]
+const VK_NEXT: c_int = 0x22;
+#[cfg(target_os = "macos")]
+const VK_END: c_int = 0x23;
+#[cfg(target_os = "macos")]
+const VK_HOME: c_int = 0x24;
+#[cfg(target_os = "macos")]
+const VK_LEFT: c_int = 0x25;
+#[cfg(target_os = "macos")]
+const VK_UP: c_int = 0x26;
+#[cfg(target_os = "macos")]
+const VK_RIGHT: c_int = 0x27;
+#[cfg(target_os = "macos")]
+const VK_DOWN: c_int = 0x28;
+#[cfg(target_os = "macos")]
+const VK_DELETE: c_int = 0x2E;
+#[cfg(target_os = "macos")]
+const VK_0: c_int = 0x30;
+#[cfg(target_os = "macos")]
+const VK_9: c_int = 0x39;
+#[cfg(target_os = "macos")]
+const VK_A: c_int = 0x41;
+#[cfg(target_os = "macos")]
+const VK_Z: c_int = 0x5A;
+
+#[cfg(target_os = "macos")]
+type CefKeyEventTypeSwitchboard = c_int;
+#[cfg(target_os = "macos")]
+type CefEventHandleSwitchboard = *mut c_void;
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct cef_key_event_t_switchboard {
+    type_: CefKeyEventTypeSwitchboard,
+    modifiers: u32,
+    windows_key_code: c_int,
+    native_key_code: c_int,
+    is_system_key: c_int,
+    character: u16,
+    unmodified_character: u16,
+    focus_on_editable_field: c_int,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct cef_keyboard_handler_t_switchboard {
+    base: cef_base_ref_counted_t,
+    on_pre_key_event: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_keyboard_handler_t,
+            browser: *mut cef_browser_t,
+            event: *const cef_key_event_t_switchboard,
+            os_event: CefEventHandleSwitchboard,
+            is_keyboard_shortcut: *mut c_int,
+        ) -> c_int,
+    >,
+    on_key_event: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_keyboard_handler_t,
+            browser: *mut cef_browser_t,
+            event: *const cef_key_event_t_switchboard,
+            os_event: CefEventHandleSwitchboard,
+        ) -> c_int,
+    >,
+}
 
 #[cfg(target_os = "macos")]
 fn ui_shell_body() -> &'static [u8] {
@@ -705,9 +1282,16 @@ struct SwitchboardContentDisplayHandler {
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
+struct SwitchboardContentKeyboardHandler {
+    handler: cef_keyboard_handler_t_switchboard,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
 struct SwitchboardContentClient {
     client: cef_client_t,
     display_handler: *mut cef_display_handler_t,
+    keyboard_handler: *mut cef_keyboard_handler_t,
 }
 
 #[cfg(target_os = "macos")]
@@ -1147,6 +1731,13 @@ enum UiPromptAction {
     QueryActiveUri,
     QueryShellState,
     UiOverlay { visible: bool },
+    WebsiteKeybindings { active: bool },
+    KeybindingsSync {
+        close_tab: String,
+        command_palette: String,
+        focus_navigation: String,
+        toggle_devtools: String,
+    },
     UiReady,
 }
 
@@ -1394,6 +1985,34 @@ fn parse_ui_prompt_payload(payload: &str) -> Result<UiPromptAction, &'static str
     if trimmed == "ui_overlay off" {
         return Ok(UiPromptAction::UiOverlay { visible: false });
     }
+    if trimmed == "website_keybindings on" {
+        return Ok(UiPromptAction::WebsiteKeybindings { active: true });
+    }
+    if trimmed == "website_keybindings off" {
+        return Ok(UiPromptAction::WebsiteKeybindings { active: false });
+    }
+    if let Some(rest) = trimmed.strip_prefix("keybindings_sync ") {
+        let mut parts = rest.split_whitespace();
+        let close_tab = parts.next().ok_or("keybindings_sync requires close_tab binding")?;
+        let command_palette = parts
+            .next()
+            .ok_or("keybindings_sync requires command_palette binding")?;
+        let focus_navigation = parts
+            .next()
+            .ok_or("keybindings_sync requires focus_navigation binding")?;
+        let toggle_devtools = parts
+            .next()
+            .ok_or("keybindings_sync requires toggle_devtools binding")?;
+        if parts.next().is_some() {
+            return Err("keybindings_sync only accepts four bindings");
+        }
+        return Ok(UiPromptAction::KeybindingsSync {
+            close_tab: close_tab.to_owned(),
+            command_palette: command_palette.to_owned(),
+            focus_navigation: focus_navigation.to_owned(),
+            toggle_devtools: toggle_devtools.to_owned(),
+        });
+    }
     if trimmed.starts_with("ui_ready ") {
         return Ok(UiPromptAction::UiReady);
     }
@@ -1403,7 +2022,7 @@ fn parse_ui_prompt_payload(payload: &str) -> Result<UiPromptAction, &'static str
 #[cfg(target_os = "macos")]
 unsafe extern "C" fn switchboard_ui_on_jsdialog(
     _self_: *mut cef_jsdialog_handler_t,
-    _browser: *mut cef_browser_t,
+    browser: *mut cef_browser_t,
     _origin_url: *const cef_string_t,
     dialog_type: switchboard_cef_sys::raw::cef_jsdialog_type_t,
     message_text: *const cef_string_t,
@@ -1419,6 +2038,7 @@ unsafe extern "C" fn switchboard_ui_on_jsdialog(
     if marker != UI_INTENT_PROMPT_MARKER {
         return 0;
     }
+    remember_ui_shell_browser(browser);
 
     let payload = cef_string_to_owned(default_prompt_text);
     match parse_ui_prompt_payload(&payload) {
@@ -1443,6 +2063,34 @@ unsafe extern "C" fn switchboard_ui_on_jsdialog(
             if let Err(error) = set_ui_overlay_visible(visible) {
                 eprintln!("switchboard-app: failed to set UI overlay visible={visible}: {error}");
             }
+            0
+        }
+        Ok(UiPromptAction::WebsiteKeybindings { active }) => {
+            if !suppress_message.is_null() {
+                *suppress_message = 1;
+            }
+            if let Err(error) = set_website_keybindings_active(active) {
+                eprintln!(
+                    "switchboard-app: failed to set website keybindings active={active}: {error}"
+                );
+            }
+            0
+        }
+        Ok(UiPromptAction::KeybindingsSync {
+            close_tab,
+            command_palette,
+            focus_navigation,
+            toggle_devtools,
+        }) => {
+            if !suppress_message.is_null() {
+                *suppress_message = 1;
+            }
+            set_browser_shortcut_bindings(
+                &close_tab,
+                &command_palette,
+                &focus_navigation,
+                &toggle_devtools,
+            );
             0
         }
         Ok(UiPromptAction::QueryShellState) => {
@@ -1825,6 +2473,50 @@ unsafe extern "C" fn switchboard_content_on_loading_progress_change(
 }
 
 #[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_content_on_pre_key_event(
+    _self_: *mut cef_keyboard_handler_t,
+    _browser: *mut cef_browser_t,
+    _event: *const cef_key_event_t_switchboard,
+    _os_event: CefEventHandleSwitchboard,
+    _is_keyboard_shortcut: *mut c_int,
+) -> c_int {
+    0
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_content_on_key_event(
+    _self_: *mut cef_keyboard_handler_t,
+    browser: *mut cef_browser_t,
+    event: *const cef_key_event_t_switchboard,
+    _os_event: CefEventHandleSwitchboard,
+) -> c_int {
+    if browser.is_null() || event.is_null() {
+        return 0;
+    }
+    remember_browser_for_active_tab(browser);
+    if !WEBSITE_KEYBINDINGS_ACTIVE.with(|slot| slot.get()) {
+        return 0;
+    }
+    let key_event = &*event;
+    if key_event.type_ != CEF_KEYEVENT_RAWKEYDOWN && key_event.type_ != CEF_KEYEVENT_KEYDOWN {
+        return 0;
+    }
+    if key_event.focus_on_editable_field != 0 {
+        return 0;
+    }
+    if (key_event.modifiers & CEF_EVENTFLAG_IS_REPEAT) != 0 {
+        return 0;
+    }
+    let Some(action) = fallback_shortcut_action(key_event) else {
+        return 0;
+    };
+    if dispatch_ui_shortcut_action(action) {
+        return 1;
+    }
+    0
+}
+
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn switchboard_content_client_get_display_handler(
     self_: *mut cef_client_t,
 ) -> *mut cef_display_handler_t {
@@ -1833,6 +2525,17 @@ unsafe extern "C" fn switchboard_content_client_get_display_handler(
     }
     let client = self_ as *mut SwitchboardContentClient;
     (*client).display_handler
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_content_client_get_keyboard_handler(
+    self_: *mut cef_client_t,
+) -> *mut cef_keyboard_handler_t {
+    if self_.is_null() {
+        return std::ptr::null_mut();
+    }
+    let client = self_ as *mut SwitchboardContentClient;
+    (*client).keyboard_handler
 }
 
 #[cfg(target_os = "macos")]
@@ -1860,8 +2563,22 @@ fn allocate_content_display_handler() -> *mut cef_display_handler_t {
 }
 
 #[cfg(target_os = "macos")]
+fn allocate_content_keyboard_handler() -> *mut cef_keyboard_handler_t {
+    let handler = Box::new(SwitchboardContentKeyboardHandler {
+        handler: cef_keyboard_handler_t_switchboard {
+            base: ref_counted_base::<cef_keyboard_handler_t_switchboard>(),
+            on_pre_key_event: Some(switchboard_content_on_pre_key_event),
+            on_key_event: Some(switchboard_content_on_key_event),
+        },
+    });
+    let ptr = Box::into_raw(handler);
+    unsafe { &mut (*ptr).handler as *mut cef_keyboard_handler_t_switchboard as *mut cef_keyboard_handler_t }
+}
+
+#[cfg(target_os = "macos")]
 fn allocate_content_cef_client() -> *mut cef_client_t {
     let display_handler = allocate_content_display_handler();
+    let keyboard_handler = allocate_content_keyboard_handler();
     let client = Box::new(SwitchboardContentClient {
         client: cef_client_t {
             base: ref_counted_base::<cef_client_t>(),
@@ -1877,7 +2594,7 @@ fn allocate_content_cef_client() -> *mut cef_client_t {
             get_frame_handler: None,
             get_permission_handler: None,
             get_jsdialog_handler: None,
-            get_keyboard_handler: None,
+            get_keyboard_handler: Some(switchboard_content_client_get_keyboard_handler),
             get_life_span_handler: None,
             get_load_handler: None,
             get_print_handler: None,
@@ -1886,6 +2603,7 @@ fn allocate_content_cef_client() -> *mut cef_client_t {
             on_process_message_received: None,
         },
         display_handler,
+        keyboard_handler,
     });
     let client_ptr = Box::into_raw(client);
     if env_flag(ENV_CEF_VERBOSE_ERRORS) {
@@ -1909,6 +2627,12 @@ unsafe fn free_content_cef_client(client: *mut cef_client_t) {
     if !display_handler.is_null() {
         drop(Box::from_raw(
             display_handler as *mut SwitchboardContentDisplayHandler,
+        ));
+    }
+    let keyboard_handler = (*content_client).keyboard_handler;
+    if !keyboard_handler.is_null() {
+        drop(Box::from_raw(
+            keyboard_handler as *mut SwitchboardContentKeyboardHandler,
         ));
     }
     drop(Box::from_raw(content_client));
@@ -2716,6 +3440,7 @@ impl CefHost for NativeMacHost {
             );
         }
         if visible {
+            set_active_content_container(container)?;
             if let Some(tab_id) = self.content_view_tabs.get(&view_id).copied() {
                 set_active_content_tab(Some(tab_id));
                 let mapped_browser = browser_for_tab(tab_id);
@@ -2725,6 +3450,8 @@ impl CefHost for NativeMacHost {
                     set_active_content_browser(std::ptr::null_mut());
                 }
             }
+        } else {
+            clear_active_content_container_if_matches(container)?;
         }
         Ok(())
     }
@@ -2820,18 +3547,18 @@ impl CefHost for NativeMacHost {
             .content_views
             .remove(&view_id)
             .ok_or_else(|| HostError::Native(format!("content view not found: {}", view_id.0)))?;
+        let container = match content_backend {
+            ContentBackend::WebKit(container) | ContentBackend::Cef(container) => container,
+        };
+        clear_active_content_container_if_matches(container)?;
         self.content_view_windows.remove(&view_id);
         if let Some(tab_id) = self.content_view_tabs.remove(&view_id) {
             forget_browser_for_tab(tab_id);
         }
 
         unsafe {
-            match content_backend {
-                ContentBackend::WebKit(container) | ContentBackend::Cef(container) => {
-                    remove_all_subviews(container)?;
-                    msg_send_void(container, selector("removeFromSuperview")?);
-                }
-            }
+            remove_all_subviews(container)?;
+            msg_send_void(container, selector("removeFromSuperview")?);
         }
 
         if let Some(client) = self.cef_clients.remove(&view_id) {
@@ -2868,6 +3595,8 @@ impl CefHost for NativeMacHost {
                 self.cef = None;
                 set_active_content_tab(None);
                 set_active_content_browser(std::ptr::null_mut());
+                set_active_content_container(NIL)?;
+                set_ui_shell_browser(std::ptr::null_mut());
             } else {
                 msg_send_void(self.app, selector("run")?);
             }
@@ -3140,6 +3869,13 @@ unsafe fn msg_send_void_i64(receiver: ObjcId, selector: ObjcSel, arg: i64) {
 #[cfg(target_os = "macos")]
 unsafe fn msg_send_void_u64(receiver: ObjcId, selector: ObjcSel, arg: u64) {
     let send: unsafe extern "C" fn(ObjcId, ObjcSel, u64) =
+        std::mem::transmute(objc_msgSend as *const ());
+    send(receiver, selector, arg);
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn msg_send_void_f64(receiver: ObjcId, selector: ObjcSel, arg: f64) {
+    let send: unsafe extern "C" fn(ObjcId, ObjcSel, f64) =
         std::mem::transmute(objc_msgSend as *const ());
     send(receiver, selector, arg);
 }
