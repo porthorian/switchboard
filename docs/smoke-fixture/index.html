@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Switchboard Local Smoke</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+      body { display: grid; min-height: 100vh; margin: 0; place-items: center; background: #17181c; color: #f4f4f5; }
+      main { max-width: 42rem; padding: 3rem; text-align: center; }
+      code { color: #81e6d9; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>SWITCHBOARD_LOCAL_SMOKE_OK</h1>
+      <p>This page is served locally to verify content browser creation and rendering without DNS or TLS.</p>
+      <p id="storage"></p>
+    </main>
+    <script>
+      const key = "switchboard-smoke-visits";
+      const visits = Number(localStorage.getItem(key) || "0") + 1;
+      localStorage.setItem(key, String(visits));
+      document.cookie = `switchboard_smoke=${visits}; SameSite=Lax`;
+      document.querySelector("#storage").textContent = `Profile-local visits: ${visits}`;
+    </script>
+  </body>
+</html>

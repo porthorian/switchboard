@@ -1,489 +1,143 @@
-# Chromium-based Browser (CEF) — macOS-first Rust Design Doc
+# Switchboard architecture — macOS-first Rust + CEF
 
-## 1. Overview
+## Product boundary
 
-Build a fast, macOS-first desktop browser using **CEF (Chromium Embedded Framework)** as the web engine, with:
+Switchboard is a macOS-first browser with an original interface and SigmaOS-inspired productivity workflows. Chromium Embedded Framework 145 is the rendering engine. Rust owns state, lifecycle, persistence, policy, and native view orchestration. The local `app://ui` document renders derived state and emits intents.
 
-* **Rust** as the primary “browser brain” (state, lifecycle, persistence, policies)
-* **HTML/CSS/JS** for the browser chrome UI rendered inside CEF (`app://ui`)
-* Support for **Profiles** (hard storage isolation) and **Workspaces** (tab organization) with **vertical tabs**
-* Scalability target: **50–200 tabs** across workspaces with stable memory via **restore-on-click**
+The alpha excludes public distribution, signing/notarization, cloud sync, collaboration, AI, updater infrastructure, and non-macOS platforms. Password and general-purpose extension support remain disabled until the all-provider compatibility gate in `PASSWORD_EXTENSION_COMPATIBILITY.md` passes.
 
-Key principle:
+## Non-negotiable boundaries
 
-> Chromium/CEF is the engine. Rust is the orchestration layer.
+- Rust is the single source of truth. UI collapse state and presentation details may be local; hierarchy, ordering, selection, split membership, status, and lifecycle may not.
+- State changes follow intent → candidate state → complete SQLite transaction → in-memory swap → patch.
+- A failed transaction changes neither memory nor revision.
+- Content pages have no privileged bridge and cannot load `app://`.
+- The UI loads only bundled resources, has a restrictive CSP, and uses an ephemeral request context with default cookie schemes disabled.
+- Every profile owns one persistent `CefRequestContext`; workspaces never create storage boundaries.
+- Inactive profiles retain no live content browsers.
+- There is never more than one live browser generation for a tab.
 
-## 2. Non-Goals (MVP)
+## macOS and CEF packaging
 
-Not in MVP:
+The supported browser launch is a generated `.app`, not `cargo run`. `scripts/build_macos_dev_app.sh` creates:
 
-* Extensions
-* Sync across devices
-* Full password manager
-* Adblock engine
-* Wayland/Linux support, Windows support
+- `Switchboard Dev.app` and its `Info.plist`;
+- the pinned CEF framework and resources;
+- dedicated main, Renderer, GPU, and Plugin helper applications;
+- main/helper entitlements; and
+- an inside-out ad-hoc signature verified with `codesign --deep --strict`.
 
-## 3. Platform Scope
+Startup fails if the process is outside an app bundle or if the framework, resources, helper executable, or sandbox library is missing. `cef_settings_t.no_sandbox` is always zero. Normal development uses the real macOS Keychain; mock Keychain is accepted only by `Switchboard Smoke.app`.
 
-* **macOS only** for v1.
-* CEF multiprocess model is used as-is (renderer/GPU/utility subprocesses managed by CEF).
+Every helper initializes `libcef_sandbox.dylib` before loading the CEF framework, then destroys the sandbox context after `cef_execute_process` returns. The sandbox library and framework handles are owned separately so teardown always unloads CEF before destroying the helper sandbox.
 
-## 4. High-Level Architecture
+Host-facing C ABI definitions are pinned to CEF `145.0.26` / API `14500`. Normal builds consume a checked-in, version-verified bindgen snapshot for high-risk callback and settings structures; regenerating that snapshot is an explicit developer action and is rejected for another CEF version.
 
-### 4.1 Processes
+## Context and scheme isolation
 
-* **Main App Process (Rust-owned “browser process”)**
+The UI browser uses its own ephemeral request context. Profile contexts use separate direct-child cache paths at `root_cache_path/profile-<profile_id>` with persistent cookies. The direct-child layout satisfies Chromium's profile-path restriction while retaining one storage boundary per Switchboard profile. Content browser creation receives the owning profile context explicitly. Calls into the raw CEF C API transfer an additional reference for ref-counted client and request-context parameters, preserving the host-owned persistent references across browser close and recreation.
 
-  * Owns canonical state (profiles/workspaces/tabs)
-  * Owns persistence (SQLite)
-  * Owns policies (discarding, permissions)
-  * Hosts and manages CEF views (UI + content)
-  * Integrates CEF message loop with macOS run loop
+The `app` scheme factory is registered only on the ephemeral UI request context and only for the exact `ui` domain; it is never registered globally or on a profile context. This lets the initial `app://ui` request resolve before `OnAfterCreated` while leaving content contexts without an `app` handler. The bridge separately validates the retained UI browser identity and accepts only the exact `app://ui` origin on its main frame. HTTP content navigations to `app://` are rejected by Rust, and a content client receives no handler for privileged UI messages.
 
-* **CEF Subprocesses**
+## Typed bridge and revisions
 
-  * Renderer/GPU/utility processes spawned by CEF
-  * Packaged inside the app bundle
+All payloads use versioned `serde` envelopes with a 64 KiB input limit and a non-empty bounded request id. Unknown fields, unknown commands, malformed JSON, and unsupported protocol versions are rejected.
 
-### 4.2 Views (macOS)
+Rust → UI messages are:
 
-Window layout:
+- `snapshot { snapshot }`;
+- `patch { patch }`;
+- `restore_requested { tab_id, generation }`;
+- `search_results { query, results }`; and
+- bounded acknowledgements/errors.
 
-* **UI View**: a dedicated CEF browser instance using **UI Context** rendering `app://ui`
-* **Content Container**: a native container view hosting the active tab’s CEF view
+UI → Rust messages are whitelisted `UiCommand` variants only. The UI receives one snapshot and ordered patches. Each patch declares contiguous `from_revision` and `to_revision`; a mismatch triggers `request_resync` and a new snapshot. There is no snapshot polling or prompt-based native bridge.
 
-Conceptually:
+Decoded stateful UI commands are deferred to the next macOS main-queue turn. This prevents browser creation or teardown from running reentrantly inside a CEF display callback.
 
-* `NSWindow`
+The current alpha transport serializes these envelopes through the privileged main-frame CEF callback. Moving the same envelope contract to CEF process-message/V8 plumbing remains a native acceptance item; the reducer and UI contract must not change when that transport is replaced.
 
-  * Root view
+## Domain model
 
-    * UI CEF view (`app://ui`) — vertical tabs, omnibox, workspace/profile selectors
-    * Content container — active content webview
+### Profiles and workspaces
 
-## 5. Security & Context Separation
+A profile is the browsing-data isolation boundary. A workspace belongs to exactly one profile and stores its primary tab, optional secondary tab, split-enabled state, and a divider ratio clamped to 25–75%. `active_tab_id` is a compatibility alias for the primary tab during the native-host transition.
 
-We operate with **separated contexts**:
+### Tab tree
 
-### 5.1 UI Context (Privileged)
+Open tabs form an arbitrary-depth tree through `parent_tab_id`; workspace `tab_order` is the authoritative depth-first order. Pinned and locked are independent. Pinned siblings precede unpinned siblings at each level, and moving a parent moves its subtree. Reducer validation rejects cross-profile moves, invalid parents, cycles, invalid sibling positions, and invalid split membership.
 
-* Only loads `app://...` internal pages
-* Minimal/no persistent cookies
-* Has access to Rust bridge (strictly limited API)
+Observed and custom titles are stored separately. A custom title wins until cleared.
 
-### 5.2 Content Context (Unprivileged)
+### Status
 
-* One **Content Context per Profile** (storage isolation boundary)
-* Persistent cookies/cache/storage per profile
-* No privileged Rust bridge
+A tab is one of:
 
-### 5.3 Hard Rules
+- `Open`;
+- `Done { completed_at_ms, restore }`; or
+- `Snoozed { wake_at_ms, restore }`.
 
-* Content tabs **cannot navigate** to `app://...` (block/redirect)
-* Rust bridge enabled **only** for trusted UI frames under `app://ui/*`
-* UI assets bundled locally (no remote CDN dependencies in MVP)
+Close and Done converge on completion. Locked tabs cannot be completed, snoozed, or permanently deleted. Completion saves the former parent and sibling index. Restore uses that location when valid and otherwise appends at the root while preserving pinned ordering.
 
-### 5.4 Security Objective (Non-Negotiable)
+After completion, selection is deterministic: next sibling, previous sibling, parent, first root, then none. Completed tabs are retained for 30 days and up to 500 per profile and pruned at completion/startup. Snoozed tabs use a one-shot UI timer; startup and application reactivation process overdue entries.
 
-Untrusted web content must never gain host-level control.
+## Runtime lifecycle
 
-Concrete requirement:
+Runtime residency is rebuilt after startup and is never persisted:
 
-* No website can trigger arbitrary native code execution, arbitrary local file access, or privileged OS actions through browser APIs.
-* Browser chrome actions must only be reachable via explicit trusted UI intents and strict allowlists.
-* Any unknown/invalid intent, malformed message, or unauthorized origin is rejected by default.
+- `Active`: primary visible browser;
+- `Secondary`: second visible browser;
+- `Warm`: hidden live browser in the active profile LRU;
+- `Discarded`: metadata only; and
+- `Restoring`: visible placeholder awaiting a frame acknowledgement.
 
-### 5.5 Security Invariants
+The active profile has at most two visible browsers plus eight warm browsers. Both visible tabs are excluded from the warm budget. Inactive profiles have zero live browsers.
 
-These invariants must remain true across all milestones:
+Activating a discarded tab follows this sequence:
 
-* Default-deny bridge: only explicit command allowlist, argument validation, and origin checks.
-* Least privilege by context: content context has no privileged bridge surface.
-* Scheme isolation: `app://` resources remain inaccessible to web content.
-* Process boundary respect: CEF sandbox and multiprocess boundaries remain enabled and are not weakened for convenience.
-* Fail closed: on uncertainty, reject action and preserve isolation.
+1. The reducer selects it and marks it `Restoring`.
+2. The committed patch is sent to the UI.
+3. Rust emits `restore_requested(tab_id, generation)`.
+4. The UI renders and responds from its next animation frame.
+5. Rust accepts only the matching pending generation and creates the native view.
+6. Successful creation commits `Active` or `Secondary` and emits the next patch.
 
-## 6. Product Model: Profiles & Workspaces
+Switching away removes the pending token. Stale acknowledgements and CEF callbacks are no-ops. Navigating an existing tab calls the existing main frame's `load_url`; it never recreates the browser.
 
-### 6.1 Profiles (Isolation)
+Every UI and content client installs a life-span handler. Window close requests `CloseBrowser` for every live browser and keeps the CEF loop alive until the final `OnBeforeClose`; client-owned handlers are not released before that callback. Discarding a tab also requests an explicit close and retires its client until close completion. If the same tab becomes live again while its prior browser is closing, restoration remains pending; `OnBeforeClose` emits close completion and the UI receives a fresh restore request before CEF creates the replacement browser.
 
-* Profiles represent hard storage isolation:
+Content loading state and Chromium back/forward capability come only from `CefLoadHandler::OnLoadingStateChange`; display progress callbacks never query browser lifecycle methods. Main-frame `OnLoadEnd` emits the successful-load signal used for history, while `OnLoadError` emits bounded diagnostics and suppresses history. Retained browser wrappers are attributed to `(tab_id, browser_generation)` and may be refreshed only when CEF confirms they represent the same underlying browser.
 
-  * cookies
-  * cache
-  * site storage
-  * permissions (later)
+## Persistence schema v2
 
-### 6.2 Workspaces (Organization)
+`rusqlite` uses the system SQLite library. Schema v2 contains normalized `meta`, `profiles`, `workspaces`, `tabs`, `settings`, and `history` tables with foreign keys and transactional replacement.
 
-* Workspaces are organizational collections of tabs **within a profile**.
-* Workspaces do **not** create separate cookie jars.
+Persisted fields are domain state and the committed revision. Loading flags, native handles, generations, warm order, and runtime residency are reconstructed. If a database is not schema v2, it and any WAL/SHM companions are renamed to a timestamped versioned backup before an empty v2 database is created. Nothing is silently deleted.
 
-Outcome:
+History is per profile. A successful HTTP(S) main-frame completion records a visit. Consecutive normalized URLs coalesce while increasing visit count and updating last-visit time. History has no automatic retention and is removed only by clear-current-profile or clear-all.
 
-* **Profiles isolate**.
-* **Workspaces organize**.
+## Lazy Search
 
-## 7. State Management: Snapshots + Patches
+New Tab opens Lazy Search and creates no state until selection. Rust queries and ranks open tabs across all profiles/workspaces, whitelisted commands, active-profile history, and a configurable web-search fallback.
 
-### 7.1 Source of Truth
+`>` restricts commands, `history:` restricts history, and `done:` searches completed tabs. Archived tabs are otherwise hidden. Ranking is exact, then prefix, then substring; frequency, recency, and title provide deterministic tie-breakers. Selecting an existing tab activates its profile/workspace/tab. URL and history selections create a tab only when selected.
 
-* Rust holds canonical state.
-* UI renders canonical state.
+## Split, focus, and keyboard modes
 
-### 7.2 Revisions
+Two existing tabs from one workspace can be visible. The secondary remains in the normal tree. Clearing split preserves secondary selection but returns the hidden browser to ordinary warm-pool policy. Completing or snoozing the secondary clears it and disables split. Rust persists selection and ratio; native layout clamps the ratio.
 
-* Rust maintains a monotonically increasing `revision`.
-* UI stores `current_revision`.
+CEF popup dispositions are intercepted so unmanaged Chrome windows never appear. Command-click/new-tab dispositions create a subtab beneath the source. Shift-click/new-window dispositions create that subtab and assign it to the secondary pane. The callback carries the source generation, and obsolete generations are ignored by the runtime.
 
-### 7.3 Messages
+Focus mode is session-only. It moves the UI view behind content and lays content across the full native root without changing tab state.
 
-Rust → UI:
+Browser and Insert are explicit modes with a persistent UI indicator. Switching profile/workspace/tab resets Browser mode. Browser mode owns single-key actions; `I` enters Insert and `Escape` returns to Browser, including when focus is inside content. Command-based shortcuts remain active in both modes. Setting validation rejects duplicate bindings.
 
-* `SNAPSHOT { state, revision }`
-* `PATCH { ops[], from_revision, to_revision }`
+## UI performance
 
-UI → Rust:
+The UI flattens only expanded tree nodes and virtualizes that visible list. Expansion, hover, scroll, drag affordances, panels, and presentation layout stay local. A drop produces one authoritative move intent. Rust does not stream layout micro-events or expose the complete history database.
 
-* Intents (commands):
+## Security and release gates
 
-  * `UI_READY { ui_version }`
-  * `NAVIGATE { tab_id, url }`
-  * `NEW_TAB { workspace_id, url?, make_active }`
-  * `CLOSE_TAB { tab_id }`
-  * `ACTIVATE_TAB { tab_id }`
-  * `MOVE_TAB { tab_id, workspace_id, index }`
-  * `NEW_WORKSPACE { profile_id, name }`
-  * `RENAME_WORKSPACE { workspace_id, name }`
-  * `SWITCH_WORKSPACE { workspace_id }`
-  * `SWITCH_PROFILE { profile_id }`
-  * `PIN_TAB { tab_id, pinned }`
-  * `DISCARD_TAB { tab_id }`
-  * `SETTING_SET { key, value }`
+Deterministic tests cover reducer invariants, SQLite reset/rollback/revision behavior, bridge decoding and resync, generation attribution, deferred creation, browser reuse, warm limits, shutdown requests, and the 200-tab workload.
 
-Robustness:
-
-* If the UI gets out of sync, it requests a resync and Rust sends a full `SNAPSHOT`.
-
-## 8. UI Performance: Virtualized Vertical Tabs
-
-* UI computes virtualization locally (no “visible rows” from Rust).
-* Virtual list requirements:
-
-  * Fixed row height (MVP)
-  * Minimal DOM per row (favicon, title, close button, small status)
-  * Local-only hover/scroll/drag state
-
-Drag/drop:
-
-* UI provides the drag experience locally.
-* On drop, UI sends a single `MOVE_TAB` intent.
-* Rust responds with authoritative ordering patch.
-
-Search:
-
-* UI maintains a local search index (title + URL) updated on patches.
-
-## 9. Tab Lifecycle: Restore-on-Click
-
-### 9.1 States
-
-Each tab is in exactly one runtime state:
-
-* **Active**: live CEF instance, visible
-* **Warm**: live CEF instance, hidden
-* **Discarded**: no CEF instance, metadata only (+ optional thumbnail)
-
-### 9.2 Budgets (macOS MVP)
-
-Per active profile:
-
-* Active: 1
-* Warm pool: 5–8 total (LRU)
-* Discarded: everything else
-
-Warm pool is **profile-scoped** and **global within the profile**, not per workspace.
-
-### 9.3 Workspace Switching
-
-* Instant sidebar switch.
-* Content shows last active tab for that workspace:
-
-  * Warm → instant
-  * Discarded → thumbnail placeholder + restore
-
-No bulk wake-up of workspace tabs.
-
-### 9.4 Profile Switching
-
-* UI stays constant (UI Context unchanged).
-* Content swaps to the target profile’s active tab.
-* Optionally shrink/discard warm tabs in the previous profile.
-
-## 10. Deferred Creation Until UI Frame Commit
-
-We defer expensive work for smooth UI.
-
-Flow when activating a discarded tab:
-
-1. UI sends `ACTIVATE_TAB { tab_id }`.
-2. Rust updates state immediately:
-
-   * sets active pointers
-   * marks tab as `restoring` (sub-state)
-   * emits `PATCH` so UI shows thumbnail + spinner
-3. UI applies patch and renders the placeholder.
-4. UI sends `FRAME_COMMITTED { revision }`.
-5. Rust creates/attaches the CEF content view and starts navigation.
-6. Rust patches tab to `Active` when ready.
-
-Cancellation:
-
-* If user activates another tab before commit, pending restore is canceled.
-
-## 11. Thumbnails (Perceived Speed)
-
-* Capture thumbnail on transitions:
-
-  * Active → Warm
-  * Active → Discarded
-* For discarded tab activation:
-
-  * show thumbnail immediately
-  * replace with live view when ready
-* Maintain storage cap and LRU cleanup.
-
-## 12. Persistence (SQLite)
-
-### 12.1 Goals
-
-* Crash-safe persistence
-* Fast startup
-* Easy migrations
-
-### 12.2 Schema (Conceptual)
-
-**meta**
-
-* `key` (PK): `schema_version`, `last_revision`, etc.
-* `value`
-
-**profiles**
-
-* `id` (PK)
-* `name`
-* `created_at`
-* `last_active_at`
-* `content_data_dir` (or derived)
-* `active_workspace_id` (nullable)
-
-**workspaces**
-
-* `id` (PK)
-* `profile_id` (FK)
-* `name`
-* `sort_index`
-* `created_at`
-* `last_active_at`
-* `active_tab_id` (nullable)
-
-**tabs** (metadata only)
-
-* `id` (PK)
-* `profile_id` (FK)
-* `workspace_id` (FK)
-* `url`
-* `title`
-* `favicon_url` (or favicon key)
-* `pinned` (bool)
-* `muted` (bool)
-* `created_at`
-* `last_active_at`
-
-**workspace_tabs** (ordering)
-
-* `workspace_id` (FK)
-* `tab_id` (FK)
-* `sort_index` (int)
-* PK: (`workspace_id`, `tab_id`)
-* Index: (`workspace_id`, `sort_index`)
-
-**thumbnails** (optional; prefer file-based storage)
-
-* `id` (PK)
-* `tab_id` (FK)
-* `mime`
-* `width`, `height`
-* `file_path` (recommended) or `bytes` (BLOB)
-* `created_at`
-* `last_used_at`
-
-### 12.3 Runtime vs Persistent
-
-Persisted:
-
-* profiles/workspaces
-* tab metadata
-* tab ordering
-* last active pointers
-
-Runtime-only (in-memory):
-
-* warm LRU state
-* restoring queue
-* live browser instance map (tab_id → view handle)
-* loading/audio/canGoBack flags
-
-### 12.4 Write Ordering
-
-For each intent:
-
-1. Apply mutation in Rust
-2. Commit SQLite transaction
-3. Emit patch
-
-## 13. Startup / Restore Flow (Fast)
-
-1. Load minimal state from SQLite:
-
-   * profiles
-   * active profile
-   * workspaces for active profile
-   * active workspace
-   * tab ordering + metadata for active workspace
-2. Emit `SNAPSHOT` immediately so UI draws sidebar fast.
-3. Instantiate only the active tab’s content view.
-4. All other tabs start as Discarded at runtime.
-
-## 14. Minimal CEF→Rust→UI Event Surface
-
-CEF events feeding state updates:
-
-* title changed
-* url changed
-* favicon changed (optional early)
-* loading started/stopped
-* audio playing/muted (later)
-
-Rust converts these into state mutations and emits patches.
-
-## 15. MVP Milestones
-
-### Milestone 1: UI shell + one content tab
-
-* macOS window
-* UI CEF view loads `app://ui`
-* UI → Rust intents wired
-* Single content view created on navigation
-
-### Milestone 2: Workspaces + vertical tabs (virtualized)
-
-* Workspaces CRUD
-* Tab list rendering for active workspace
-* Omnibox + basic navigation
-
-### Milestone 3: Multi-tab + show/hide views
-
-* Create/close/activate tabs
-* Patch-driven title/loading updates
-
-### Milestone 4: Restore-on-click + warm pool
-
-* Warm LRU budget
-* Discarded tabs as metadata only
-* Deferred creation on `FRAME_COMMITTED`
-
-### Milestone 5: Profiles
-
-* One content context per profile
-* Profile switching
-
-### Milestone 6: Thumbnails
-
-* capture + display placeholders
-* storage cap + cleanup
-
-### Milestone 7: Persistence + restore
-
-* SQLite-backed persistence for profiles/workspaces/tabs/order/active pointers
-* startup restore path that hydrates UI quickly from DB
-* crash-safe write ordering validation (mutate -> commit -> patch)
-
-### Milestone 8: Lifecycle + memory policy hardening
-
-* strict active/warm/discarded lifecycle enforcement
-* warm pool LRU budget enforcement under tab stress
-* deterministic restore-on-click behavior across workspace/profile switches
-
-### Milestone 9: Profile UX completion
-
-* full profile CRUD UX parity in shell
-* guardrails for invalid profile operations (e.g., last-profile delete)
-* keyboard-accessible create/switch/rename flows
-
-### Milestone 10: Stabilization + release readiness
-
-* integration tests for snapshot/patch revision integrity and resync
-* restart/crash recovery validation against persisted state
-* macOS packaging/signing/notarization runbook + smoke checks
-* runbook reference: `docs/RELEASE_RUNBOOK.md`
-
-### Milestone 11: Settings + behavior preferences
-
-* settings surface in UI shell for browser preferences
-* configurable default search engine
-* configurable homepage/start page
-* configurable new tab behavior (blank/home/custom URL/workspace defaults)
-* persisted settings with patch-driven runtime updates
-
-### Milestone 12: Keybindings + command ergonomics
-
-* global keybinding system in UI shell + Rust intent bridge
-* default shortcuts for core actions (e.g., close active tab)
-* keyboard shortcut to focus/open navigation input (including Space in shell command mode)
-* conflict handling between content-page input and browser chrome shortcuts
-* user-configurable keybindings persisted in settings
-
-### Milestone 13: Developer tools integration
-
-* open Chromium DevTools for the active content tab from UI and keybindings
-* support developer workflows for website debugging (elements/network/console/sources)
-* allow internal debugging of browser shell/content behavior during development
-* stable DevTools window lifecycle across tab/workspace/profile switching
-
-### Milestone 14: Password manager ecosystem support
-
-* support user-selected password manager workflows (e.g., Bitwarden, LastPass, 1Password)
-* provide secure autofill/credential-save integration points without breaking profile isolation
-* define policy boundaries for third-party credential providers and permissions
-* include UX for enabling/disabling providers per profile and handling fallback behavior
-
-### Milestone 15: Security hardening + abuse resistance
-
-* comprehensive audit of UI bridge allowlist and capability boundaries
-* tighten `app://` scheme protections, navigation guards, and resource loading policy
-* enforce stronger context isolation and least-privilege defaults across UI/content surfaces
-* add security-focused tests/checks (intent fuzzing, malformed message handling, regression suites)
-* release hardening checklist (dependency review, secure defaults, packaging/signing validation)
-* required go/no-go gates before release:
-  * no known path from web content to privileged bridge commands
-  * no known path to arbitrary file read/write via browser-exposed APIs
-  * no known path to arbitrary process execution from untrusted content
-  * all high/critical security findings resolved or explicitly risk-accepted
-
-### Milestone 16: Release readiness + distribution
-
-* production packaging pipeline for building distributable browser artifacts
-* application branding assets (app icon, bundle metadata, polished app identity)
-* GitHub Actions CI/CD workflows for build, test, signing, and release publishing
-* macOS distribution readiness (codesign/notarization/stapling verification)
-* documented release process (versioning, changelog, rollback, smoke-test checklist)
-
-## 16. Open Questions (Later)
-
-* Tab groups
-* Workspace templates / cloning
-* Permissions UX and policies
-* Crash recovery beyond last committed DB transaction
-* Update mechanism and signing/notarization
-* Detailed memory pressure signals and heuristics
+The environment-dependent native gate in `MACOS_CEF_SMOKE.md` must pass before calling the alpha complete. The password provider matrix is a separate manual/instrumented gate. A passing unit suite or a generated bundle is not proof that either native gate passed.

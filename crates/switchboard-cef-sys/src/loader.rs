@@ -7,9 +7,15 @@ use std::ptr::NonNull;
 use crate::raw::{
     cef_api_hash_fn, cef_api_version_fn, cef_browser_host_create_browser_fn, cef_currently_on_fn,
     cef_do_message_loop_work_fn, cef_execute_process_fn, cef_initialize_fn, cef_post_task_fn,
-    cef_quit_message_loop_fn, cef_register_scheme_handler_factory_fn, cef_run_message_loop_fn,
+    cef_quit_message_loop_fn, cef_request_context_create_context_fn, cef_run_message_loop_fn,
     cef_shutdown_fn, cef_string_utf16_clear_fn, cef_string_utf16_set_fn,
 };
+
+#[cfg(target_os = "macos")]
+type cef_sandbox_initialize_fn =
+    unsafe extern "C" fn(argc: i32, argv: *mut *mut c_char) -> *mut c_void;
+#[cfg(target_os = "macos")]
+type cef_sandbox_destroy_fn = unsafe extern "C" fn(sandbox_context: *mut c_void);
 
 const RTLD_LAZY: i32 = 0x1;
 const RTLD_LOCAL: i32 = 0x4;
@@ -52,7 +58,7 @@ pub struct CefApi {
     pub cef_currently_on: cef_currently_on_fn,
     pub cef_post_task: cef_post_task_fn,
     pub cef_browser_host_create_browser: cef_browser_host_create_browser_fn,
-    pub cef_register_scheme_handler_factory: cef_register_scheme_handler_factory_fn,
+    pub cef_request_context_create_context: cef_request_context_create_context_fn,
     pub cef_string_utf16_set: cef_string_utf16_set_fn,
     pub cef_string_utf16_clear: cef_string_utf16_clear_fn,
 }
@@ -60,6 +66,81 @@ pub struct CefApi {
 pub struct CefLibrary {
     handle: NonNull<c_void>,
     pub api: CefApi,
+}
+
+/// Owns the macOS CEF sandbox context and the dynamic library that created it.
+///
+/// CEF requires helper processes to initialize this context before loading the
+/// Chromium Embedded Framework. Keeping both handles in one value also makes
+/// the required destruction order explicit: destroy the context first, then
+/// unload `libcef_sandbox.dylib`.
+#[cfg(target_os = "macos")]
+pub struct CefSandboxContext {
+    library_handle: NonNull<c_void>,
+    context_handle: NonNull<c_void>,
+    destroy: cef_sandbox_destroy_fn,
+}
+
+#[cfg(target_os = "macos")]
+impl CefSandboxContext {
+    /// Load and initialize the CEF sandbox for a helper process.
+    ///
+    /// # Safety
+    ///
+    /// `argv` must contain `argc` valid pointers for the duration of this call.
+    /// This function must run at helper process startup before loading CEF.
+    pub unsafe fn initialize<P: AsRef<Path>>(
+        path: P,
+        argc: i32,
+        argv: *mut *mut c_char,
+    ) -> Result<Self, CefLoadError> {
+        let path_string = path.as_ref().to_string_lossy().to_string();
+        if !path.as_ref().exists() {
+            return Err(CefLoadError::NotFound(path_string));
+        }
+
+        let path_cstr = CString::new(path_string.clone()).map_err(|_| {
+            CefLoadError::DlError("sandbox library path contained interior NUL".to_owned())
+        })?;
+        let raw = dlopen(path_cstr.as_ptr(), RTLD_LAZY | RTLD_LOCAL);
+        let library_handle =
+            NonNull::new(raw).ok_or_else(|| CefLoadError::DlError(last_dl_error()))?;
+
+        let load = |symbol: &'static str| -> Result<*mut c_void, CefLoadError> {
+            let symbol_cstr = CString::new(symbol).map_err(|_| {
+                CefLoadError::DlError("symbol name contained interior NUL".to_owned())
+            })?;
+            let ptr = dlsym(library_handle.as_ptr(), symbol_cstr.as_ptr());
+            if ptr.is_null() {
+                return Err(CefLoadError::SymbolMissing(symbol, last_dl_error()));
+            }
+            Ok(ptr)
+        };
+
+        let initialize = load_symbol::<cef_sandbox_initialize_fn>(&load, "cef_sandbox_initialize")?;
+        let destroy = load_symbol::<cef_sandbox_destroy_fn>(&load, "cef_sandbox_destroy")?;
+        let context_handle = NonNull::new(initialize(argc, argv)).ok_or_else(|| {
+            CefLoadError::DlError(format!(
+                "CEF sandbox initialization failed using {path_string}"
+            ))
+        })?;
+
+        Ok(Self {
+            library_handle,
+            context_handle,
+            destroy,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for CefSandboxContext {
+    fn drop(&mut self) {
+        unsafe {
+            (self.destroy)(self.context_handle.as_ptr());
+            let _ = dlclose(self.library_handle.as_ptr());
+        }
+    }
 }
 
 impl CefLibrary {
@@ -116,11 +197,10 @@ impl CefLibrary {
                     &load,
                     "cef_browser_host_create_browser",
                 )?,
-                cef_register_scheme_handler_factory: load_symbol::<
-                    cef_register_scheme_handler_factory_fn,
+                cef_request_context_create_context: load_symbol::<
+                    cef_request_context_create_context_fn,
                 >(
-                    &load,
-                    "cef_register_scheme_handler_factory",
+                    &load, "cef_request_context_create_context"
                 )?,
                 cef_string_utf16_set: load_symbol::<cef_string_utf16_set_fn>(
                     &load,

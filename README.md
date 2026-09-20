@@ -10,31 +10,17 @@ Rust-first browser orchestration scaffold for a CEF-based macOS browser.
 - `docs/DESIGN_DOC.md`: Architecture and lifecycle contract.
 - `AGENTS.md`: Agent operating constraints.
 
-## Quick start
+## Development build
 
 ```bash
-cargo run -p switchboard-app
 cargo test
+SWITCHBOARD_CEF_DIST=/absolute/path/to/cef_binary_145... ./scripts/build_macos_dev_app.sh
+open "target/dev-bundle/Switchboard Dev.app"
 ```
 
-`cargo run -p switchboard-app` starts the Milestone 1 shell and opens a native macOS window.
-Milestone 1 now boots a privileged CEF UI view at `app://ui`, so a CEF distribution path is required on macOS.
+The browser must run from the generated `.app`. Bare `cargo run` is intentionally rejected because it cannot provide the required CEF helper applications, framework resources, sandbox library, entitlements, or signing order. The bundle locates CEF and its dedicated helper automatically.
 
-To render content with CEF, provide either a distribution root or an explicit framework binary:
-
-```bash
-SWITCHBOARD_CEF_DIST=/Users/vmarone/projects/cef_binary_145.0.26+g6ed7554+chromium-145.0.7632.110_macosarm64 \
-cargo run -p switchboard-app
-```
-
-Or:
-
-```bash
-SWITCHBOARD_CEF_LIBRARY=/path/to/Release/Chromium\ Embedded\ Framework.framework/Chromium\ Embedded\ Framework \
-cargo run -p switchboard-app
-```
-
-The `app://ui` shell currently exposes a minimal prompt-based bridge marker (`__switchboard_intent__`) with a strict allowlist (`navigate http(s)://...`).
+The UI bridge uses versioned JSON envelopes, pushed snapshots/patches, strict command decoding, and no snapshot polling or prompt-based transport.
 
 Optional overrides:
 - `SWITCHBOARD_CEF_FRAMEWORK_DIR`
@@ -44,34 +30,31 @@ Optional overrides:
 - `SWITCHBOARD_CEF_API_VERSION` (defaults to `14500`; set explicitly if using a different CEF build)
 - `SWITCHBOARD_CEF_ROOT_CACHE_PATH`
 - `SWITCHBOARD_CEF_TMPDIR`
-- `SWITCHBOARD_CEF_USE_MOCK_KEYCHAIN` (`1/true` to force `--use-mock-keychain`, defaults to enabled in debug builds)
+- `SWITCHBOARD_STATE_DB_PATH` (absolute development/smoke database path; defaults to Application Support)
+- `SWITCHBOARD_CEF_USE_MOCK_KEYCHAIN` (`1/true` only inside the dedicated `Switchboard Smoke.app`; rejected by normal development bundles)
 - `SWITCHBOARD_CEF_PASSWORD_STORE` (optional Chromium `--password-store=<value>`, e.g. `basic` for dev)
 - `SWITCHBOARD_CEF_AUTOPLAY_POLICY` (optional Chromium `--autoplay-policy=<value>`, defaults to `no-user-gesture-required`)
 - `SWITCHBOARD_CEF_VERBOSE_ERRORS` (`1` to include raw loader details)
 
 Media playback note:
 - YouTube Live and other livestreams often require H264/AAC support.
-- If your CEF build does not include `libffmpeg.dylib` with proprietary codecs enabled, livestream playback can fail with "Your browser can't play this video."
-- Switchboard stages runtime libs from both `Chromium Embedded Framework.framework/Libraries` and the CEF `Release` directory (including `libffmpeg.dylib` when present) into the subprocess directory at startup.
+- The standard packaged CEF framework does not dynamically load a standalone `libffmpeg.dylib`; copying one into the bundle does not enable proprietary codecs.
+- H264/AAC support requires a complete matching CEF build with the appropriate Chromium codec flags and a separate licensing review; see [issue #1](https://github.com/porthorian/switchboard/issues/1).
 
 Note on macOS keychain prompts:
 - CEF/Chromium uses the login keychain by default (`Chromium Safe Storage` entry).
 - Upstream Chromium does not provide a simple runtime switch for a custom keychain name like `Switchboard`; that requires deeper platform customization.
-- For local development, mock keychain mode avoids repeated prompts.
+- Development builds use the real macOS Keychain. Mock Keychain behavior is limited to the automated smoke bundle.
+
+## Current product scope
+
+Switchboard supports Rust-authoritative profiles/workspaces, arbitrary-depth tab trees, completion/archive, snooze, Lazy Search, per-profile history, two-pane split state, focus mode, Browser/Insert modes, native Chromium history, and a two-visible-plus-eight-warm lifecycle budget. Password/extension controls are deliberately absent; see [the compatibility gate](docs/PASSWORD_EXTENSION_COMPATIBILITY.md).
 
 ## CEF bindings generation
 
-The `switchboard-cef-sys` crate supports optional bindgen-driven CEF bindings generation.
+Normal builds consume the checked-in bindings snapshot generated from CEF `145.0.26+g6ed7554+chromium-145.0.7632.110` with API version `14500`. Regeneration is an explicit developer action and rejects a mismatched distribution.
 
 ```bash
-./scripts/generate_cef_bindings.sh <cef_header> [cef_include_dir]
-```
-
-Or directly via env vars:
-
-```bash
-SWITCHBOARD_CEF_GENERATE_BINDINGS=1 \
-SWITCHBOARD_CEF_HEADER=/path/to/cef/include/capi/cef_app_capi.h \
-SWITCHBOARD_CEF_INCLUDE_DIR=/path/to/cef/include \
-cargo check -p switchboard-cef-sys
+./scripts/generate_cef_bindings.sh /absolute/path/to/cef_binary_145...
+./scripts/generate_cef_bindings.sh --check /absolute/path/to/cef_binary_145...
 ```

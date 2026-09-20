@@ -109,14 +109,20 @@ Agents must not:
 Valid states:
 
 * Active
+* Secondary
 * Warm
 * Discarded
+* Restoring
 
 Agents must:
 
 * Maintain LRU warm pool limits
+* Permit at most two visible tabs in the active workspace
+* Exclude both visible tabs from the eight-tab warm budget
+* Retain zero live CEF views for inactive profiles
 * Discard non-active workspace tabs first
 * Prevent duplicate live CEF instances for the same tab
+* Require a matching `(tab_id, browser_generation)` frame commit before creating a discarded tab's CEF view
 
 Agents must not:
 
@@ -131,21 +137,26 @@ Agents must not:
 
 * SNAPSHOT
 * PATCH
+* RESTORE_REQUESTED
 
 ## UI → Rust
 
 * Intents only
+* Versioned, bounded, typed `serde` envelopes only
 
 Agents must:
 
 * Maintain revision integrity
 * Ensure patches are minimal and deterministic
 * Provide resync path if revision mismatch occurs
+* Validate the exact privileged UI browser, main frame, `app://ui` origin, protocol version, payload size, and message shape
+* Ignore callbacks and frame commits from obsolete browser generations
 
 Agents must not:
 
 * Stream high-frequency micro events unnecessarily
 * Send UI-specific layout data from Rust
+* Reintroduce `window.prompt` or polling as a bridge transport
 
 ---
 
@@ -213,4 +224,3 @@ Determinism > Magic
 Explicit State > Implicit Behavior
 
 Agents should optimize for clarity, isolation, and long-term maintainability over short-term convenience.
-

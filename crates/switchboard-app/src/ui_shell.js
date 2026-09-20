@@ -1,9 +1,10 @@
-const marker = "__switchboard_intent__";
 const key = "switchboard.active_uri";
+const BRIDGE_PROTOCOL_VERSION = 1;
 
 const input = document.getElementById("url");
 const backButton = document.getElementById("nav-back");
 const forwardButton = document.getElementById("nav-forward");
+const reloadButton = document.getElementById("nav-reload");
 const profileMenuButton = document.getElementById("profile-menu-button");
 const profileMenuLabel = document.getElementById("profile-menu-label");
 const profileMenuPopover = document.getElementById("profile-menu-popover");
@@ -23,13 +24,20 @@ const workspaceTitleInput = document.getElementById("workspace-title-input");
 const workspaceDelete = document.getElementById("workspace-delete");
 const tabList = document.getElementById("tab-list");
 const tabNew = document.getElementById("tab-new");
+const archiveOpen = document.getElementById("archive-open");
 const devtoolsToggle = document.getElementById("devtools-toggle");
+const splitToggle = document.getElementById("split-toggle");
+const splitRatio = document.getElementById("split-ratio");
+const restorePlaceholder = document.getElementById("restore-placeholder");
+const focusToggle = document.getElementById("focus-toggle");
+const modeIndicator = document.getElementById("mode-indicator");
 const settingsToggle = document.getElementById("settings-toggle");
 const settingsBackdrop = document.getElementById("settings-backdrop");
 const commandBackdrop = document.getElementById("command-backdrop");
 const commandPanel = document.getElementById("command-panel");
 const commandForm = document.getElementById("command-form");
 const commandInput = document.getElementById("command-input");
+const commandResults = document.getElementById("command-results");
 const settingsPanel = document.getElementById("settings-panel");
 const settingsClose = document.getElementById("settings-close");
 const settingsSearchEngine = document.getElementById("settings-search-engine");
@@ -41,21 +49,6 @@ const settingsKeybindingCloseTab = document.getElementById("settings-keybinding-
 const settingsKeybindingCommand = document.getElementById("settings-keybinding-command");
 const settingsKeybindingFocusNav = document.getElementById("settings-keybinding-focus-nav");
 const settingsKeybindingDevTools = document.getElementById("settings-keybinding-devtools");
-const settingsPasswordManagerProfileNote = document.getElementById(
-  "settings-password-manager-profile-note"
-);
-const settingsPasswordManagerProvider = document.getElementById(
-  "settings-password-manager-provider"
-);
-const settingsPasswordManagerAutofill = document.getElementById(
-  "settings-password-manager-autofill"
-);
-const settingsPasswordManagerSavePrompt = document.getElementById(
-  "settings-password-manager-save-prompt"
-);
-const settingsPasswordManagerFallback = document.getElementById(
-  "settings-password-manager-fallback"
-);
 
 const TAB_ROW_HEIGHT = 56;
 const TAB_OVERSCAN = 6;
@@ -68,15 +61,6 @@ const KEYBINDING_CLOSE_TAB_SETTING_KEY = "keybinding_close_tab";
 const KEYBINDING_COMMAND_PALETTE_SETTING_KEY = "keybinding_command_palette";
 const KEYBINDING_FOCUS_NAVIGATION_SETTING_KEY = "keybinding_focus_navigation";
 const KEYBINDING_TOGGLE_DEVTOOLS_SETTING_KEY = "keybinding_toggle_devtools";
-const PASSWORD_MANAGER_DEFAULT_PROVIDER_SETTING_KEY = "password_manager.default_provider";
-const PASSWORD_MANAGER_DEFAULT_AUTOFILL_SETTING_KEY = "password_manager.default_autofill";
-const PASSWORD_MANAGER_DEFAULT_SAVE_PROMPT_SETTING_KEY =
-  "password_manager.default_save_prompt";
-const PASSWORD_MANAGER_DEFAULT_FALLBACK_SETTING_KEY = "password_manager.default_fallback";
-const PASSWORD_MANAGER_PROVIDER_PROFILE_PREFIX = "password_manager.provider.profile.";
-const PASSWORD_MANAGER_AUTOFILL_PROFILE_PREFIX = "password_manager.autofill.profile.";
-const PASSWORD_MANAGER_SAVE_PROMPT_PROFILE_PREFIX = "password_manager.save_prompt.profile.";
-const PASSWORD_MANAGER_FALLBACK_PROFILE_PREFIX = "password_manager.fallback.profile.";
 const DEFAULT_SEARCH_ENGINE = "google";
 const DEFAULT_HOMEPAGE = "https://youtube.com";
 const DEFAULT_NEW_TAB_BEHAVIOR = "homepage";
@@ -85,9 +69,6 @@ const DEFAULT_KEYBINDING_CLOSE_TAB = "mod+w";
 const DEFAULT_KEYBINDING_COMMAND_PALETTE = "space";
 const DEFAULT_KEYBINDING_FOCUS_NAVIGATION = "mod+l";
 const DEFAULT_KEYBINDING_TOGGLE_DEVTOOLS = "mod+shift+i";
-const PASSWORD_MANAGER_PROVIDERS = new Set(["builtin", "bitwarden", "1password", "lastpass", "none"]);
-const PASSWORD_MANAGER_SWITCHES = new Set(["enabled", "disabled"]);
-const PASSWORD_MANAGER_FALLBACKS = new Set(["builtin", "prompt", "none"]);
 const SEARCH_ENGINE_URLS = Object.freeze({
   google: "https://www.google.com/search?q=%s",
   duckduckgo: "https://duckduckgo.com/?q=%s",
@@ -114,8 +95,6 @@ const KEYBINDING_SPECIAL_KEYS = new Set([
   "pagedown",
 ]);
 
-let backStack = [];
-let forwardStack = [];
 let activeUri = normalizeUrl(localStorage.getItem(key)) || "https://youtube.com";
 let shellRevision = -1;
 let shellState = null;
@@ -126,6 +105,7 @@ let virtualTabs = [];
 let virtualActiveTabId = null;
 let lastRenderedProfileId = null;
 let lastRenderedWorkspaceId = null;
+let lastRenderedTabId = null;
 let virtualRenderPending = false;
 let virtualDataEpoch = 0;
 let virtualRenderKey = "";
@@ -134,16 +114,82 @@ let profileEditorMode = null;
 let profileEditorTargetId = null;
 let settingsPanelOpen = false;
 let commandPanelOpen = false;
+let commandSearchResults = [];
+let commandSelectedIndex = 0;
+const collapsedTabIds = new Set();
+let lazySearchCreatesTab = false;
+let lazySearchParentTabId = null;
+let keyboardMode = "browser";
+let focusMode = false;
+let snoozeTimer = null;
 let uiOverlayVisible = false;
 let websiteKeybindingsActive = false;
 let hostKeybindingsSignature = "";
+let bridgeRequestCounter = 0;
+const bridgeQueue = [];
+let bridgeSending = false;
+
+function postBridgeCommand(command) {
+  bridgeRequestCounter += 1;
+  bridgeQueue.push({
+    protocol_version: BRIDGE_PROTOCOL_VERSION,
+    request_id: `ui-${Date.now()}-${bridgeRequestCounter}`,
+    command,
+  });
+  flushBridgeQueue();
+}
+
+function flushBridgeQueue() {
+  if (bridgeSending || bridgeQueue.length === 0) return;
+  bridgeSending = true;
+  const envelope = bridgeQueue.shift();
+  const encoded = encodeURIComponent(JSON.stringify(envelope));
+  window.location.hash = `bridge=${encoded}`;
+  window.setTimeout(() => {
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+    bridgeSending = false;
+    flushBridgeQueue();
+  }, 0);
+}
+
+function parseLegacyCommand(payload) {
+  const [name, ...parts] = String(payload || "").trim().split(/\s+/);
+  const rest = String(payload || "").trim().slice(name.length).trim();
+  const number = (value) => Number.parseInt(value, 10);
+  switch (name) {
+    case "ui_ready": return { type: "ui_ready", ui_version: rest || "0.1.0-dev", last_revision: shellRevision >= 0 ? shellRevision : null };
+    case "navigate": return { type: "navigate_active", url: rest };
+    case "devtools_toggle": return { type: "toggle_dev_tools" };
+    case "switch_profile": return { type: "switch_profile", profile_id: number(parts[0]) };
+    case "delete_profile": return { type: "delete_profile", profile_id: number(parts[0]) };
+    case "rename_profile": return { type: "rename_profile", profile_id: number(parts[0]), name: parts.slice(1).join(" ") };
+    case "new_profile": return { type: "new_profile", name: rest };
+    case "new_workspace": return { type: "new_workspace", name: rest };
+    case "rename_workspace": return { type: "rename_workspace", workspace_id: number(parts[0]), name: parts.slice(1).join(" ") };
+    case "delete_workspace": return { type: "delete_workspace", workspace_id: number(parts[0]) };
+    case "switch_workspace": return { type: "switch_workspace", workspace_id: number(parts[0]) };
+    case "new_tab": return { type: "new_tab", workspace_id: number(parts[0]), url: null, make_active: true };
+    case "activate_tab": return { type: "activate_tab", tab_id: number(parts[0]) };
+    case "close_tab": return { type: "complete_tab", tab_id: number(parts[0]), completed_at_ms: Date.now() };
+    case "setting_set_text": return { type: "setting_set", key: parts[0], value: parts.slice(1).join(" ") };
+    case "ui_overlay": return { type: "set_ui_overlay", visible: parts[0] === "on" };
+    case "website_keybindings": return { type: "set_browser_mode", active: parts[0] === "on" };
+    case "keybindings_sync": return {
+      type: "sync_keybindings",
+      close_tab: parts[0],
+      command_palette: parts[1],
+      focus_navigation: parts[2],
+      toggle_devtools: parts[3],
+    };
+    case "query_active_uri": return null;
+    default: return null;
+  }
+}
 
 function send(payload) {
-  try {
-    return window.prompt(marker, payload);
-  } catch (_error) {
-    return "";
-  }
+  const command = typeof payload === "string" ? parseLegacyCommand(payload) : payload;
+  if (command) postBridgeCommand(command);
+  return "";
 }
 
 function normalizeUrl(value) {
@@ -170,21 +216,6 @@ function normalizeNewTabBehavior(value) {
     return candidate;
   }
   return DEFAULT_NEW_TAB_BEHAVIOR;
-}
-
-function normalizePasswordManagerProvider(value) {
-  const candidate = (value || "").trim().toLowerCase();
-  return PASSWORD_MANAGER_PROVIDERS.has(candidate) ? candidate : "builtin";
-}
-
-function normalizePasswordManagerSwitch(value) {
-  const candidate = (value || "").trim().toLowerCase();
-  return PASSWORD_MANAGER_SWITCHES.has(candidate) ? candidate : "enabled";
-}
-
-function normalizePasswordManagerFallback(value) {
-  const candidate = (value || "").trim().toLowerCase();
-  return PASSWORD_MANAGER_FALLBACKS.has(candidate) ? candidate : "builtin";
 }
 
 function activeProfileIdFromState(sourceState = shellState) {
@@ -390,8 +421,9 @@ function syncHostKeybindings(
 
 function renderUri() {
   input.value = activeUri;
-  backButton.disabled = backStack.length === 0;
-  forwardButton.disabled = forwardStack.length === 0;
+  const activeTab = shellState ? deriveActiveContext(shellState).activeTab : null;
+  backButton.disabled = !activeTab?.can_go_back;
+  forwardButton.disabled = !activeTab?.can_go_forward;
 }
 
 function setActiveUri(next, pushHistory) {
@@ -400,11 +432,6 @@ function setActiveUri(next, pushHistory) {
     renderUri();
     return;
   }
-  if (pushHistory && activeUri) {
-    backStack.push(activeUri);
-    forwardStack = [];
-  }
-
   activeUri = next;
   localStorage.setItem(key, activeUri);
   renderUri();
@@ -424,29 +451,23 @@ function navigateFromInput() {
 }
 
 function goBack() {
-  if (backStack.length === 0) return;
-  if (activeUri) {
-    forwardStack.push(activeUri);
-  }
-  const previous = backStack.pop();
-  navigateTo(previous, false);
+  postBridgeCommand({ type: "go_back" });
 }
 
 function goForward() {
-  if (forwardStack.length === 0) return;
-  if (activeUri) {
-    backStack.push(activeUri);
-  }
-  const next = forwardStack.pop();
-  navigateTo(next, false);
+  postBridgeCommand({ type: "go_forward" });
+}
+
+function reload() {
+  postBridgeCommand({ type: "reload" });
 }
 
 function syncActiveUriFromHost() {
   if (document.hidden || document.activeElement === input || document.activeElement === commandInput) {
     return;
   }
-  const response = send("query_active_uri");
-  const hostUri = normalizeUrl(response);
+  const activeTab = shellState ? deriveActiveContext(shellState).activeTab : null;
+  const hostUri = normalizeUrl(activeTab?.url || "");
   if (!hostUri || hostUri === activeUri) return;
   setActiveUri(hostUri, true);
 }
@@ -458,6 +479,123 @@ function parseShellState(raw) {
   } catch (_error) {
     return null;
   }
+}
+
+function upsertById(items, value) {
+  const index = items.findIndex((item) => String(item.id) === String(value.id));
+  if (index >= 0) items[index] = value;
+  else items.push(value);
+}
+
+function applyPatchOperation(state, operation) {
+  switch (operation.type) {
+    case "upsert_profile":
+      upsertById(state.profiles, operation);
+      break;
+    case "upsert_workspace":
+      upsertById(state.workspaces, operation);
+      break;
+    case "upsert_tab":
+      upsertById(state.tabs, operation);
+      break;
+    case "remove_profile":
+      state.profiles = state.profiles.filter((item) => String(item.id) !== String(operation.profile_id));
+      break;
+    case "remove_workspace":
+      state.workspaces = state.workspaces.filter((item) => String(item.id) !== String(operation.workspace_id));
+      break;
+    case "remove_tab":
+      state.tabs = state.tabs.filter((item) => String(item.id) !== String(operation.tab_id));
+      break;
+    case "set_active_profile":
+      state.active_profile_id = operation.profile_id;
+      break;
+    case "set_active_workspace": {
+      const profile = state.profiles.find((item) => String(item.id) === String(operation.profile_id));
+      if (profile) profile.active_workspace_id = operation.workspace_id;
+      break;
+    }
+    case "set_active_tab": {
+      const workspace = state.workspaces.find((item) => String(item.id) === String(operation.workspace_id));
+      if (workspace) {
+        workspace.active_tab_id = operation.tab_id;
+        workspace.primary_tab_id = operation.tab_id;
+      }
+      break;
+    }
+    case "setting_changed":
+      state.settings[operation.key] = operation.value;
+      break;
+    default:
+      break;
+  }
+}
+
+function receiveSnapshot(snapshot) {
+  shellRevision = snapshot.revision;
+  shellState = snapshot;
+  renderShellState(snapshot);
+  scheduleNextSnoozeWake();
+  syncActiveUriFromHost();
+}
+
+function receivePatch(patch) {
+  if (!shellState || patch.from_revision !== shellRevision) {
+    postBridgeCommand({ type: "request_resync", last_revision: shellRevision >= 0 ? shellRevision : null });
+    return;
+  }
+  for (const operation of patch.ops || []) applyPatchOperation(shellState, operation);
+  shellRevision = patch.to_revision;
+  shellState.revision = shellRevision;
+  renderShellState(shellState);
+  scheduleNextSnoozeWake();
+  syncActiveUriFromHost();
+}
+
+window.switchboardReceive = (payload) => {
+  let envelope;
+  try {
+    envelope = typeof payload === "string" ? JSON.parse(payload) : payload;
+  } catch (_error) {
+    return;
+  }
+  if (!envelope || envelope.protocol_version !== BRIDGE_PROTOCOL_VERSION) return;
+  const message = envelope.message || {};
+  if (message.type === "snapshot" && message.snapshot) {
+    receiveSnapshot(message.snapshot);
+  } else if (message.type === "patch" && message.patch) {
+    receivePatch(message.patch);
+  } else if (message.type === "restore_requested") {
+    const tabId = Number(message.tab_id);
+    const generation = Number(message.generation);
+    if (Number.isFinite(tabId) && Number.isFinite(generation)) {
+      window.requestAnimationFrame(() => {
+        postBridgeCommand({ type: "frame_committed", tab_id: tabId, generation });
+      });
+    }
+  } else if (message.type === "active_uri" && message.url) {
+    setActiveUri(message.url, false);
+  } else if (message.type === "search_results") {
+    renderSearchResults(message.results || []);
+  }
+};
+
+function scheduleNextSnoozeWake() {
+  if (snoozeTimer !== null) {
+    window.clearTimeout(snoozeTimer);
+    snoozeTimer = null;
+  }
+  const wakeTimes = (shellState?.tabs || [])
+    .filter((tab) => tab.status?.kind === "snoozed")
+    .map((tab) => Number(tab.status.wake_at_ms))
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+  if (wakeTimes.length === 0) return;
+  const delay = Math.max(0, Math.min(wakeTimes[0] - Date.now(), 2_147_000_000));
+  snoozeTimer = window.setTimeout(() => {
+    snoozeTimer = null;
+    postBridgeCommand({ type: "wake_snoozed", now_ms: Date.now() });
+  }, delay);
 }
 
 function syncSettingsControlsFromState(state) {
@@ -559,82 +697,6 @@ function syncSettingsControlsFromState(state) {
     keybindingDevTools
   );
 
-  const activeProfileId = activeProfileIdFromState(state);
-  const activeProfile = (state.profiles || []).find(
-    (profile) => String(profile.id) === String(activeProfileId)
-  );
-  if (activeProfileId) {
-    settingsPasswordManagerProfileNote.textContent = `Applies to ${profileDisplayName(activeProfile)} (Profile ${activeProfileId}).`;
-  } else {
-    settingsPasswordManagerProfileNote.textContent = "No active profile.";
-  }
-
-  const provider = normalizePasswordManagerProvider(
-    profileScopedSettingText(
-      PASSWORD_MANAGER_PROVIDER_PROFILE_PREFIX,
-      PASSWORD_MANAGER_DEFAULT_PROVIDER_SETTING_KEY,
-      "builtin",
-      state
-    )
-  );
-  if (
-    document.activeElement !== settingsPasswordManagerProvider &&
-    settingsPasswordManagerProvider.value !== provider
-  ) {
-    settingsPasswordManagerProvider.value = provider;
-  }
-
-  const autofill = normalizePasswordManagerSwitch(
-    profileScopedSettingText(
-      PASSWORD_MANAGER_AUTOFILL_PROFILE_PREFIX,
-      PASSWORD_MANAGER_DEFAULT_AUTOFILL_SETTING_KEY,
-      "enabled",
-      state
-    )
-  );
-  if (
-    document.activeElement !== settingsPasswordManagerAutofill &&
-    settingsPasswordManagerAutofill.value !== autofill
-  ) {
-    settingsPasswordManagerAutofill.value = autofill;
-  }
-
-  const savePrompt = normalizePasswordManagerSwitch(
-    profileScopedSettingText(
-      PASSWORD_MANAGER_SAVE_PROMPT_PROFILE_PREFIX,
-      PASSWORD_MANAGER_DEFAULT_SAVE_PROMPT_SETTING_KEY,
-      "enabled",
-      state
-    )
-  );
-  if (
-    document.activeElement !== settingsPasswordManagerSavePrompt &&
-    settingsPasswordManagerSavePrompt.value !== savePrompt
-  ) {
-    settingsPasswordManagerSavePrompt.value = savePrompt;
-  }
-
-  const fallback = normalizePasswordManagerFallback(
-    profileScopedSettingText(
-      PASSWORD_MANAGER_FALLBACK_PROFILE_PREFIX,
-      PASSWORD_MANAGER_DEFAULT_FALLBACK_SETTING_KEY,
-      "builtin",
-      state
-    )
-  );
-  if (
-    document.activeElement !== settingsPasswordManagerFallback &&
-    settingsPasswordManagerFallback.value !== fallback
-  ) {
-    settingsPasswordManagerFallback.value = fallback;
-  }
-
-  const passwordControlsEnabled = Boolean(activeProfileId);
-  settingsPasswordManagerProvider.disabled = !passwordControlsEnabled;
-  settingsPasswordManagerAutofill.disabled = !passwordControlsEnabled;
-  settingsPasswordManagerSavePrompt.disabled = !passwordControlsEnabled;
-  settingsPasswordManagerFallback.disabled = !passwordControlsEnabled;
-
   settingsCustomUrlField.hidden = behavior !== "custom";
 }
 
@@ -667,42 +729,6 @@ function commitKeybindingSetting(inputElement, settingKey, fallback) {
   const normalized = normalizeKeybinding(inputElement.value, fallback);
   inputElement.value = normalized;
   commitTextSetting(settingKey, normalized);
-}
-
-function commitActiveProfileTextSetting(prefix, value) {
-  const profileKey = profileScopedSettingKey(prefix);
-  if (!profileKey) return;
-  const normalized = (value || "").trim();
-  if (!normalized) return;
-  const current = shellSettingText(profileKey, "");
-  if (current === normalized) return;
-  setLocalSettingValue(profileKey, normalized);
-  send(`setting_set_text ${profileKey} ${normalized}`);
-  queueStateRefresh();
-}
-
-function commitPasswordManagerProviderSetting() {
-  const normalized = normalizePasswordManagerProvider(settingsPasswordManagerProvider.value);
-  settingsPasswordManagerProvider.value = normalized;
-  commitActiveProfileTextSetting(PASSWORD_MANAGER_PROVIDER_PROFILE_PREFIX, normalized);
-}
-
-function commitPasswordManagerAutofillSetting() {
-  const normalized = normalizePasswordManagerSwitch(settingsPasswordManagerAutofill.value);
-  settingsPasswordManagerAutofill.value = normalized;
-  commitActiveProfileTextSetting(PASSWORD_MANAGER_AUTOFILL_PROFILE_PREFIX, normalized);
-}
-
-function commitPasswordManagerSavePromptSetting() {
-  const normalized = normalizePasswordManagerSwitch(settingsPasswordManagerSavePrompt.value);
-  settingsPasswordManagerSavePrompt.value = normalized;
-  commitActiveProfileTextSetting(PASSWORD_MANAGER_SAVE_PROMPT_PROFILE_PREFIX, normalized);
-}
-
-function commitPasswordManagerFallbackSetting() {
-  const normalized = normalizePasswordManagerFallback(settingsPasswordManagerFallback.value);
-  settingsPasswordManagerFallback.value = normalized;
-  commitActiveProfileTextSetting(PASSWORD_MANAGER_FALLBACK_PROFILE_PREFIX, normalized);
 }
 
 function syncUiOverlayVisibility() {
@@ -767,18 +793,126 @@ function toggleSettingsPanel() {
   }
 }
 
-function openCommandPanel() {
+function requestLazySearch() {
+  postBridgeCommand({ type: "search", query: commandInput.value, limit: 30 });
+}
+
+function renderSearchResults(results) {
+  commandSearchResults = Array.isArray(results) ? results : [];
+  commandSelectedIndex = Math.max(0, Math.min(commandSelectedIndex, commandSearchResults.length - 1));
+  const fragment = document.createDocumentFragment();
+  commandSearchResults.forEach((result, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `command-result${index === commandSelectedIndex ? " selected" : ""}`;
+    button.dataset.index = String(index);
+    button.setAttribute("role", "option");
+    button.setAttribute("aria-selected", index === commandSelectedIndex ? "true" : "false");
+    const title = document.createElement("span");
+    title.className = "command-result-title";
+    title.textContent = result.title || result.url || "Untitled";
+    const kind = document.createElement("span");
+    kind.className = "command-result-kind";
+    kind.textContent = String(result.kind || "").replaceAll("_", " ");
+    const subtitle = document.createElement("span");
+    subtitle.className = "command-result-subtitle";
+    subtitle.textContent = result.subtitle || "";
+    button.append(title, kind, subtitle);
+    button.addEventListener("click", () => executeSearchResult(result));
+    if (result.kind === "archived_tab" && result.tab_id) {
+      button.title = "Click to restore · Right-click to permanently delete";
+      button.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
+        if (window.confirm(`Permanently delete “${result.title || "this tab"}”?`)) {
+          postBridgeCommand({ type: "permanently_delete_tab", tab_id: Number(result.tab_id) });
+          requestLazySearch();
+        }
+      });
+    }
+    fragment.appendChild(button);
+  });
+  commandResults.replaceChildren(fragment);
+}
+
+function executeSearchCommand(command) {
+  switch (command) {
+    case "new_workspace": createWorkspace(); break;
+    case "show_archive": openCommandPanel({ initial: "done:", createsTab: false }); break;
+    case "toggle_split": toggleSplitView(); break;
+    case "toggle_focus": toggleFocusMode(); break;
+    case "open_settings": openSettingsPanel(); break;
+    case "clear_profile_history": {
+      const profileId = activeProfileIdFromState();
+      if (profileId) postBridgeCommand({ type: "clear_profile_history", profile_id: Number(profileId) });
+      break;
+    }
+    case "clear_archive": {
+      const profileId = activeProfileIdFromState();
+      if (profileId && window.confirm("Permanently delete all unlocked completed tabs in this profile?")) {
+        postBridgeCommand({ type: "clear_archive", profile_id: Number(profileId) });
+      }
+      break;
+    }
+    default: break;
+  }
+}
+
+function executeSearchResult(result) {
+  if (!result) return;
+  closeCommandPanel();
+  if (result.kind === "command") {
+    executeSearchCommand(result.command);
+    return;
+  }
+  if (result.kind === "open_tab" && result.tab_id) {
+    postBridgeCommand({ type: "activate_tab", tab_id: Number(result.tab_id) });
+    return;
+  }
+  if (result.kind === "archived_tab" && result.tab_id) {
+    postBridgeCommand({ type: "restore_tab", tab_id: Number(result.tab_id) });
+    postBridgeCommand({ type: "activate_tab", tab_id: Number(result.tab_id) });
+    return;
+  }
+  if (result.url) {
+    const { activeWorkspace } = deriveActiveContext(shellState || {});
+    if (lazySearchParentTabId && activeWorkspace) {
+      postBridgeCommand({
+        type: "new_subtab",
+        workspace_id: Number(activeWorkspace.id),
+        parent_tab_id: Number(lazySearchParentTabId),
+        url: result.url,
+        make_active: true,
+      });
+    } else if (lazySearchCreatesTab && activeWorkspace) {
+      postBridgeCommand({
+        type: "new_tab",
+        workspace_id: Number(activeWorkspace.id),
+        url: result.url,
+        make_active: true,
+      });
+    } else {
+      postBridgeCommand({ type: "navigate_active", url: result.url });
+    }
+  }
+}
+
+function openCommandPanel(options = {}) {
   if (commandPanelOpen) return;
   if (settingsPanelOpen) closeSettingsPanel();
   closeProfileMenu();
+  lazySearchCreatesTab = Boolean(options.createsTab);
+  lazySearchParentTabId = options.parentTabId || null;
   commandPanelOpen = true;
   commandBackdrop.hidden = false;
   commandPanel.hidden = false;
-  commandInput.value = activeUri;
+  commandInput.value = options.initial || "";
+  commandSearchResults = [];
+  commandSelectedIndex = 0;
+  commandResults.replaceChildren();
   syncUiOverlayVisibility();
   window.requestAnimationFrame(() => {
     commandInput.focus();
-    commandInput.select();
+    requestLazySearch();
   });
 }
 
@@ -791,10 +925,28 @@ function closeCommandPanel() {
 }
 
 function navigateFromCommandPanel() {
+  const selected = commandSearchResults[commandSelectedIndex];
+  if (selected) {
+    executeSearchResult(selected);
+    return;
+  }
   const next = normalizeNavigationInput(commandInput.value);
   if (!next) return;
+  const { activeWorkspace } = deriveActiveContext(shellState || {});
   closeCommandPanel();
-  navigateTo(next, true);
+  if (lazySearchParentTabId && activeWorkspace) {
+    postBridgeCommand({
+      type: "new_subtab",
+      workspace_id: Number(activeWorkspace.id),
+      parent_tab_id: Number(lazySearchParentTabId),
+      url: next,
+      make_active: true,
+    });
+  } else if (lazySearchCreatesTab && activeWorkspace) {
+    postBridgeCommand({ type: "new_tab", workspace_id: Number(activeWorkspace.id), url: next, make_active: true });
+  } else {
+    postBridgeCommand({ type: "navigate_active", url: next });
+  }
 }
 
 function focusTopNavigationInput() {
@@ -986,6 +1138,43 @@ function renderWorkspaceRail(orderedWorkspaces, activeWorkspaceId) {
   });
 }
 
+function tabDepth(tab) {
+  if (!shellState || !tab?.parent_tab_id) return 0;
+  const tabs = new Map((shellState.tabs || []).map((candidate) => [String(candidate.id), candidate]));
+  const seen = new Set();
+  let parentId = tab.parent_tab_id;
+  let depth = 0;
+  while (parentId && depth < 12 && !seen.has(String(parentId))) {
+    seen.add(String(parentId));
+    const parent = tabs.get(String(parentId));
+    if (!parent) break;
+    depth += 1;
+    parentId = parent.parent_tab_id;
+  }
+  return depth;
+}
+
+function visibleTreeTabs(orderedTabs) {
+  const byId = new Map(orderedTabs.map((tab) => [String(tab.id), tab]));
+  return orderedTabs.filter((tab) => {
+    const seen = new Set();
+    let parentId = tab.parent_tab_id;
+    while (parentId && !seen.has(String(parentId))) {
+      if (collapsedTabIds.has(String(parentId))) return false;
+      seen.add(String(parentId));
+      parentId = byId.get(String(parentId))?.parent_tab_id;
+    }
+    return true;
+  });
+}
+
+function toggleTabCollapsed(tabId) {
+  const key = String(tabId);
+  if (collapsedTabIds.has(key)) collapsedTabIds.delete(key);
+  else collapsedTabIds.add(key);
+  if (shellState) renderShellState(shellState);
+}
+
 function createTabButton(tab, isActive) {
   const label = tabLabel(tab);
   const button = document.createElement("button");
@@ -993,6 +1182,8 @@ function createTabButton(tab, isActive) {
   button.className = "tab-item";
   button.dataset.tabId = String(tab.id);
   button.dataset.tabUrl = tab.url || "";
+  button.draggable = true;
+  button.style.paddingLeft = `${8 + tabDepth(tab) * 16}px`;
   if (isActive) {
     button.classList.add("active");
   }
@@ -1000,12 +1191,22 @@ function createTabButton(tab, isActive) {
     button.classList.add("loading");
   }
 
+  const hasChildren = (shellState?.tabs || []).some(
+    (candidate) => String(candidate.parent_tab_id || "") === String(tab.id)
+      && candidate.status?.kind === "open"
+  );
+  const disclosure = document.createElement("span");
+  disclosure.className = `tab-disclosure${hasChildren ? "" : " empty"}`;
+  disclosure.textContent = collapsedTabIds.has(String(tab.id)) ? "▸" : "▾";
+  disclosure.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (hasChildren) toggleTabCollapsed(tab.id);
+  });
+  button.appendChild(disclosure);
+
   const icon = document.createElement("span");
   icon.className = "tab-icon";
-  if (tab.thumbnail_data_url) {
-    icon.classList.add("thumbnail");
-    icon.style.backgroundImage = `url("${tab.thumbnail_data_url}")`;
-  }
   icon.textContent = label.slice(0, 1).toUpperCase();
   button.appendChild(icon);
 
@@ -1014,7 +1215,7 @@ function createTabButton(tab, isActive) {
 
   const title = document.createElement("span");
   title.className = "tab-title";
-  title.textContent = label;
+  title.textContent = `${tab.pinned ? "● " : ""}${tab.locked ? "🔒 " : ""}${label}`;
   content.appendChild(title);
 
   const url = document.createElement("span");
@@ -1031,6 +1232,7 @@ function createTabButton(tab, isActive) {
   close.setAttribute("aria-label", "Close tab");
   close.title = "Close tab";
   close.textContent = "×";
+  close.disabled = Boolean(tab.locked);
   button.appendChild(close);
 
   return button;
@@ -1169,18 +1371,33 @@ function renderShellState(state) {
 
   renderProfileControls(orderedProfiles, activeProfile);
   renderWorkspaceRail(orderedWorkspaces, activeWorkspaceId);
-  if (lastRenderedProfileId !== activeProfileId || lastRenderedWorkspaceId !== activeWorkspaceId) {
+  if (
+    lastRenderedProfileId !== activeProfileId ||
+    lastRenderedWorkspaceId !== activeWorkspaceId ||
+    lastRenderedTabId !== activeTabId
+  ) {
     tabList.scrollTop = 0;
+    setKeyboardMode("browser");
     lastRenderedProfileId = activeProfileId;
     lastRenderedWorkspaceId = activeWorkspaceId;
+    lastRenderedTabId = activeTabId;
   }
-  setVirtualTabState(orderedTabs, activeTabId);
+  setVirtualTabState(visibleTreeTabs(orderedTabs), activeTabId);
   renderVirtualTabList();
 
   tabNew.disabled = !activeWorkspaceId;
   workspaceTitleWrap.classList.toggle("disabled", !activeWorkspaceId);
   workspaceTitleWrap.setAttribute("tabindex", activeWorkspaceId ? "0" : "-1");
   workspaceDelete.disabled = !activeWorkspaceId || orderedWorkspaces.length <= 1;
+  splitToggle.setAttribute("aria-pressed", activeWorkspace?.split_enabled ? "true" : "false");
+  splitToggle.disabled = !activeTab;
+  splitRatio.hidden = !activeWorkspace?.split_enabled;
+  splitRatio.value = String(Math.round(Number(activeWorkspace?.split_ratio || 0.5) * 100));
+  const secondaryTab = activeWorkspace?.secondary_tab_id
+    ? (state.tabs || []).find((tab) => String(tab.id) === String(activeWorkspace.secondary_tab_id))
+    : null;
+  restorePlaceholder.hidden =
+    activeTab?.runtime_state !== "restoring" && secondaryTab?.runtime_state !== "restoring";
 
   if (activeTab && activeTab.url && document.activeElement !== input) {
     setActiveUri(normalizeUrl(activeTab.url), false);
@@ -1189,20 +1406,15 @@ function renderShellState(state) {
 }
 
 function syncShellStateFromHost(force) {
-  const raw = send("query_shell_state");
-  const next = parseShellState(raw);
-  if (!next) return;
-  if (!force && next.revision === shellRevision) return;
-  shellRevision = next.revision;
-  shellState = next;
-  renderShellState(next);
+  if (!force && shellState) return;
+  postBridgeCommand({
+    type: "request_resync",
+    last_revision: shellRevision >= 0 ? shellRevision : null,
+  });
 }
 
 function queueStateRefresh() {
-  window.setTimeout(() => {
-    syncShellStateFromHost(true);
-    syncActiveUriFromHost();
-  }, 180);
+  // Rust pushes the resulting revisioned patch after the committed SQLite write.
 }
 
 function nextWorkspaceName() {
@@ -1420,8 +1632,105 @@ function createTabInActiveWorkspace() {
   if (!shellState) return;
   const { activeWorkspace } = deriveActiveContext(shellState);
   if (!activeWorkspace) return;
-  send(`new_tab ${activeWorkspace.id}`);
-  queueStateRefresh();
+  openCommandPanel({ createsTab: true });
+}
+
+function openArchivePanel() {
+  openCommandPanel({ initial: "done:", createsTab: false });
+}
+
+function toggleSplitView() {
+  if (!shellState) return;
+  const { activeWorkspace, activeTab, orderedTabs } = deriveActiveContext(shellState);
+  if (!activeWorkspace) return;
+  if (activeWorkspace.split_enabled) {
+    postBridgeCommand({ type: "clear_split", workspace_id: Number(activeWorkspace.id) });
+    return;
+  }
+  const secondary = orderedTabs.find((tab) => !activeTab || String(tab.id) !== String(activeTab.id));
+  if (secondary) {
+    postBridgeCommand({
+      type: "set_secondary_tab",
+      workspace_id: Number(activeWorkspace.id),
+      tab_id: Number(secondary.id),
+    });
+  } else {
+    openCommandPanel({ createsTab: true });
+  }
+}
+
+function setKeyboardMode(mode) {
+  const next = mode === "insert" ? "insert" : "browser";
+  if (keyboardMode === next) return;
+  keyboardMode = next;
+  modeIndicator.textContent = next.toUpperCase();
+  modeIndicator.classList.toggle("insert", next === "insert");
+  syncWebsiteKeybindingsActive();
+}
+
+function toggleFocusMode() {
+  focusMode = !focusMode;
+  document.body.classList.toggle("focus-mode", focusMode);
+  focusToggle.setAttribute("aria-pressed", focusMode ? "true" : "false");
+  postBridgeCommand({ type: "set_focus_mode", active: focusMode });
+}
+
+function activateRelativeTab(step) {
+  if (!shellState) return;
+  const { activeTab, orderedTabs } = deriveActiveContext(shellState);
+  if (!activeTab || orderedTabs.length < 2) return;
+  const index = orderedTabs.findIndex((tab) => String(tab.id) === String(activeTab.id));
+  const next = orderedTabs[(index + step + orderedTabs.length) % orderedTabs.length];
+  if (next) postBridgeCommand({ type: "activate_tab", tab_id: Number(next.id) });
+}
+
+function activateRelativeWorkspace(step) {
+  if (!shellState) return;
+  const { activeWorkspace, orderedWorkspaces } = deriveActiveContext(shellState);
+  if (!activeWorkspace || orderedWorkspaces.length < 2) return;
+  const index = orderedWorkspaces.findIndex((workspace) => String(workspace.id) === String(activeWorkspace.id));
+  const next = orderedWorkspaces[(index + step + orderedWorkspaces.length) % orderedWorkspaces.length];
+  if (next) postBridgeCommand({ type: "switch_workspace", workspace_id: Number(next.id) });
+}
+
+function snoozeTab(tab) {
+  if (!tab || tab.locked) return;
+  const choice = window.prompt("Snooze until: later today, tomorrow, next week, or enter a local date/time", "tomorrow");
+  if (!choice) return;
+  const now = new Date();
+  let wake;
+  if (choice.trim().toLowerCase() === "later today") {
+    wake = new Date(now);
+    wake.setHours(Math.max(now.getHours() + 2, 17), 0, 0, 0);
+  } else if (choice.trim().toLowerCase() === "tomorrow") {
+    wake = new Date(now);
+    wake.setDate(wake.getDate() + 1);
+    wake.setHours(9, 0, 0, 0);
+  } else if (choice.trim().toLowerCase() === "next week") {
+    wake = new Date(now);
+    wake.setDate(wake.getDate() + 7);
+    wake.setHours(9, 0, 0, 0);
+  } else {
+    wake = new Date(choice);
+  }
+  if (!Number.isFinite(wake.getTime()) || wake.getTime() <= Date.now()) return;
+  postBridgeCommand({ type: "snooze_tab", tab_id: Number(tab.id), wake_at_ms: wake.getTime() });
+}
+
+function snoozeActiveTab() {
+  if (!shellState) return;
+  snoozeTab(deriveActiveContext(shellState).activeTab);
+}
+
+function restoreMostRecentCompletedTab() {
+  if (!shellState) return;
+  const completed = (shellState.tabs || [])
+    .filter((tab) => tab.status?.kind === "done")
+    .sort((left, right) => (right.status?.completed_at_ms || 0) - (left.status?.completed_at_ms || 0));
+  const tab = completed[0];
+  if (!tab) return;
+  postBridgeCommand({ type: "restore_tab", tab_id: Number(tab.id) });
+  postBridgeCommand({ type: "activate_tab", tab_id: Number(tab.id) });
 }
 
 function handleWorkspaceClick(event) {
@@ -1456,6 +1765,76 @@ function handleTabClick(event) {
   }
   send(`activate_tab ${tabId}`);
   queueStateRefresh();
+}
+
+function handleTabContextMenu(event) {
+  const target = event.target.closest(".tab-item");
+  if (!target || !shellState) return;
+  event.preventDefault();
+  const tab = (shellState.tabs || []).find((candidate) => String(candidate.id) === String(target.dataset.tabId));
+  if (!tab) return;
+  const action = window.prompt(
+    "Tab action: rename, subtab, pin, unpin, lock, unlock, snooze, done, split",
+    tab.locked ? "unlock" : "rename"
+  );
+  if (!action) return;
+  switch (action.trim().toLowerCase()) {
+    case "rename": {
+      const title = window.prompt("Tab name (empty restores the observed title)", tab.title || "");
+      if (title !== null) postBridgeCommand({ type: "rename_tab", tab_id: Number(tab.id), title });
+      break;
+    }
+    case "subtab": openCommandPanel({ createsTab: true, parentTabId: tab.id }); break;
+    case "pin": postBridgeCommand({ type: "pin_tab", tab_id: Number(tab.id), pinned: true }); break;
+    case "unpin": postBridgeCommand({ type: "pin_tab", tab_id: Number(tab.id), pinned: false }); break;
+    case "lock": postBridgeCommand({ type: "set_tab_locked", tab_id: Number(tab.id), locked: true }); break;
+    case "unlock": postBridgeCommand({ type: "set_tab_locked", tab_id: Number(tab.id), locked: false }); break;
+    case "snooze": {
+      snoozeTab(tab);
+      break;
+    }
+    case "done": postBridgeCommand({ type: "complete_tab", tab_id: Number(tab.id), completed_at_ms: Date.now() }); break;
+    case "split": {
+      const workspace = (shellState.workspaces || []).find((item) => String(item.id) === String(tab.workspace_id));
+      if (workspace) postBridgeCommand({ type: "set_secondary_tab", workspace_id: Number(workspace.id), tab_id: Number(tab.id) });
+      break;
+    }
+    default: break;
+  }
+}
+
+function handleTabDragStart(event) {
+  const target = event.target.closest(".tab-item");
+  if (!target || !event.dataTransfer) return;
+  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.setData("text/switchboard-tab", target.dataset.tabId || "");
+}
+
+function handleTabDrop(event) {
+  const target = event.target.closest(".tab-item");
+  if (!target || !event.dataTransfer || !shellState) return;
+  const draggedId = event.dataTransfer.getData("text/switchboard-tab");
+  const targetId = target.dataset.tabId;
+  if (!draggedId || !targetId || draggedId === targetId) return;
+  event.preventDefault();
+  const tabs = shellState.tabs || [];
+  const dragged = tabs.find((tab) => String(tab.id) === String(draggedId));
+  const destination = tabs.find((tab) => String(tab.id) === String(targetId));
+  const workspace = (shellState.workspaces || []).find((item) => String(item.id) === String(destination?.workspace_id));
+  if (!dragged || !destination || !workspace) return;
+  const asChild = event.altKey;
+  const parentId = asChild ? destination.id : destination.parent_tab_id;
+  const siblings = (workspace.tab_order || [])
+    .map((id) => tabs.find((tab) => String(tab.id) === String(id)))
+    .filter((tab) => tab && String(tab.parent_tab_id || "") === String(parentId || ""));
+  const index = asChild ? siblings.length : Math.max(0, siblings.findIndex((tab) => String(tab.id) === String(destination.id)));
+  postBridgeCommand({
+    type: "move_tab_tree",
+    tab_id: Number(dragged.id),
+    workspace_id: Number(workspace.id),
+    parent_tab_id: parentId ? Number(parentId) : null,
+    sibling_index: index,
+  });
 }
 
 function handleShortcutCloseTab(event) {
@@ -1502,15 +1881,6 @@ function handleShortcutToggleDevTools(event) {
   return true;
 }
 
-function startHostSyncLoop() {
-  function tick() {
-    syncActiveUriFromHost();
-    syncShellStateFromHost(false);
-    window.setTimeout(tick, 1200);
-  }
-  window.setTimeout(tick, 1200);
-}
-
 input.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
@@ -1519,6 +1889,7 @@ input.addEventListener("keydown", (event) => {
 });
 backButton.addEventListener("click", goBack);
 forwardButton.addEventListener("click", goForward);
+reloadButton.addEventListener("click", reload);
 devtoolsToggle.addEventListener("click", () => {
   toggleDevTools();
 });
@@ -1613,18 +1984,6 @@ settingsKeybindingDevTools.addEventListener("blur", () => {
     DEFAULT_KEYBINDING_TOGGLE_DEVTOOLS
   );
 });
-settingsPasswordManagerProvider.addEventListener("change", () => {
-  commitPasswordManagerProviderSetting();
-});
-settingsPasswordManagerAutofill.addEventListener("change", () => {
-  commitPasswordManagerAutofillSetting();
-});
-settingsPasswordManagerSavePrompt.addEventListener("change", () => {
-  commitPasswordManagerSavePromptSetting();
-});
-settingsPasswordManagerFallback.addEventListener("change", () => {
-  commitPasswordManagerFallbackSetting();
-});
 commandBackdrop.addEventListener("click", () => {
   closeCommandPanel();
 });
@@ -1632,10 +1991,23 @@ commandForm.addEventListener("submit", (event) => {
   event.preventDefault();
   navigateFromCommandPanel();
 });
+commandInput.addEventListener("input", () => {
+  commandSelectedIndex = 0;
+  requestLazySearch();
+});
 commandPanel.addEventListener("keydown", (event) => {
-  if (event.key !== "Escape") return;
-  event.preventDefault();
-  closeCommandPanel();
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeCommandPanel();
+    return;
+  }
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    if (commandSearchResults.length === 0) return;
+    const direction = event.key === "ArrowDown" ? 1 : -1;
+    commandSelectedIndex = (commandSelectedIndex + direction + commandSearchResults.length) % commandSearchResults.length;
+    renderSearchResults(commandSearchResults);
+  }
 });
 profileNew.addEventListener("click", createProfile);
 profileMenuButton.addEventListener("click", (event) => {
@@ -1760,11 +2132,36 @@ workspaceTitleWrap.addEventListener("mouseleave", () => {
 });
 workspaceList.addEventListener("click", handleWorkspaceClick);
 tabList.addEventListener("click", handleTabClick);
+tabList.addEventListener("contextmenu", handleTabContextMenu);
+tabList.addEventListener("dragstart", handleTabDragStart);
+tabList.addEventListener("dragover", (event) => event.preventDefault());
+tabList.addEventListener("drop", handleTabDrop);
 tabList.addEventListener("scroll", () => {
   if (virtualTabs.length <= 1) return;
   scheduleVirtualTabListRender();
 }, { passive: true });
 tabNew.addEventListener("click", createTabInActiveWorkspace);
+archiveOpen.addEventListener("click", openArchivePanel);
+splitToggle.addEventListener("click", toggleSplitView);
+splitToggle.addEventListener("contextmenu", (event) => {
+  event.preventDefault();
+  if (!shellState) return;
+  const { activeWorkspace } = deriveActiveContext(shellState);
+  if (activeWorkspace?.split_enabled) {
+    postBridgeCommand({ type: "swap_split", workspace_id: Number(activeWorkspace.id) });
+  }
+});
+splitRatio.addEventListener("change", () => {
+  if (!shellState) return;
+  const { activeWorkspace } = deriveActiveContext(shellState);
+  if (!activeWorkspace?.split_enabled) return;
+  postBridgeCommand({
+    type: "set_split_ratio",
+    workspace_id: Number(activeWorkspace.id),
+    ratio: Number(splitRatio.value) / 100,
+  });
+});
+focusToggle.addEventListener("click", toggleFocusMode);
 document.addEventListener("focusin", () => {
   syncWebsiteKeybindingsActive();
 });
@@ -1790,15 +2187,61 @@ document.addEventListener("keydown", (event) => {
     closeProfileMenu();
     closeCommandPanel();
     closeSettingsPanel();
+    setKeyboardMode("browser");
     return;
   }
 
   if (commandPanelOpen || settingsPanelOpen) return;
-  if (shouldIgnoreGlobalShortcutTarget(event.target)) return;
   if (handleShortcutCommandPalette(event)) return;
   if (handleShortcutFocusNavigation(event)) return;
   if (handleShortcutCloseTab(event)) return;
   if (handleShortcutToggleDevTools(event)) return;
+  if (keyboardMode === "insert") return;
+  if (shouldIgnoreGlobalShortcutTarget(event.target)) return;
+
+  if (!event.metaKey && !event.ctrlKey && !event.altKey) {
+    const key = event.key.toLowerCase();
+    if (key === "i") {
+      event.preventDefault();
+      setKeyboardMode("insert");
+      return;
+    }
+    if (key === "j") {
+      event.preventDefault();
+      activateRelativeTab(1);
+      return;
+    }
+    if (key === "k") {
+      event.preventDefault();
+      activateRelativeTab(-1);
+      return;
+    }
+    if (key === "w") {
+      event.preventDefault();
+      activateRelativeWorkspace(1);
+      return;
+    }
+    if (key === "d") {
+      event.preventDefault();
+      closeActiveTabFromShortcut();
+      return;
+    }
+    if (key === "h") {
+      event.preventDefault();
+      snoozeActiveTab();
+      return;
+    }
+    if (key === "f") {
+      event.preventDefault();
+      toggleFocusMode();
+      return;
+    }
+    if (key === "z") {
+      event.preventDefault();
+      restoreMostRecentCompletedTab();
+      return;
+    }
+  }
 
   const hasPrimaryModifier = event.metaKey || event.ctrlKey;
   if (!hasPrimaryModifier || !event.shiftKey || event.altKey) return;
@@ -1822,6 +2265,10 @@ document.addEventListener("keydown", (event) => {
 
 window.__switchboardHostShortcut = (action) => {
   const normalized = String(action || "").trim().toLowerCase();
+  if (normalized === "reload") {
+    postBridgeCommand({ type: "reload" });
+    return true;
+  }
   if (normalized === "command_palette") {
     openCommandPanel();
     return true;
@@ -1838,14 +2285,21 @@ window.__switchboardHostShortcut = (action) => {
     toggleDevTools();
     return true;
   }
+  if (normalized === "enter_browser_mode") { setKeyboardMode("browser"); return true; }
+  if (normalized === "enter_insert_mode") { setKeyboardMode("insert"); return true; }
+  if (normalized === "next_tab") { activateRelativeTab(1); return true; }
+  if (normalized === "previous_tab") { activateRelativeTab(-1); return true; }
+  if (normalized === "next_workspace") { activateRelativeWorkspace(1); return true; }
+  if (normalized === "complete_tab") { closeActiveTabFromShortcut(); return true; }
+  if (normalized === "snooze_tab") { snoozeActiveTab(); return true; }
+  if (normalized === "toggle_focus") { toggleFocusMode(); return true; }
+  if (normalized === "restore_completed") { restoreMostRecentCompletedTab(); return true; }
+  if (normalized === "toggle_split") { toggleSplitView(); return true; }
   return false;
 };
 
 renderUri();
 send("ui_ready 0.1.0-dev");
-syncShellStateFromHost(true);
-syncActiveUriFromHost();
-startHostSyncLoop();
 window.addEventListener("focus", () => {
   syncShellStateFromHost(true);
   syncActiveUriFromHost();

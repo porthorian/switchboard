@@ -1,81 +1,38 @@
-#![cfg_attr(test, allow(dead_code))]
-
-use std::env;
 use std::error::Error;
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::fs;
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use switchboard_core::{
-    BrowserState, Persistence, Profile, ProfileId, SettingValue, Tab, TabId, TabRuntimeState,
-    Workspace, WorkspaceId,
+    BrowserState, HistoryEntry, Persistence, Profile, ProfileId, RestorePosition, SettingValue,
+    Tab, TabId, TabRuntimeState, TabStatus, Workspace, WorkspaceId,
 };
 
-const ENV_STATE_DB: &str = "SWITCHBOARD_STATE_DB";
+const SCHEMA_VERSION: i64 = 2;
 const META_SCHEMA_VERSION: &str = "schema_version";
+const META_REVISION: &str = "revision";
 const META_ACTIVE_PROFILE_ID: &str = "active_profile_id";
-const SCHEMA_VERSION: i64 = 1;
-
-const SQLITE_OK: c_int = 0;
-const SQLITE_OPEN_READWRITE: c_int = 0x0000_0002;
-const SQLITE_OPEN_CREATE: c_int = 0x0000_0004;
-
-#[repr(C)]
-struct sqlite3 {
-    _private: [u8; 0],
-}
-
-#[link(name = "sqlite3")]
-extern "C" {
-    fn sqlite3_open_v2(
-        filename: *const c_char,
-        pp_db: *mut *mut sqlite3,
-        flags: c_int,
-        z_vfs: *const c_char,
-    ) -> c_int;
-    fn sqlite3_close(db: *mut sqlite3) -> c_int;
-    fn sqlite3_exec(
-        db: *mut sqlite3,
-        sql: *const c_char,
-        callback: Option<
-            unsafe extern "C" fn(
-                arg: *mut c_void,
-                argc: c_int,
-                argv: *mut *mut c_char,
-                col_names: *mut *mut c_char,
-            ) -> c_int,
-        >,
-        arg: *mut c_void,
-        errmsg: *mut *mut c_char,
-    ) -> c_int;
-    fn sqlite3_errmsg(db: *mut sqlite3) -> *const c_char;
-    fn sqlite3_free(ptr: *mut c_void);
-}
+const ENV_STATE_DB_PATH: &str = "SWITCHBOARD_STATE_DB_PATH";
 
 pub struct AppPersistence {
-    store: SqliteStore,
-}
-
-struct SqliteStore {
-    db: *mut sqlite3,
+    connection: Connection,
 }
 
 #[derive(Debug)]
 pub enum AppPersistenceError {
     Io(std::io::Error),
-    Sqlite(String),
+    Sqlite(rusqlite::Error),
     InvalidData(String),
 }
 
 impl Display for AppPersistenceError {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
-            Self::Io(err) => write!(f, "filesystem error: {err}"),
-            Self::Sqlite(message) => write!(f, "sqlite error: {message}"),
-            Self::InvalidData(message) => write!(f, "invalid persisted data: {message}"),
+            Self::Io(error) => write!(f, "persistence I/O failed: {error}"),
+            Self::Sqlite(error) => write!(f, "SQLite operation failed: {error}"),
+            Self::InvalidData(message) => write!(f, "invalid persisted state: {message}"),
         }
     }
 }
@@ -88,12 +45,15 @@ impl From<std::io::Error> for AppPersistenceError {
     }
 }
 
+impl From<rusqlite::Error> for AppPersistenceError {
+    fn from(value: rusqlite::Error) -> Self {
+        Self::Sqlite(value)
+    }
+}
+
 impl AppPersistence {
     pub fn open_default() -> Result<Self, AppPersistenceError> {
-        let path = env::var_os(ENV_STATE_DB)
-            .map(PathBuf::from)
-            .unwrap_or(default_state_db_path()?);
-        Self::open_path(path)
+        Self::open_path(default_state_db_path()?)
     }
 
     pub fn open_path(path: impl AsRef<Path>) -> Result<Self, AppPersistenceError> {
@@ -101,911 +61,833 @@ impl AppPersistence {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut store = SqliteStore::open(path)?;
-        store.migrate()?;
-        Ok(Self { store })
+        backup_incompatible_database(path)?;
+        let connection = Connection::open(path)?;
+        configure_connection(&connection, true)?;
+        migrate_v2(&connection)?;
+        Ok(Self { connection })
     }
 
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self, AppPersistenceError> {
-        let mut store = SqliteStore::open_memory()?;
-        store.migrate()?;
-        Ok(Self { store })
+        let connection = Connection::open_in_memory()?;
+        configure_connection(&connection, false)?;
+        migrate_v2(&connection)?;
+        Ok(Self { connection })
     }
 
-    pub fn load_state(&mut self) -> Result<Option<BrowserState>, AppPersistenceError> {
-        self.store.load_state()
+    pub fn load(&self) -> Result<Option<(BrowserState, u64)>, AppPersistenceError> {
+        let count: i64 = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM profiles", [], |row| row.get(0))?;
+        if count == 0 {
+            return Ok(None);
+        }
+
+        let mut state = BrowserState::default();
+        {
+            let mut statement = self.connection.prepare(
+                "SELECT id, name, active_workspace_id FROM profiles ORDER BY position, id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(Profile {
+                    id: ProfileId(as_u64(row.get::<_, i64>(0)?, "profiles.id")?),
+                    name: row.get(1)?,
+                    workspace_order: Vec::new(),
+                    active_workspace_id: row
+                        .get::<_, Option<i64>>(2)?
+                        .map(|id| as_u64(id, "profiles.active_workspace_id"))
+                        .transpose()?
+                        .map(WorkspaceId),
+                })
+            })?;
+            for profile in rows {
+                let profile = profile?;
+                state.profiles.insert(profile.id, profile);
+            }
+        }
+
+        {
+            let mut statement = self.connection.prepare(
+                "SELECT id, profile_id, name, primary_tab_id, secondary_tab_id, split_enabled, split_ratio
+                 FROM workspaces ORDER BY profile_id, position, id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                let id = WorkspaceId(as_u64(row.get::<_, i64>(0)?, "workspaces.id")?);
+                let profile_id = ProfileId(as_u64(row.get::<_, i64>(1)?, "workspaces.profile_id")?);
+                let primary_tab_id = row
+                    .get::<_, Option<i64>>(3)?
+                    .map(|value| as_u64(value, "workspaces.primary_tab_id"))
+                    .transpose()?
+                    .map(TabId);
+                Ok(Workspace {
+                    id,
+                    profile_id,
+                    name: row.get(2)?,
+                    tab_order: Vec::new(),
+                    active_tab_id: primary_tab_id,
+                    primary_tab_id,
+                    secondary_tab_id: row
+                        .get::<_, Option<i64>>(4)?
+                        .map(|value| as_u64(value, "workspaces.secondary_tab_id"))
+                        .transpose()?
+                        .map(TabId),
+                    split_enabled: row.get::<_, i64>(5)? != 0,
+                    split_ratio: row.get::<_, f64>(6)?.clamp(0.25, 0.75),
+                })
+            })?;
+            for workspace in rows {
+                let workspace = workspace?;
+                let profile = state
+                    .profiles
+                    .get_mut(&workspace.profile_id)
+                    .ok_or_else(|| {
+                        AppPersistenceError::InvalidData(format!(
+                            "workspace {} references missing profile {}",
+                            workspace.id.0, workspace.profile_id.0
+                        ))
+                    })?;
+                profile.workspace_order.push(workspace.id);
+                state.workspaces.insert(workspace.id, workspace);
+            }
+        }
+
+        {
+            let mut statement = self.connection.prepare(
+                "SELECT id, profile_id, workspace_id, parent_tab_id, url, observed_title,
+                        custom_title, pinned, locked, muted, status, status_time_ms,
+                        restore_parent_tab_id, restore_sibling_index, position
+                 FROM tabs ORDER BY workspace_id, CASE WHEN position IS NULL THEN 1 ELSE 0 END, position, id",
+            )?;
+            let rows = statement.query_map([], load_tab)?;
+            for row in rows {
+                let (tab, position) = row?;
+                if !state.profiles.contains_key(&tab.profile_id) {
+                    return Err(AppPersistenceError::InvalidData(format!(
+                        "tab {} references missing profile {}",
+                        tab.id.0, tab.profile_id.0
+                    )));
+                }
+                let workspace = state.workspaces.get_mut(&tab.workspace_id).ok_or_else(|| {
+                    AppPersistenceError::InvalidData(format!(
+                        "tab {} references missing workspace {}",
+                        tab.id.0, tab.workspace_id.0
+                    ))
+                })?;
+                if tab.status.is_open() && position.is_some() {
+                    workspace.tab_order.push(tab.id);
+                }
+                state.tabs.insert(tab.id, tab);
+            }
+        }
+
+        {
+            let mut statement = self.connection.prepare(
+                "SELECT key, value_type, bool_value, int_value, text_value FROM settings ORDER BY key",
+            )?;
+            let rows = statement.query_map([], |row| {
+                let key: String = row.get(0)?;
+                let kind: String = row.get(1)?;
+                let value = match kind.as_str() {
+                    "bool" => SettingValue::Bool(row.get::<_, i64>(2)? != 0),
+                    "int" => SettingValue::Int(row.get(3)?),
+                    "text" => SettingValue::Text(row.get(4)?),
+                    _ => {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(InvalidValue(format!("unknown setting type {kind}"))),
+                        ))
+                    }
+                };
+                Ok((key, value))
+            })?;
+            for row in rows {
+                let (key, value) = row?;
+                state.settings.insert(key, value);
+            }
+        }
+
+        {
+            let mut statement = self.connection.prepare(
+                "SELECT profile_id, url, title, visit_count, last_visit_ms
+                 FROM history ORDER BY profile_id, sequence",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(HistoryEntry {
+                    profile_id: ProfileId(as_u64(row.get::<_, i64>(0)?, "history.profile_id")?),
+                    url: row.get(1)?,
+                    title: row.get(2)?,
+                    visit_count: as_u64(row.get::<_, i64>(3)?, "history.visit_count")?,
+                    last_visit_ms: row.get(4)?,
+                })
+            })?;
+            for entry in rows {
+                let entry = entry?;
+                state
+                    .history
+                    .entry(entry.profile_id)
+                    .or_default()
+                    .push(entry);
+            }
+        }
+
+        state.active_profile_id = meta_value(&self.connection, META_ACTIVE_PROFILE_ID)?
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value.parse::<u64>().map(ProfileId).map_err(|_| {
+                    AppPersistenceError::InvalidData("invalid active profile id".into())
+                })
+            })
+            .transpose()?;
+        if state
+            .active_profile_id
+            .is_some_and(|id| !state.profiles.contains_key(&id))
+        {
+            state.active_profile_id = state.profiles.keys().next().copied();
+        }
+        state.recompute_next_ids();
+        state.reset_runtime_state();
+        let revision = meta_value(&self.connection, META_REVISION)?
+            .unwrap_or_else(|| "0".into())
+            .parse::<u64>()
+            .map_err(|_| AppPersistenceError::InvalidData("invalid persisted revision".into()))?;
+        Ok(Some((state, revision)))
     }
 }
 
 impl Persistence for AppPersistence {
     type Error = AppPersistenceError;
 
-    fn commit(&mut self, state: &BrowserState) -> Result<(), Self::Error> {
-        self.store.save_state(state)
+    fn commit(&mut self, state: &BrowserState, revision: u64) -> Result<(), Self::Error> {
+        let transaction = self.connection.transaction()?;
+        save_state(&transaction, state, revision)?;
+        transaction.commit()?;
+        Ok(())
     }
 }
 
-impl SqliteStore {
-    fn open(path: &Path) -> Result<Self, AppPersistenceError> {
-        let c_path = path_to_cstring(path)?;
-        let mut db = std::ptr::null_mut();
-        let rc = unsafe {
-            sqlite3_open_v2(
-                c_path.as_ptr(),
-                &mut db,
-                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                std::ptr::null(),
-            )
-        };
-        if rc != SQLITE_OK || db.is_null() {
-            let message = if !db.is_null() {
-                unsafe { sqlite_error_message(db) }
-            } else {
-                "failed to open sqlite database".to_owned()
-            };
-            if !db.is_null() {
-                unsafe {
-                    let _ = sqlite3_close(db);
-                }
-            }
-            return Err(AppPersistenceError::Sqlite(message));
-        }
-        Ok(Self { db })
+fn configure_connection(
+    connection: &Connection,
+    file_backed: bool,
+) -> Result<(), AppPersistenceError> {
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    if file_backed {
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "synchronous", "NORMAL")?;
     }
+    Ok(())
+}
 
-    #[cfg(test)]
-    fn open_memory() -> Result<Self, AppPersistenceError> {
-        let c_memory = CString::new(":memory:").map_err(|_| {
-            AppPersistenceError::InvalidData("invalid sqlite memory uri".to_owned())
-        })?;
-        let mut db = std::ptr::null_mut();
-        let rc = unsafe {
-            sqlite3_open_v2(
-                c_memory.as_ptr(),
-                &mut db,
-                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                std::ptr::null(),
-            )
-        };
-        if rc != SQLITE_OK || db.is_null() {
-            let message = if !db.is_null() {
-                unsafe { sqlite_error_message(db) }
-            } else {
-                "failed to open sqlite in-memory database".to_owned()
-            };
-            if !db.is_null() {
-                unsafe {
-                    let _ = sqlite3_close(db);
-                }
-            }
-            return Err(AppPersistenceError::Sqlite(message));
-        }
-        Ok(Self { db })
-    }
+fn migrate_v2(connection: &Connection) -> Result<(), AppPersistenceError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE IF NOT EXISTS meta (
+             key TEXT PRIMARY KEY,
+             value TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS profiles (
+             id INTEGER PRIMARY KEY,
+             name TEXT NOT NULL,
+             active_workspace_id INTEGER,
+             position INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS workspaces (
+             id INTEGER PRIMARY KEY,
+             profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+             name TEXT NOT NULL,
+             primary_tab_id INTEGER,
+             secondary_tab_id INTEGER,
+             split_enabled INTEGER NOT NULL,
+             split_ratio REAL NOT NULL,
+             position INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS tabs (
+             id INTEGER PRIMARY KEY,
+             profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+             workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+             parent_tab_id INTEGER REFERENCES tabs(id) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED,
+             url TEXT NOT NULL,
+             observed_title TEXT NOT NULL,
+             custom_title TEXT,
+             pinned INTEGER NOT NULL,
+             locked INTEGER NOT NULL,
+             muted INTEGER NOT NULL,
+             status TEXT NOT NULL,
+             status_time_ms INTEGER,
+             restore_parent_tab_id INTEGER,
+             restore_sibling_index INTEGER,
+             position INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS tabs_workspace_position ON tabs(workspace_id, position);
+         CREATE INDEX IF NOT EXISTS tabs_profile_status ON tabs(profile_id, status, status_time_ms);
+         CREATE TABLE IF NOT EXISTS settings (
+             key TEXT PRIMARY KEY,
+             value_type TEXT NOT NULL,
+             bool_value INTEGER,
+             int_value INTEGER,
+             text_value TEXT
+         );
+         CREATE TABLE IF NOT EXISTS history (
+             sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+             profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+             url TEXT NOT NULL,
+             title TEXT NOT NULL,
+             visit_count INTEGER NOT NULL,
+             last_visit_ms INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS history_profile_recency ON history(profile_id, last_visit_ms DESC);
+         INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '2');
+         INSERT OR IGNORE INTO meta(key, value) VALUES('revision', '0');
+         COMMIT;",
+    )?;
+    Ok(())
+}
 
-    fn migrate(&mut self) -> Result<(), AppPersistenceError> {
-        self.exec_batch(
-            "
-            PRAGMA foreign_keys = ON;
-            CREATE TABLE IF NOT EXISTS meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS profiles (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                active_workspace_id INTEGER
-            );
-            CREATE TABLE IF NOT EXISTS profile_workspace_order (
-                profile_id INTEGER NOT NULL,
-                position INTEGER NOT NULL,
-                workspace_id INTEGER NOT NULL,
-                PRIMARY KEY (profile_id, position)
-            );
-            CREATE TABLE IF NOT EXISTS workspaces (
-                id INTEGER PRIMARY KEY,
-                profile_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                active_tab_id INTEGER
-            );
-            CREATE TABLE IF NOT EXISTS workspace_tab_order (
-                workspace_id INTEGER NOT NULL,
-                position INTEGER NOT NULL,
-                tab_id INTEGER NOT NULL,
-                PRIMARY KEY (workspace_id, position)
-            );
-            CREATE TABLE IF NOT EXISTS tabs (
-                id INTEGER PRIMARY KEY,
-                profile_id INTEGER NOT NULL,
-                workspace_id INTEGER NOT NULL,
-                url TEXT NOT NULL,
-                title TEXT NOT NULL,
-                loading INTEGER NOT NULL,
-                thumbnail_data_url TEXT,
-                pinned INTEGER NOT NULL,
-                muted INTEGER NOT NULL,
-                runtime_state INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                bool_value INTEGER,
-                int_value INTEGER,
-                text_value TEXT
-            );
-            ",
+fn save_state(
+    transaction: &Transaction<'_>,
+    state: &BrowserState,
+    revision: u64,
+) -> Result<(), AppPersistenceError> {
+    transaction.execute_batch(
+        "PRAGMA defer_foreign_keys = ON;
+         DELETE FROM history;
+         DELETE FROM tabs;
+         DELETE FROM workspaces;
+         DELETE FROM profiles;
+         DELETE FROM settings;",
+    )?;
+
+    for (position, profile_id) in state.profiles.keys().enumerate() {
+        let profile = &state.profiles[profile_id];
+        transaction.execute(
+            "INSERT INTO profiles(id, name, active_workspace_id, position) VALUES(?1, ?2, ?3, ?4)",
+            params![
+                to_i64(profile.id.0)?,
+                profile.name,
+                profile
+                    .active_workspace_id
+                    .map(|id| to_i64(id.0))
+                    .transpose()?,
+                to_i64(position as u64)?
+            ],
         )?;
-        self.exec_batch(&format!(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES({}, {});",
-            sql_text_literal(META_SCHEMA_VERSION),
-            sql_text_literal(&SCHEMA_VERSION.to_string()),
-        ))?;
-        Ok(())
     }
-
-    fn save_state(&mut self, state: &BrowserState) -> Result<(), AppPersistenceError> {
-        let mut sql = String::with_capacity(64 * 1024);
-        sql.push_str("BEGIN IMMEDIATE;\n");
-        sql.push_str(
-            "
-            DELETE FROM profile_workspace_order;
-            DELETE FROM workspace_tab_order;
-            DELETE FROM tabs;
-            DELETE FROM workspaces;
-            DELETE FROM profiles;
-            DELETE FROM settings;
-            ",
-        );
-
-        for profile in state.profiles.values() {
-            sql.push_str(&format!(
-                "INSERT INTO profiles(id, name, active_workspace_id) VALUES({}, {}, {});\n",
-                profile.id.0,
-                sql_text_literal(&profile.name),
-                sql_opt_u64(profile.active_workspace_id.map(|id| id.0))
-            ));
-            for (position, workspace_id) in profile.workspace_order.iter().enumerate() {
-                sql.push_str(&format!(
-                    "INSERT INTO profile_workspace_order(profile_id, position, workspace_id) VALUES({}, {}, {});\n",
-                    profile.id.0,
-                    position,
-                    workspace_id.0
-                ));
-            }
-        }
-
-        for workspace in state.workspaces.values() {
-            sql.push_str(&format!(
-                "INSERT INTO workspaces(id, profile_id, name, active_tab_id) VALUES({}, {}, {}, {});\n",
-                workspace.id.0,
-                workspace.profile_id.0,
-                sql_text_literal(&workspace.name),
-                sql_opt_u64(workspace.active_tab_id.map(|id| id.0))
-            ));
-            for (position, tab_id) in workspace.tab_order.iter().enumerate() {
-                sql.push_str(&format!(
-                    "INSERT INTO workspace_tab_order(workspace_id, position, tab_id) VALUES({}, {}, {});\n",
-                    workspace.id.0,
-                    position,
-                    tab_id.0
-                ));
-            }
-        }
-
-        for tab in state.tabs.values() {
-            sql.push_str(&format!(
-                "INSERT INTO tabs(
-                    id, profile_id, workspace_id, url, title, loading, thumbnail_data_url,
-                    pinned, muted, runtime_state
-                 ) VALUES({}, {}, {}, {}, {}, {}, {}, {}, {}, {});\n",
-                tab.id.0,
-                tab.profile_id.0,
-                tab.workspace_id.0,
-                sql_text_literal(&tab.url),
-                sql_text_literal(&tab.title),
-                sql_bool(tab.loading),
-                sql_opt_text(tab.thumbnail_data_url.as_deref()),
-                sql_bool(tab.pinned),
-                sql_bool(tab.muted),
-                runtime_state_to_i64(tab.runtime_state)
-            ));
-        }
-
-        for (key, value) in &state.settings {
-            let (kind, bool_value, int_value, text_value) = match value {
-                SettingValue::Bool(value) => {
-                    ("bool", Some(if *value { 1_i64 } else { 0_i64 }), None, None)
-                }
-                SettingValue::Int(value) => ("int", None, Some(*value), None),
-                SettingValue::Text(value) => ("text", None, None, Some(value.as_str())),
-            };
-            sql.push_str(&format!(
-                "INSERT INTO settings(key, kind, bool_value, int_value, text_value) VALUES({}, {}, {}, {}, {});\n",
-                sql_text_literal(key),
-                sql_text_literal(kind),
-                sql_opt_i64(bool_value),
-                sql_opt_i64(int_value),
-                sql_opt_text(text_value)
-            ));
-        }
-
-        let active_profile_value = state
-            .active_profile_id
-            .map(|id| id.0.to_string())
-            .unwrap_or_default();
-        sql.push_str(&format!(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES({}, {});\n",
-            sql_text_literal(META_ACTIVE_PROFILE_ID),
-            sql_text_literal(&active_profile_value)
-        ));
-        sql.push_str(&format!(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES({}, {});\n",
-            sql_text_literal(META_SCHEMA_VERSION),
-            sql_text_literal(&SCHEMA_VERSION.to_string())
-        ));
-        sql.push_str("COMMIT;");
-        self.exec_batch(&sql)
-    }
-
-    fn load_state(&mut self) -> Result<Option<BrowserState>, AppPersistenceError> {
-        let profile_count_rows = self.query_rows("SELECT COUNT(*) FROM profiles;")?;
-        let profile_count = profile_count_rows
-            .first()
-            .and_then(|row| row.first())
-            .and_then(|cell| cell.as_deref())
-            .map(|value| parse_i64(value, "profiles.count"))
-            .transpose()?
-            .unwrap_or(0);
-        if profile_count <= 0 {
-            return Ok(None);
-        }
-
-        let mut state = BrowserState::default();
-
-        for row in
-            self.query_rows("SELECT id, name, active_workspace_id FROM profiles ORDER BY id;")?
-        {
-            let id = ProfileId(parse_u64(
-                required_cell(&row, 0, "profiles.id")?,
-                "profiles.id",
-            )?);
-            let name = required_cell(&row, 1, "profiles.name")?.to_owned();
-            let active_workspace_id = optional_cell(&row, 2)
-                .map(|value| parse_u64(value, "profiles.active_workspace_id"))
-                .transpose()?
-                .map(WorkspaceId);
-            state.profiles.insert(
-                id,
-                Profile {
-                    id,
-                    name,
-                    workspace_order: Vec::new(),
-                    active_workspace_id,
-                },
-            );
-        }
-
-        for row in self.query_rows(
-            "SELECT profile_id, workspace_id FROM profile_workspace_order ORDER BY profile_id, position;",
-        )? {
-            let profile_id = ProfileId(parse_u64(
-                required_cell(&row, 0, "profile_workspace_order.profile_id")?,
-                "profile_workspace_order.profile_id",
-            )?);
-            let workspace_id = WorkspaceId(parse_u64(
-                required_cell(&row, 1, "profile_workspace_order.workspace_id")?,
-                "profile_workspace_order.workspace_id",
-            )?);
-            if let Some(profile) = state.profiles.get_mut(&profile_id) {
-                profile.workspace_order.push(workspace_id);
-            }
-        }
-
-        for row in self
-            .query_rows("SELECT id, profile_id, name, active_tab_id FROM workspaces ORDER BY id;")?
-        {
-            let id = WorkspaceId(parse_u64(
-                required_cell(&row, 0, "workspaces.id")?,
-                "workspaces.id",
-            )?);
-            let profile_id = ProfileId(parse_u64(
-                required_cell(&row, 1, "workspaces.profile_id")?,
-                "workspaces.profile_id",
-            )?);
-            let name = required_cell(&row, 2, "workspaces.name")?.to_owned();
-            let active_tab_id = optional_cell(&row, 3)
-                .map(|value| parse_u64(value, "workspaces.active_tab_id"))
-                .transpose()?
-                .map(TabId);
-            state.workspaces.insert(
-                id,
-                Workspace {
-                    id,
-                    profile_id,
-                    name,
-                    tab_order: Vec::new(),
-                    active_tab_id,
-                },
-            );
-        }
-
-        for row in self.query_rows(
-            "SELECT workspace_id, tab_id FROM workspace_tab_order ORDER BY workspace_id, position;",
-        )? {
-            let workspace_id = WorkspaceId(parse_u64(
-                required_cell(&row, 0, "workspace_tab_order.workspace_id")?,
-                "workspace_tab_order.workspace_id",
-            )?);
-            let tab_id = TabId(parse_u64(
-                required_cell(&row, 1, "workspace_tab_order.tab_id")?,
-                "workspace_tab_order.tab_id",
-            )?);
-            if let Some(workspace) = state.workspaces.get_mut(&workspace_id) {
-                workspace.tab_order.push(tab_id);
-            }
-        }
-
-        for row in self.query_rows(
-            "SELECT
-                id, profile_id, workspace_id, url, title, loading, thumbnail_data_url,
-                pinned, muted, runtime_state
-             FROM tabs
-             ORDER BY id;",
-        )? {
-            let id = TabId(parse_u64(required_cell(&row, 0, "tabs.id")?, "tabs.id")?);
-            let profile_id = ProfileId(parse_u64(
-                required_cell(&row, 1, "tabs.profile_id")?,
-                "tabs.profile_id",
-            )?);
-            let workspace_id = WorkspaceId(parse_u64(
-                required_cell(&row, 2, "tabs.workspace_id")?,
-                "tabs.workspace_id",
-            )?);
-            let runtime_state = runtime_state_from_i64(parse_i64(
-                required_cell(&row, 9, "tabs.runtime_state")?,
-                "tabs.runtime_state",
-            )?)
-            .ok_or_else(|| {
+    for profile in state.profiles.values() {
+        for (position, workspace_id) in profile.workspace_order.iter().enumerate() {
+            let workspace = state.workspaces.get(workspace_id).ok_or_else(|| {
                 AppPersistenceError::InvalidData(format!(
-                    "unsupported tabs.runtime_state for tab {}",
-                    id.0
+                    "profile order references missing workspace {}",
+                    workspace_id.0
                 ))
             })?;
-
-            state.tabs.insert(
-                id,
-                Tab {
-                    id,
-                    profile_id,
-                    workspace_id,
-                    url: required_cell(&row, 3, "tabs.url")?.to_owned(),
-                    title: required_cell(&row, 4, "tabs.title")?.to_owned(),
-                    loading: parse_i64(required_cell(&row, 5, "tabs.loading")?, "tabs.loading")?
-                        != 0,
-                    thumbnail_data_url: optional_cell(&row, 6).map(ToOwned::to_owned),
-                    pinned: parse_i64(required_cell(&row, 7, "tabs.pinned")?, "tabs.pinned")? != 0,
-                    muted: parse_i64(required_cell(&row, 8, "tabs.muted")?, "tabs.muted")? != 0,
-                    runtime_state,
-                },
-            );
+            transaction.execute(
+                "INSERT INTO workspaces(id, profile_id, name, primary_tab_id, secondary_tab_id, split_enabled, split_ratio, position)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    to_i64(workspace.id.0)?,
+                    to_i64(workspace.profile_id.0)?,
+                    workspace.name,
+                    workspace.primary_tab_id.map(|id| to_i64(id.0)).transpose()?,
+                    workspace.secondary_tab_id.map(|id| to_i64(id.0)).transpose()?,
+                    i64::from(workspace.split_enabled),
+                    workspace.split_ratio.clamp(0.25, 0.75),
+                    to_i64(position as u64)?,
+                ],
+            )?;
         }
-
-        for row in self.query_rows(
-            "SELECT key, kind, bool_value, int_value, text_value FROM settings ORDER BY key;",
-        )? {
-            let key = required_cell(&row, 0, "settings.key")?.to_owned();
-            let kind = required_cell(&row, 1, "settings.kind")?;
-            let value = match kind {
-                "bool" => SettingValue::Bool(
-                    optional_cell(&row, 2)
-                        .map(|cell| parse_i64(cell, "settings.bool_value"))
-                        .transpose()?
-                        .unwrap_or(0)
-                        != 0,
-                ),
-                "int" => SettingValue::Int(
-                    optional_cell(&row, 3)
-                        .map(|cell| parse_i64(cell, "settings.int_value"))
-                        .transpose()?
-                        .unwrap_or(0),
-                ),
-                "text" => SettingValue::Text(optional_cell(&row, 4).unwrap_or("").to_owned()),
-                _ => continue,
-            };
-            state.settings.insert(key, value);
-        }
-
-        let meta_rows = self.query_rows(&format!(
-            "SELECT value FROM meta WHERE key = {};",
-            sql_text_literal(META_ACTIVE_PROFILE_ID)
-        ))?;
-        if let Some(value) = meta_rows
-            .first()
-            .and_then(|row| row.first())
-            .and_then(|cell| cell.as_deref())
-            .map(str::trim)
-        {
-            if !value.is_empty() {
-                state.active_profile_id =
-                    Some(ProfileId(parse_u64(value, "meta.active_profile_id")?));
-            }
-        }
-
-        normalize_loaded_state(&mut state);
-        if state.profiles.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(state))
     }
 
-    fn exec_batch(&mut self, sql: &str) -> Result<(), AppPersistenceError> {
-        let c_sql = CString::new(sql).map_err(|_| {
-            AppPersistenceError::InvalidData("sql batch contained interior NUL byte".to_owned())
-        })?;
-        let mut err: *mut c_char = std::ptr::null_mut();
-        let rc = unsafe {
-            sqlite3_exec(
-                self.db,
-                c_sql.as_ptr(),
-                None,
-                std::ptr::null_mut(),
-                &mut err,
-            )
+    for tab in state.tabs.values() {
+        let position = state
+            .workspaces
+            .get(&tab.workspace_id)
+            .and_then(|workspace| workspace.tab_order.iter().position(|id| *id == tab.id))
+            .map(|value| to_i64(value as u64))
+            .transpose()?;
+        let (status, status_time, restore_parent, restore_index) = match tab.status {
+            TabStatus::Open => ("open", None, None, None),
+            TabStatus::Done {
+                completed_at_ms,
+                restore,
+            } => (
+                "done",
+                Some(completed_at_ms),
+                restore.parent_tab_id.map(|id| to_i64(id.0)).transpose()?,
+                Some(to_i64(restore.sibling_index as u64)?),
+            ),
+            TabStatus::Snoozed {
+                wake_at_ms,
+                restore,
+            } => (
+                "snoozed",
+                Some(wake_at_ms),
+                restore.parent_tab_id.map(|id| to_i64(id.0)).transpose()?,
+                Some(to_i64(restore.sibling_index as u64)?),
+            ),
         };
-        if rc != SQLITE_OK {
-            let message = unsafe { sqlite_exec_error_message(self.db, err) };
-            return Err(AppPersistenceError::Sqlite(message));
-        }
-        if !err.is_null() {
-            unsafe { sqlite3_free(err as *mut c_void) };
-        }
-        Ok(())
+        transaction.execute(
+            "INSERT INTO tabs(id, profile_id, workspace_id, parent_tab_id, url, observed_title,
+                              custom_title, pinned, locked, muted, status, status_time_ms,
+                              restore_parent_tab_id, restore_sibling_index, position)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                to_i64(tab.id.0)?,
+                to_i64(tab.profile_id.0)?,
+                to_i64(tab.workspace_id.0)?,
+                tab.parent_tab_id.map(|id| to_i64(id.0)).transpose()?,
+                tab.url,
+                tab.observed_title,
+                tab.custom_title,
+                i64::from(tab.pinned),
+                i64::from(tab.locked),
+                i64::from(tab.muted),
+                status,
+                status_time,
+                restore_parent,
+                restore_index,
+                position,
+            ],
+        )?;
     }
 
-    fn query_rows(&mut self, sql: &str) -> Result<Vec<Vec<Option<String>>>, AppPersistenceError> {
-        let c_sql = CString::new(sql).map_err(|_| {
-            AppPersistenceError::InvalidData("sql query contained interior NUL byte".to_owned())
-        })?;
-        let mut rows = Vec::<Vec<Option<String>>>::new();
-        let mut err: *mut c_char = std::ptr::null_mut();
-        let rc = unsafe {
-            sqlite3_exec(
-                self.db,
-                c_sql.as_ptr(),
-                Some(collect_rows_callback),
-                (&mut rows as *mut Vec<Vec<Option<String>>>).cast::<c_void>(),
-                &mut err,
-            )
+    for (key, value) in &state.settings {
+        let (kind, bool_value, int_value, text_value): (
+            &str,
+            Option<i64>,
+            Option<i64>,
+            Option<&str>,
+        ) = match value {
+            SettingValue::Bool(value) => ("bool", Some(i64::from(*value)), None, None),
+            SettingValue::Int(value) => ("int", None, Some(*value), None),
+            SettingValue::Text(value) => ("text", None, None, Some(value)),
         };
-        if rc != SQLITE_OK {
-            let message = unsafe { sqlite_exec_error_message(self.db, err) };
-            return Err(AppPersistenceError::Sqlite(message));
-        }
-        if !err.is_null() {
-            unsafe { sqlite3_free(err as *mut c_void) };
-        }
-        Ok(rows)
-    }
-}
-
-impl Drop for SqliteStore {
-    fn drop(&mut self) {
-        if !self.db.is_null() {
-            unsafe {
-                let _ = sqlite3_close(self.db);
-            }
-            self.db = std::ptr::null_mut();
-        }
-    }
-}
-
-unsafe extern "C" fn collect_rows_callback(
-    arg: *mut c_void,
-    argc: c_int,
-    argv: *mut *mut c_char,
-    _col_names: *mut *mut c_char,
-) -> c_int {
-    if arg.is_null() {
-        return 0;
-    }
-    let rows = &mut *(arg as *mut Vec<Vec<Option<String>>>);
-    let mut row = Vec::with_capacity(argc as usize);
-    for index in 0..argc {
-        let value_ptr = *argv.add(index as usize);
-        if value_ptr.is_null() {
-            row.push(None);
-        } else {
-            let value = CStr::from_ptr(value_ptr).to_string_lossy().into_owned();
-            row.push(Some(value));
-        }
-    }
-    rows.push(row);
-    0
-}
-
-unsafe fn sqlite_error_message(db: *mut sqlite3) -> String {
-    if db.is_null() {
-        return "sqlite operation failed".to_owned();
-    }
-    let ptr = sqlite3_errmsg(db);
-    if ptr.is_null() {
-        return "sqlite operation failed".to_owned();
-    }
-    CStr::from_ptr(ptr).to_string_lossy().into_owned()
-}
-
-unsafe fn sqlite_exec_error_message(db: *mut sqlite3, err: *mut c_char) -> String {
-    if !err.is_null() {
-        let message = CStr::from_ptr(err).to_string_lossy().into_owned();
-        sqlite3_free(err as *mut c_void);
-        return message;
-    }
-    sqlite_error_message(db)
-}
-
-fn normalize_loaded_state(state: &mut BrowserState) {
-    state
-        .workspaces
-        .retain(|_, workspace| state.profiles.contains_key(&workspace.profile_id));
-    state.tabs.retain(|_, tab| {
-        let Some(workspace) = state.workspaces.get(&tab.workspace_id) else {
-            return false;
-        };
-        state.profiles.contains_key(&tab.profile_id) && workspace.profile_id == tab.profile_id
-    });
-
-    let profile_ids: Vec<ProfileId> = state.profiles.keys().copied().collect();
-    for profile_id in profile_ids {
-        if let Some(profile) = state.profiles.get_mut(&profile_id) {
-            profile.workspace_order.retain(|workspace_id| {
-                state
-                    .workspaces
-                    .get(workspace_id)
-                    .map(|workspace| workspace.profile_id == profile_id)
-                    .unwrap_or(false)
-            });
-        }
+        transaction.execute(
+            "INSERT INTO settings(key, value_type, bool_value, int_value, text_value) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![key, kind, bool_value, int_value, text_value],
+        )?;
     }
 
-    let workspace_ids: Vec<WorkspaceId> = state.workspaces.keys().copied().collect();
-    for workspace_id in workspace_ids {
-        let Some(workspace) = state.workspaces.get(&workspace_id).cloned() else {
-            continue;
-        };
-        if let Some(profile) = state.profiles.get_mut(&workspace.profile_id) {
-            if !profile.workspace_order.contains(&workspace_id) {
-                profile.workspace_order.push(workspace_id);
+    for profile in state.profiles.values() {
+        if let Some(entries) = state.history.get(&profile.id) {
+            for entry in entries {
+                transaction.execute(
+                    "INSERT INTO history(profile_id, url, title, visit_count, last_visit_ms) VALUES(?1, ?2, ?3, ?4, ?5)",
+                    params![to_i64(profile.id.0)?, entry.url, entry.title, to_i64(entry.visit_count)?, entry.last_visit_ms],
+                )?;
             }
         }
     }
 
-    let workspace_ids: Vec<WorkspaceId> = state.workspaces.keys().copied().collect();
-    for workspace_id in workspace_ids {
-        if let Some(workspace) = state.workspaces.get_mut(&workspace_id) {
-            workspace.tab_order.retain(|tab_id| {
-                state
-                    .tabs
-                    .get(tab_id)
-                    .map(|tab| tab.workspace_id == workspace_id)
-                    .unwrap_or(false)
-            });
-        }
-    }
-
-    let tab_ids: Vec<TabId> = state.tabs.keys().copied().collect();
-    for tab_id in tab_ids {
-        let Some(tab) = state.tabs.get(&tab_id).cloned() else {
-            continue;
-        };
-        if let Some(workspace) = state.workspaces.get_mut(&tab.workspace_id) {
-            if !workspace.tab_order.contains(&tab_id) {
-                workspace.tab_order.push(tab_id);
-            }
-        }
-    }
-
-    for profile in state.profiles.values_mut() {
-        if profile
-            .active_workspace_id
-            .map(|workspace_id| !profile.workspace_order.contains(&workspace_id))
-            .unwrap_or(false)
-        {
-            profile.active_workspace_id = None;
-        }
-        if profile.active_workspace_id.is_none() {
-            profile.active_workspace_id = profile.workspace_order.first().copied();
-        }
-    }
-
-    for workspace in state.workspaces.values_mut() {
-        if workspace
-            .active_tab_id
-            .map(|tab_id| !workspace.tab_order.contains(&tab_id))
-            .unwrap_or(false)
-        {
-            workspace.active_tab_id = None;
-        }
-        if workspace.active_tab_id.is_none() {
-            workspace.active_tab_id = workspace.tab_order.first().copied();
-        }
-    }
-
-    if state
-        .active_profile_id
-        .map(|profile_id| !state.profiles.contains_key(&profile_id))
-        .unwrap_or(true)
-    {
-        state.active_profile_id = state.profiles.keys().next().copied();
-    }
-
-    state.recompute_next_ids();
+    transaction.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        params![META_SCHEMA_VERSION, SCHEMA_VERSION.to_string()],
+    )?;
+    transaction.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        params![META_REVISION, revision.to_string()],
+    )?;
+    transaction.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        params![
+            META_ACTIVE_PROFILE_ID,
+            state
+                .active_profile_id
+                .map(|id| id.0.to_string())
+                .unwrap_or_default()
+        ],
+    )?;
+    Ok(())
 }
 
-fn required_cell<'a>(
-    row: &'a [Option<String>],
-    index: usize,
-    field: &str,
-) -> Result<&'a str, AppPersistenceError> {
-    row.get(index)
-        .and_then(|value| value.as_deref())
-        .ok_or_else(|| AppPersistenceError::InvalidData(format!("missing required {field}")))
-}
-
-fn optional_cell(row: &[Option<String>], index: usize) -> Option<&str> {
-    row.get(index).and_then(|value| value.as_deref())
-}
-
-fn parse_u64(value: &str, field: &str) -> Result<u64, AppPersistenceError> {
-    let parsed = value.parse::<i128>().map_err(|_| {
-        AppPersistenceError::InvalidData(format!("{field} is not a valid integer: {value}"))
-    })?;
-    if parsed < 0 || parsed > u64::MAX as i128 {
-        return Err(AppPersistenceError::InvalidData(format!(
-            "{field} out of range for u64: {value}"
-        )));
-    }
-    Ok(parsed as u64)
-}
-
-fn parse_i64(value: &str, field: &str) -> Result<i64, AppPersistenceError> {
-    value.parse::<i64>().map_err(|_| {
-        AppPersistenceError::InvalidData(format!("{field} is not a valid i64: {value}"))
-    })
-}
-
-fn runtime_state_to_i64(state: TabRuntimeState) -> i64 {
-    match state {
-        TabRuntimeState::Active => 0,
-        TabRuntimeState::Warm => 1,
-        TabRuntimeState::Discarded => 2,
-        TabRuntimeState::Restoring => 3,
-    }
-}
-
-fn runtime_state_from_i64(value: i64) -> Option<TabRuntimeState> {
-    match value {
-        0 => Some(TabRuntimeState::Active),
-        1 => Some(TabRuntimeState::Warm),
-        2 => Some(TabRuntimeState::Discarded),
-        3 => Some(TabRuntimeState::Restoring),
-        _ => None,
-    }
-}
-
-fn sql_bool(value: bool) -> &'static str {
-    if value {
-        "1"
-    } else {
-        "0"
-    }
-}
-
-fn sql_opt_u64(value: Option<u64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "NULL".to_owned())
-}
-
-fn sql_opt_i64(value: Option<i64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "NULL".to_owned())
-}
-
-fn sql_opt_text(value: Option<&str>) -> String {
-    value
-        .map(sql_text_literal)
-        .unwrap_or_else(|| "NULL".to_owned())
-}
-
-fn sql_text_literal(value: &str) -> String {
-    let sanitized = value.replace('\0', " ");
-    let escaped = sanitized.replace('\'', "''");
-    format!("'{escaped}'")
-}
-
-fn path_to_cstring(path: &Path) -> Result<CString, AppPersistenceError> {
-    #[cfg(unix)]
-    {
-        return CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-            AppPersistenceError::InvalidData(format!(
-                "sqlite path contains interior NUL bytes: {}",
-                path.display()
+fn load_tab(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Tab, Option<i64>)> {
+    let id = TabId(as_u64(row.get::<_, i64>(0)?, "tabs.id")?);
+    let restore = RestorePosition {
+        parent_tab_id: row
+            .get::<_, Option<i64>>(12)?
+            .map(|value| as_u64(value, "tabs.restore_parent_tab_id"))
+            .transpose()?
+            .map(TabId),
+        sibling_index: row
+            .get::<_, Option<i64>>(13)?
+            .map(|value| as_u64(value, "tabs.restore_sibling_index"))
+            .transpose()?
+            .unwrap_or(0) as usize,
+    };
+    let status_name: String = row.get(10)?;
+    let status_time = row.get::<_, Option<i64>>(11)?.unwrap_or(0);
+    let status = match status_name.as_str() {
+        "open" => TabStatus::Open,
+        "done" => TabStatus::Done {
+            completed_at_ms: status_time,
+            restore,
+        },
+        "snoozed" => TabStatus::Snoozed {
+            wake_at_ms: status_time,
+            restore,
+        },
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                10,
+                rusqlite::types::Type::Text,
+                Box::new(InvalidValue(format!("unknown tab status {status_name}"))),
             ))
-        });
-    }
+        }
+    };
+    let observed_title: String = row.get(5)?;
+    let custom_title: Option<String> = row.get(6)?;
+    let title = custom_title
+        .as_deref()
+        .unwrap_or(&observed_title)
+        .to_owned();
+    Ok((
+        Tab {
+            id,
+            profile_id: ProfileId(as_u64(row.get::<_, i64>(1)?, "tabs.profile_id")?),
+            workspace_id: WorkspaceId(as_u64(row.get::<_, i64>(2)?, "tabs.workspace_id")?),
+            parent_tab_id: row
+                .get::<_, Option<i64>>(3)?
+                .map(|value| as_u64(value, "tabs.parent_tab_id"))
+                .transpose()?
+                .map(TabId),
+            url: row.get(4)?,
+            title,
+            observed_title,
+            custom_title,
+            pinned: row.get::<_, i64>(7)? != 0,
+            locked: row.get::<_, i64>(8)? != 0,
+            muted: row.get::<_, i64>(9)? != 0,
+            status,
+            loading: false,
+            can_go_back: false,
+            can_go_forward: false,
+            runtime_state: TabRuntimeState::Discarded,
+        },
+        row.get(14)?,
+    ))
+}
 
-    #[cfg(not(unix))]
-    {
-        CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
-            AppPersistenceError::InvalidData(format!(
-                "sqlite path contains interior NUL bytes: {}",
-                path.display()
-            ))
+fn meta_value(connection: &Connection, key: &str) -> Result<Option<String>, AppPersistenceError> {
+    Ok(connection
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+            row.get(0)
         })
+        .optional()?)
+}
+
+fn backup_incompatible_database(path: &Path) -> Result<Option<PathBuf>, AppPersistenceError> {
+    if !path.exists() || fs::metadata(path)?.len() == 0 {
+        return Ok(None);
     }
+    let connection = Connection::open(path)?;
+    let has_meta: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta')",
+        [],
+        |row| row.get(0),
+    )?;
+    let version = if has_meta {
+        connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.parse::<i64>().ok())
+    } else {
+        None
+    };
+    drop(connection);
+    if version == Some(SCHEMA_VERSION) {
+        return Ok(None);
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("sqlite3");
+    let backup = path.with_extension(format!(
+        "v{}-backup-{stamp}.{extension}",
+        version.unwrap_or(0)
+    ));
+    fs::rename(path, &backup)?;
+    let wal = PathBuf::from(format!("{}-wal", path.display()));
+    let shm = PathBuf::from(format!("{}-shm", path.display()));
+    if wal.exists() {
+        fs::rename(&wal, PathBuf::from(format!("{}-wal", backup.display())))?;
+    }
+    if shm.exists() {
+        fs::rename(&shm, PathBuf::from(format!("{}-shm", backup.display())))?;
+    }
+    Ok(Some(backup))
 }
 
 fn default_state_db_path() -> Result<PathBuf, AppPersistenceError> {
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(home) = env::var_os("HOME") {
-            return Ok(PathBuf::from(home)
-                .join("Library")
-                .join("Application Support")
-                .join("Switchboard")
-                .join("state.sqlite3"));
-        }
-    }
-
-    let cwd = env::current_dir()?;
-    Ok(cwd.join("target").join("switchboard-state.sqlite3"))
+    resolve_state_db_path(
+        std::env::var_os(ENV_STATE_DB_PATH).map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
 }
+
+fn resolve_state_db_path(
+    configured: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Result<PathBuf, AppPersistenceError> {
+    if let Some(configured) = configured.filter(|path| !path.as_os_str().is_empty()) {
+        if !configured.is_absolute() {
+            return Err(AppPersistenceError::InvalidData(format!(
+                "{ENV_STATE_DB_PATH} must be an absolute path"
+            )));
+        }
+        return Ok(configured);
+    }
+    let base = home.ok_or_else(|| AppPersistenceError::InvalidData("HOME is not set".into()))?;
+    Ok(base
+        .join("Library")
+        .join("Application Support")
+        .join("Switchboard")
+        .join("state.sqlite3"))
+}
+
+fn to_i64(value: u64) -> Result<i64, AppPersistenceError> {
+    i64::try_from(value).map_err(|_| {
+        AppPersistenceError::InvalidData(format!("integer {value} exceeds SQLite range"))
+    })
+}
+
+fn as_u64(value: i64, field: &'static str) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(InvalidValue(format!("{field} is negative"))),
+        )
+    })
+}
+
+#[derive(Debug)]
+struct InvalidValue(String);
+
+impl Display for InvalidValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for InvalidValue {}
 
 #[cfg(test)]
 mod tests {
-    use switchboard_core::WorkspaceId;
-
     use super::*;
+    use switchboard_core::{Intent, NoopPersistence};
 
-    fn sample_state() -> BrowserState {
-        let mut state = BrowserState::default();
-        let profile_id = state.add_profile("Default");
-        let workspace_id = state
-            .add_workspace(profile_id, "Workspace 1")
-            .expect("profile should exist");
-        let tab_id = TabId(1);
-        state.tabs.insert(
-            tab_id,
-            Tab {
-                id: tab_id,
-                profile_id,
-                workspace_id,
-                url: "https://example.com".to_owned(),
-                title: "Example".to_owned(),
-                loading: false,
-                thumbnail_data_url: Some("data:image/svg+xml;utf8,test".to_owned()),
-                pinned: true,
-                muted: false,
-                runtime_state: TabRuntimeState::Active,
-            },
-        );
-        state
-            .workspaces
-            .get_mut(&workspace_id)
-            .expect("workspace should exist")
-            .tab_order
-            .push(tab_id);
-        state
-            .workspaces
-            .get_mut(&workspace_id)
-            .expect("workspace should exist")
-            .active_tab_id = Some(tab_id);
-        state.active_profile_id = Some(profile_id);
-        state.settings.insert(
-            "homepage".to_owned(),
-            SettingValue::Text("https://example.com".to_owned()),
-        );
-        state
-            .settings
-            .insert("restore_last_session".to_owned(), SettingValue::Bool(true));
-        state
-            .settings
-            .insert("warm_pool_budget".to_owned(), SettingValue::Int(8));
-        state.recompute_next_ids();
-        state
+    fn temporary_database_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "switchboard-{name}-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
+    fn seeded_state() -> BrowserState {
+        let mut engine = switchboard_core::Engine::new(NoopPersistence);
+        engine
+            .dispatch(Intent::NewProfile {
+                name: "Default".into(),
+            })
+            .unwrap();
+        let workspace = engine.state().active_workspace_id().unwrap();
+        engine
+            .dispatch(Intent::NewTab {
+                workspace_id: workspace,
+                url: Some("https://example.com".into()),
+                make_active: true,
+            })
+            .unwrap();
+        engine.state().clone()
     }
 
     #[test]
-    fn sqlite_persistence_roundtrip() {
-        let mut persistence = AppPersistence::open_in_memory().expect("open in-memory sqlite");
-        let state = sample_state();
-
-        persistence.commit(&state).expect("commit should succeed");
-        let loaded = persistence
-            .load_state()
-            .expect("load should succeed")
-            .expect("state should exist");
-
-        assert_eq!(loaded.active_profile_id, state.active_profile_id);
+    fn v2_roundtrip_restores_revision_and_resets_runtime() {
+        let mut persistence = AppPersistence::open_in_memory().unwrap();
+        let state = seeded_state();
+        persistence.commit(&state, 42).unwrap();
+        let (loaded, revision) = persistence.load().unwrap().unwrap();
+        assert_eq!(revision, 42);
         assert_eq!(loaded.profiles, state.profiles);
         assert_eq!(loaded.workspaces, state.workspaces);
-        assert_eq!(loaded.tabs, state.tabs);
-        assert_eq!(loaded.settings, state.settings);
-        assert_eq!(
-            loaded
-                .active_workspace_id()
-                .expect("active workspace should exist"),
-            WorkspaceId(1)
-        );
+        assert!(loaded
+            .tabs
+            .values()
+            .all(|tab| tab.runtime_state == TabRuntimeState::Discarded));
     }
 
     #[test]
-    fn sqlite_persistence_survives_reopen_and_last_commit_wins() {
-        let mut path = std::env::temp_dir();
-        let unique_suffix = format!(
-            "switchboard_state_test_{}_{}.sqlite3",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time should be after unix epoch")
-                .as_nanos()
-        );
-        path.push(unique_suffix);
+    fn history_and_archive_survive_roundtrip() {
+        let mut persistence = AppPersistence::open_in_memory().unwrap();
+        let mut state = seeded_state();
+        let profile = state.active_profile_id.unwrap();
+        let tab = *state.tabs.keys().next().unwrap();
+        switchboard_core::reducer::apply_intent(
+            &mut state,
+            Intent::RecordHistory {
+                profile_id: profile,
+                url: "https://example.com".into(),
+                title: "Example".into(),
+                visited_at_ms: 9,
+            },
+        )
+        .unwrap();
+        switchboard_core::reducer::apply_intent(
+            &mut state,
+            Intent::CompleteTab {
+                tab_id: tab,
+                completed_at_ms: 10,
+            },
+        )
+        .unwrap();
+        persistence.commit(&state, 7).unwrap();
+        let (loaded, _) = persistence.load().unwrap().unwrap();
+        assert!(matches!(
+            loaded.tabs[&tab].status,
+            TabStatus::Done {
+                completed_at_ms: 10,
+                ..
+            }
+        ));
+        assert_eq!(loaded.history[&profile][0].visit_count, 1);
+    }
 
-        let mut state_v1 = sample_state();
-        state_v1.settings.insert(
-            "homepage".to_owned(),
-            SettingValue::Text("https://v1.example".to_owned()),
-        );
+    #[test]
+    fn incompatible_v1_database_is_backed_up_before_v2_creation() {
+        let path = temporary_database_path("v1-backup");
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta(key, value) VALUES ('schema_version', '1');
+                 CREATE TABLE legacy_marker(value TEXT NOT NULL);
+                 INSERT INTO legacy_marker(value) VALUES ('preserve-me');",
+            )
+            .unwrap();
+        drop(legacy);
 
-        {
-            let mut persistence =
-                AppPersistence::open_path(&path).expect("open sqlite path for v1 commit");
-            persistence
-                .commit(&state_v1)
-                .expect("v1 commit should succeed");
+        let persistence = AppPersistence::open_path(&path).unwrap();
+        assert!(persistence.load().unwrap().is_none());
+        let parent = path.parent().unwrap();
+        let prefix = format!("{}.v1-backup-", path.file_stem().unwrap().to_string_lossy());
+        let backup = fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|candidate| {
+                candidate
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+            })
+            .expect("v1 backup should exist");
+        let preserved = Connection::open(&backup)
+            .unwrap()
+            .query_row("SELECT value FROM legacy_marker", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        assert_eq!(preserved, "preserve-me");
+        fs::remove_file(path).ok();
+        fs::remove_file(backup).ok();
+    }
+
+    #[test]
+    fn failed_sqlite_commit_rolls_back_state_and_revision() {
+        let mut persistence = AppPersistence::open_in_memory().unwrap();
+        let state = seeded_state();
+        persistence.commit(&state, 3).unwrap();
+        let mut invalid = state.clone();
+        invalid.profiles.clear();
+        assert!(persistence.commit(&invalid, 4).is_err());
+        let (loaded, revision) = persistence.load().unwrap().unwrap();
+        assert_eq!(revision, 3);
+        assert_eq!(loaded.profiles, state.profiles);
+        assert_eq!(loaded.workspaces, state.workspaces);
+    }
+
+    #[test]
+    fn history_has_no_implicit_limit_and_clear_scopes_persist() {
+        let mut persistence = AppPersistence::open_in_memory().unwrap();
+        let mut state = seeded_state();
+        let first_profile = state.active_profile_id.unwrap();
+        for index in 0..600 {
+            switchboard_core::reducer::apply_intent(
+                &mut state,
+                Intent::RecordHistory {
+                    profile_id: first_profile,
+                    url: format!("https://history-{index}.example"),
+                    title: format!("History {index}"),
+                    visited_at_ms: index,
+                },
+            )
+            .unwrap();
         }
+        switchboard_core::reducer::apply_intent(
+            &mut state,
+            Intent::NewProfile {
+                name: "Other".into(),
+            },
+        )
+        .unwrap();
+        let second_profile = state.active_profile_id.unwrap();
+        switchboard_core::reducer::apply_intent(
+            &mut state,
+            Intent::RecordHistory {
+                profile_id: second_profile,
+                url: "https://other.example".into(),
+                title: "Other".into(),
+                visited_at_ms: 700,
+            },
+        )
+        .unwrap();
 
-        let mut state_v2 = state_v1.clone();
-        state_v2.settings.insert(
-            "homepage".to_owned(),
-            SettingValue::Text("https://v2.example".to_owned()),
+        persistence.commit(&state, 1).unwrap();
+        let (mut loaded, _) = persistence.load().unwrap().unwrap();
+        assert_eq!(loaded.history[&first_profile].len(), 600);
+        switchboard_core::reducer::apply_intent(
+            &mut loaded,
+            Intent::ClearHistory {
+                scope: switchboard_core::ClearHistoryScope::Profile(first_profile),
+            },
+        )
+        .unwrap();
+        persistence.commit(&loaded, 2).unwrap();
+        let (mut loaded, _) = persistence.load().unwrap().unwrap();
+        assert!(!loaded.history.contains_key(&first_profile));
+        assert_eq!(loaded.history[&second_profile].len(), 1);
+
+        switchboard_core::reducer::apply_intent(
+            &mut loaded,
+            Intent::ClearHistory {
+                scope: switchboard_core::ClearHistoryScope::All,
+            },
+        )
+        .unwrap();
+        persistence.commit(&loaded, 3).unwrap();
+        let (loaded, _) = persistence.load().unwrap().unwrap();
+        assert!(loaded.history.is_empty());
+    }
+
+    #[test]
+    fn smoke_database_override_must_be_absolute() {
+        let configured = PathBuf::from("/private/tmp/switchboard-smoke/state.sqlite3");
+        assert_eq!(
+            resolve_state_db_path(Some(configured.clone()), None).unwrap(),
+            configured
         );
-        state_v2
-            .settings
-            .insert("restore_last_session".to_owned(), SettingValue::Bool(false));
-        state_v2.recompute_next_ids();
-
-        {
-            let mut persistence =
-                AppPersistence::open_path(&path).expect("reopen sqlite path for v2 commit");
-            let loaded_v1 = persistence
-                .load_state()
-                .expect("load after reopen should succeed")
-                .expect("persisted state should exist");
-            assert_eq!(loaded_v1.settings, state_v1.settings);
-
-            persistence
-                .commit(&state_v2)
-                .expect("v2 commit should succeed");
-        }
-
-        {
-            let mut persistence =
-                AppPersistence::open_path(&path).expect("reopen sqlite path for final load");
-            let loaded_v2 = persistence
-                .load_state()
-                .expect("final load should succeed")
-                .expect("persisted state should exist");
-            assert_eq!(loaded_v2.active_profile_id, state_v2.active_profile_id);
-            assert_eq!(loaded_v2.profiles, state_v2.profiles);
-            assert_eq!(loaded_v2.workspaces, state_v2.workspaces);
-            assert_eq!(loaded_v2.tabs, state_v2.tabs);
-            assert_eq!(loaded_v2.settings, state_v2.settings);
-        }
-
-        let _ = std::fs::remove_file(path);
+        assert!(resolve_state_db_path(Some(PathBuf::from("relative.sqlite3")), None).is_err());
     }
 }

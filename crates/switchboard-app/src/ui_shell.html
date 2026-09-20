@@ -15,9 +15,14 @@
       <div class="nav-row">
         <button id="nav-back" class="nav-btn" type="button" aria-label="Back">&lt;</button>
         <button id="nav-forward" class="nav-btn" type="button" aria-label="Forward">&gt;</button>
+        <button id="nav-reload" class="nav-btn" type="button" aria-label="Reload">&#8635;</button>
         <input id="url" class="uri-input" autocomplete="off" spellcheck="false">
       </div>
       <div class="titlebar-tools">
+        <span id="mode-indicator" class="mode-indicator" aria-live="polite">BROWSER</span>
+        <button id="split-toggle" class="devtools-toggle" type="button" title="Split · right-click to swap sides">Split</button>
+        <input id="split-ratio" class="split-ratio" type="range" min="25" max="75" step="1" value="50" aria-label="Split divider position" hidden>
+        <button id="focus-toggle" class="devtools-toggle" type="button">Focus</button>
         <button id="devtools-toggle" class="devtools-toggle" type="button">DevTools</button>
         <button id="settings-toggle" class="settings-toggle" type="button" aria-haspopup="dialog" aria-expanded="false">Settings</button>
       </div>
@@ -77,14 +82,21 @@
         </div>
       </div>
       <div id="tab-list" class="tab-list"></div>
-      <button id="tab-new" class="tab-new" type="button">+ New Page</button>
+      <div class="tab-footer-actions">
+        <button id="archive-open" class="tab-footer-action" type="button">Archive</button>
+        <button id="tab-new" class="tab-new" type="button">+ New Tab</button>
+      </div>
     </div>
+  </div>
+  <div id="restore-placeholder" class="restore-placeholder" hidden>
+    <span class="restore-spinner" aria-hidden="true"></span>
+    <span>Restoring tab…</span>
   </div>
   <div id="settings-backdrop" class="settings-backdrop" hidden></div>
   <div id="command-backdrop" class="command-backdrop" hidden></div>
-  <div id="command-panel" class="command-panel" role="dialog" aria-label="Navigation Command Bar" hidden>
+  <div id="command-panel" class="command-panel" role="dialog" aria-label="Lazy Search" hidden>
     <form id="command-form" class="command-form">
-      <label class="command-label" for="command-input">Search or enter address</label>
+      <label class="command-label" for="command-input">Lazy Search</label>
       <input
         id="command-input"
         class="command-input"
@@ -93,7 +105,8 @@
         spellcheck="false"
         placeholder="Search or enter address"
       >
-      <p class="command-hint">Enter to navigate, Esc to close</p>
+      <div id="command-results" class="command-results" role="listbox"></div>
+      <p class="command-hint">↑↓ select · Enter open · Esc close · &gt; commands · history: · done:</p>
     </form>
   </div>
   <div id="settings-panel" class="settings-panel" role="dialog" aria-label="Browser Settings" hidden>
@@ -149,40 +162,8 @@
         <span class="settings-label">Shortcut: Toggle DevTools</span>
         <input id="settings-keybinding-devtools" class="settings-input" type="text" spellcheck="false" autocomplete="off" placeholder="mod+shift+i">
       </label>
-      <div class="settings-divider settings-field-wide">Password Manager</div>
-      <div id="settings-password-manager-profile-note" class="settings-note settings-field-wide">Applies to active profile.</div>
-      <label class="settings-field">
-        <span class="settings-label">Provider</span>
-        <select id="settings-password-manager-provider" class="settings-select">
-          <option value="builtin">Built-in</option>
-          <option value="bitwarden">Bitwarden</option>
-          <option value="1password">1Password</option>
-          <option value="lastpass">LastPass</option>
-          <option value="none">None</option>
-        </select>
-      </label>
-      <label class="settings-field">
-        <span class="settings-label">Autofill</span>
-        <select id="settings-password-manager-autofill" class="settings-select">
-          <option value="enabled">Enabled</option>
-          <option value="disabled">Disabled</option>
-        </select>
-      </label>
-      <label class="settings-field">
-        <span class="settings-label">Save Credential Prompts</span>
-        <select id="settings-password-manager-save-prompt" class="settings-select">
-          <option value="enabled">Enabled</option>
-          <option value="disabled">Disabled</option>
-        </select>
-      </label>
-      <label class="settings-field">
-        <span class="settings-label">Fallback Behavior</span>
-        <select id="settings-password-manager-fallback" class="settings-select">
-          <option value="builtin">Fallback to built-in</option>
-          <option value="prompt">Ask every time</option>
-          <option value="none">No fallback</option>
-        </select>
-      </label>
+      <div class="settings-divider settings-field-wide">Password extensions</div>
+      <div class="settings-note settings-field-wide">Unavailable in this alpha: the Bitwarden, 1Password, and LastPass custom-chrome compatibility gate has not passed.</div>
     </div>
   </div>
   <script>

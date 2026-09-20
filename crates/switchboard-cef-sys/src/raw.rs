@@ -9,6 +9,7 @@ pub type cef_state_t = c_uint;
 pub type cef_runtime_style_t = c_uint;
 pub type cef_process_id_t = c_uint;
 pub type cef_errorcode_t = c_int;
+pub type cef_transition_type_t = c_uint;
 pub type cef_jsdialog_type_t = c_uint;
 pub type cef_scheme_options_t = c_uint;
 pub type cef_zoom_command_t = c_uint;
@@ -19,6 +20,7 @@ pub type cef_string_multimap_t = *mut c_void;
 pub type cef_window_handle_t = *mut c_void;
 pub type cef_cursor_handle_t = *mut c_void;
 pub type cef_cursor_type_t = c_uint;
+pub type cef_window_open_disposition_t = c_uint;
 
 pub const CEF_RUNTIME_STYLE_DEFAULT: cef_runtime_style_t = 0;
 pub const CEF_RUNTIME_STYLE_CHROME: cef_runtime_style_t = 1;
@@ -309,14 +311,64 @@ pub struct cef_keyboard_handler_t {
 }
 
 #[repr(C)]
-pub struct cef_life_span_handler_t {
+pub struct cef_popup_features_t {
     pub _private: [u8; 0],
 }
 
 #[repr(C)]
-pub struct cef_load_handler_t {
-    pub _private: [u8; 0],
+pub struct cef_life_span_handler_t {
+    pub base: cef_base_ref_counted_t,
+    pub on_before_popup: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_life_span_handler_t,
+            browser: *mut cef_browser_t,
+            frame: *mut cef_frame_t,
+            popup_id: c_int,
+            target_url: *const cef_string_t,
+            target_frame_name: *const cef_string_t,
+            target_disposition: cef_window_open_disposition_t,
+            user_gesture: c_int,
+            popup_features: *const cef_popup_features_t,
+            window_info: *mut cef_window_info_t,
+            client: *mut *mut cef_client_t,
+            settings: *mut cef_browser_settings_t,
+            extra_info: *mut *mut cef_dictionary_value_t,
+            no_javascript_access: *mut c_int,
+        ) -> c_int,
+    >,
+    pub on_before_popup_aborted: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_life_span_handler_t,
+            browser: *mut cef_browser_t,
+            popup_id: c_int,
+        ),
+    >,
+    pub on_before_dev_tools_popup: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_life_span_handler_t,
+            browser: *mut cef_browser_t,
+            window_info: *mut cef_window_info_t,
+            client: *mut *mut cef_client_t,
+            settings: *mut cef_browser_settings_t,
+            extra_info: *mut *mut cef_dictionary_value_t,
+            use_default_window: *mut c_int,
+        ),
+    >,
+    pub on_after_created: Option<
+        unsafe extern "C" fn(self_: *mut cef_life_span_handler_t, browser: *mut cef_browser_t),
+    >,
+    pub do_close: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_life_span_handler_t,
+            browser: *mut cef_browser_t,
+        ) -> c_int,
+    >,
+    pub on_before_close: Option<
+        unsafe extern "C" fn(self_: *mut cef_life_span_handler_t, browser: *mut cef_browser_t),
+    >,
 }
+
+pub use crate::generated::cef_load_handler_t;
 
 #[repr(C)]
 pub struct cef_run_file_dialog_callback_t {
@@ -623,7 +675,101 @@ pub struct cef_dictionary_value_t {
 }
 
 #[repr(C)]
+pub struct cef_value_t {
+    pub _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct cef_preference_observer_t {
+    pub _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct cef_preference_manager_t {
+    pub base: cef_base_ref_counted_t,
+    pub has_preference: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_preference_manager_t,
+            name: *const cef_string_t,
+        ) -> c_int,
+    >,
+    pub get_preference: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_preference_manager_t,
+            name: *const cef_string_t,
+        ) -> *mut cef_value_t,
+    >,
+    pub get_all_preferences: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_preference_manager_t,
+            include_defaults: c_int,
+        ) -> *mut cef_dictionary_value_t,
+    >,
+    pub can_set_preference: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_preference_manager_t,
+            name: *const cef_string_t,
+        ) -> c_int,
+    >,
+    pub set_preference: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_preference_manager_t,
+            name: *const cef_string_t,
+            value: *mut cef_value_t,
+            error: *mut cef_string_t,
+        ) -> c_int,
+    >,
+    pub add_preference_observer: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_preference_manager_t,
+            name: *const cef_string_t,
+            observer: *mut cef_preference_observer_t,
+        ) -> *mut cef_registration_t,
+    >,
+}
+
+#[repr(C)]
 pub struct cef_request_context_t {
+    pub base: cef_preference_manager_t,
+    pub is_same: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_request_context_t,
+            other: *mut cef_request_context_t,
+        ) -> c_int,
+    >,
+    pub is_sharing_with: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_request_context_t,
+            other: *mut cef_request_context_t,
+        ) -> c_int,
+    >,
+    pub is_global: Option<unsafe extern "C" fn(self_: *mut cef_request_context_t) -> c_int>,
+    pub get_handler: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_request_context_t,
+        ) -> *mut cef_request_context_handler_t,
+    >,
+    pub get_cache_path:
+        Option<unsafe extern "C" fn(self_: *mut cef_request_context_t) -> cef_string_userfree_t>,
+    pub get_cookie_manager: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_request_context_t,
+            callback: *mut c_void,
+        ) -> *mut c_void,
+    >,
+    pub register_scheme_handler_factory: Option<
+        unsafe extern "C" fn(
+            self_: *mut cef_request_context_t,
+            scheme_name: *const cef_string_t,
+            domain_name: *const cef_string_t,
+            factory: *mut cef_scheme_handler_factory_t,
+        ) -> c_int,
+    >,
+}
+
+pub use crate::generated::cef_request_context_settings_t;
+
+pub struct cef_request_context_handler_t {
     pub _private: [u8; 0],
 }
 
@@ -931,6 +1077,12 @@ pub type cef_browser_host_create_browser_fn = unsafe extern "C" fn(
     extra_info: *mut cef_dictionary_value_t,
     request_context: *mut cef_request_context_t,
 ) -> c_int;
+
+pub type cef_request_context_create_context_fn = unsafe extern "C" fn(
+    settings: *const cef_request_context_settings_t,
+    handler: *mut cef_request_context_handler_t,
+)
+    -> *mut cef_request_context_t;
 
 pub type cef_register_scheme_handler_factory_fn = unsafe extern "C" fn(
     scheme_name: *const cef_string_t,

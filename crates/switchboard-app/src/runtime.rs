@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use std::convert::Infallible;
@@ -9,20 +10,21 @@ use std::convert::Infallible;
 use switchboard_core::NoopPersistence;
 use switchboard_core::{
     BrowserState, Engine, EngineError, Intent, Patch, ProfileId, SettingValue, TabId,
-    TabRuntimeState, WorkspaceId,
+    TabRuntimeState, TabStatus, WorkspaceId,
 };
 
-use crate::bridge::UiCommand;
+use crate::bridge::{
+    encode_server_message, SearchResult, SearchResultKind, ServerEnvelope, ServerMessage,
+    UiCommand, UiSnapshot, BRIDGE_PROTOCOL_VERSION, MAX_SEARCH_RESULTS,
+};
 use crate::host::{
-    install_content_event_handler, install_ui_command_handler, install_ui_state_provider,
-    install_window_event_handler, CefHost, ContentEvent, ContentViewId, UiViewId, WindowEvent,
-    WindowId, WindowSize,
+    install_content_event_handler, install_ui_command_handler, install_window_event_handler,
+    CefHost, ContentEvent, ContentViewId, UiViewId, WindowEvent, WindowId, WindowSize,
 };
 #[cfg(not(test))]
 use crate::persistence::{AppPersistence, AppPersistenceError};
 
 const UI_SHELL_URL_BASE: &str = "app://ui";
-const THUMBNAIL_MAX_ENTRIES: usize = 120;
 const WINDOW_WIDTH_SETTING_KEY: &str = "window.width";
 const WINDOW_HEIGHT_SETTING_KEY: &str = "window.height";
 const SEARCH_ENGINE_SETTING_KEY: &str = "search_engine";
@@ -33,11 +35,6 @@ const KEYBINDING_CLOSE_TAB_SETTING_KEY: &str = "keybinding_close_tab";
 const KEYBINDING_COMMAND_PALETTE_SETTING_KEY: &str = "keybinding_command_palette";
 const KEYBINDING_FOCUS_NAVIGATION_SETTING_KEY: &str = "keybinding_focus_navigation";
 const KEYBINDING_TOGGLE_DEVTOOLS_SETTING_KEY: &str = "keybinding_toggle_devtools";
-const PASSWORD_MANAGER_DEFAULT_PROVIDER_SETTING_KEY: &str = "password_manager.default_provider";
-const PASSWORD_MANAGER_DEFAULT_AUTOFILL_SETTING_KEY: &str = "password_manager.default_autofill";
-const PASSWORD_MANAGER_DEFAULT_SAVE_PROMPT_SETTING_KEY: &str =
-    "password_manager.default_save_prompt";
-const PASSWORD_MANAGER_DEFAULT_FALLBACK_SETTING_KEY: &str = "password_manager.default_fallback";
 const WINDOW_MIN_WIDTH: u32 = 640;
 const WINDOW_MIN_HEIGHT: u32 = 480;
 
@@ -66,12 +63,20 @@ pub enum RuntimeError<HError> {
 struct ContentBinding {
     view_id: ContentViewId,
     profile_id: ProfileId,
+    generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveTabBinding {
     content: ContentBinding,
     last_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRestore {
+    profile_id: ProfileId,
+    generation: u64,
+    url: String,
 }
 
 pub struct AppRuntime<H: CefHost> {
@@ -81,28 +86,29 @@ pub struct AppRuntime<H: CefHost> {
     ui_view_id: UiViewId,
     default_workspace_id: WorkspaceId,
     tab_bindings: BTreeMap<TabId, LiveTabBinding>,
-    thumbnail_lru: Vec<TabId>,
+    pending_restores: BTreeMap<TabId, PendingRestore>,
+    next_browser_generation: u64,
 }
 
 impl<H: CefHost + 'static> AppRuntime<H> {
     pub fn bootstrap(mut host: H, ui_version: &str) -> Result<Self, RuntimeError<H::Error>> {
         #[cfg(test)]
-        let (persistence, mut state) = (NoopPersistence, BrowserState::default());
+        let (persistence, mut state, revision) = (NoopPersistence, BrowserState::default(), 0);
 
         #[cfg(not(test))]
-        let (persistence, mut state) = {
-            let mut persistence = AppPersistence::open_default()
+        let (persistence, mut state, revision) = {
+            let persistence = AppPersistence::open_default()
                 .map_err(|error| RuntimeError::PersistenceInit(error.to_string()))?;
-            let state = persistence
-                .load_state()
+            let loaded = persistence
+                .load()
                 .map_err(|error| RuntimeError::PersistenceInit(error.to_string()))?
-                .unwrap_or_default();
-            (persistence, state)
+                .unwrap_or_else(|| (BrowserState::default(), 0));
+            (persistence, loaded.0, loaded.1)
         };
 
         let workspace_id = ensure_bootstrap_state(&mut state);
         let initial_window_size = restored_window_size(&state);
-        let mut engine = Engine::with_state(persistence, state, 0);
+        let mut engine = Engine::with_state(persistence, state, revision);
 
         let window_id = host
             .create_window("Switchboard", initial_window_size)
@@ -114,6 +120,7 @@ impl<H: CefHost + 'static> AppRuntime<H> {
 
         let ui_ready = UiCommand::UiReady {
             ui_version: ui_version.to_owned(),
+            last_revision: None,
         };
         engine
             .dispatch(ui_ready.into_intent())
@@ -126,7 +133,8 @@ impl<H: CefHost + 'static> AppRuntime<H> {
             ui_view_id,
             default_workspace_id: workspace_id,
             tab_bindings: BTreeMap::new(),
-            thumbnail_lru: Vec::new(),
+            pending_restores: BTreeMap::new(),
+            next_browser_generation: 1,
         })
     }
 
@@ -146,10 +154,6 @@ impl<H: CefHost + 'static> AppRuntime<H> {
         &self.engine
     }
 
-    pub fn has_tabs(&self) -> bool {
-        !self.engine.state().tabs.is_empty()
-    }
-
     #[cfg(test)]
     pub fn host(&self) -> &H {
         &self.host
@@ -159,16 +163,11 @@ impl<H: CefHost + 'static> AppRuntime<H> {
     where
         H::Error: Display,
     {
-        self.sync_runtime_views()?;
-
         let runtime_ptr: *mut Self = &mut self;
         install_ui_command_handler(Some(Box::new(move |command| unsafe {
             if let Err(error) = (*runtime_ptr).handle_ui_command(command) {
                 eprintln!("switchboard-app: UI command failed: {error}");
             }
-        })));
-        install_ui_state_provider(Some(Box::new(move || unsafe {
-            (*runtime_ptr).ui_shell_state_json()
         })));
         install_content_event_handler(Some(Box::new(move |event| unsafe {
             if let Err(error) = (*runtime_ptr).handle_content_event(event) {
@@ -183,7 +182,6 @@ impl<H: CefHost + 'static> AppRuntime<H> {
 
         let result = self.host.run_event_loop().map_err(RuntimeError::Host);
         install_ui_command_handler(None);
-        install_ui_state_provider(None);
         install_content_event_handler(None);
         install_window_event_handler(None);
         result
@@ -194,6 +192,55 @@ impl<H: CefHost + 'static> AppRuntime<H> {
         command: UiCommand,
     ) -> Result<Patch, RuntimeError<H::Error>> {
         match command {
+            UiCommand::UiReady { .. } => {
+                let _ = self.handle_intent(Intent::WakeSnoozed { now_ms: now_ms() })?;
+                self.send_snapshot(None)?;
+                self.sync_runtime_views()?;
+                Ok(self.empty_patch())
+            }
+            UiCommand::RequestResync { .. } => {
+                self.send_snapshot(None)?;
+                self.sync_runtime_views()?;
+                Ok(self.empty_patch())
+            }
+            UiCommand::FrameCommitted { tab_id, generation } => {
+                self.commit_restored_frame(TabId(tab_id), generation)
+            }
+            UiCommand::Search { query, limit } => {
+                let results = self.search(&query, limit.unwrap_or(20).min(MAX_SEARCH_RESULTS));
+                self.send_server_message(None, ServerMessage::SearchResults { query, results })?;
+                Ok(self.empty_patch())
+            }
+            UiCommand::SetUiOverlay { .. }
+            | UiCommand::SetBrowserMode { .. }
+            | UiCommand::SyncKeybindings { .. } => Ok(self.empty_patch()),
+            UiCommand::SetFocusMode { active } => {
+                self.host
+                    .set_focus_mode(active)
+                    .map_err(RuntimeError::Host)?;
+                self.sync_runtime_views()?;
+                Ok(self.empty_patch())
+            }
+            UiCommand::OpenLinkFromTab {
+                source_tab_id,
+                generation,
+                url,
+                secondary,
+            } => {
+                let source_tab_id = TabId(source_tab_id);
+                let current = self
+                    .tab_bindings
+                    .get(&source_tab_id)
+                    .is_some_and(|binding| binding.content.generation == generation);
+                if !current {
+                    return Ok(self.empty_patch());
+                }
+                self.handle_intent(Intent::OpenLinkFromTab {
+                    source_tab_id,
+                    url,
+                    secondary,
+                })
+            }
             UiCommand::NavigateActive { url } => {
                 if let Some(tab_id) = self.resolve_active_tab_id() {
                     return self.handle_intent(Intent::Navigate { tab_id, url });
@@ -214,6 +261,30 @@ impl<H: CefHost + 'static> AppRuntime<H> {
                 self.handle_intent(Intent::NewWorkspace { profile_id, name })
             }
             UiCommand::NewProfile { name } => self.handle_intent(Intent::NewProfile { name }),
+            UiCommand::GoBack => {
+                if let Some(binding) = self.active_binding() {
+                    self.host
+                        .go_back(binding.view_id)
+                        .map_err(RuntimeError::Host)?;
+                }
+                Ok(self.empty_patch())
+            }
+            UiCommand::GoForward => {
+                if let Some(binding) = self.active_binding() {
+                    self.host
+                        .go_forward(binding.view_id)
+                        .map_err(RuntimeError::Host)?;
+                }
+                Ok(self.empty_patch())
+            }
+            UiCommand::Reload => {
+                if let Some(binding) = self.active_binding() {
+                    self.host
+                        .reload(binding.view_id)
+                        .map_err(RuntimeError::Host)?;
+                }
+                Ok(self.empty_patch())
+            }
             UiCommand::ToggleDevTools => {
                 self.host
                     .toggle_dev_tools_for_active_content()
@@ -230,13 +301,24 @@ impl<H: CefHost + 'static> AppRuntime<H> {
     }
 
     pub fn handle_intent(&mut self, intent: Intent) -> Result<Patch, RuntimeError<H::Error>> {
-        if let Intent::Navigate { url, .. } = &intent {
+        if let Intent::Navigate { url, .. }
+        | Intent::NewSubtab { url, .. }
+        | Intent::OpenLinkFromTab { url, .. } = &intent
+        {
             if url.starts_with("app://") {
                 return Err(RuntimeError::BlockedContentNavigation(url.clone()));
             }
         }
 
         let patch = self.engine.dispatch(intent).map_err(RuntimeError::Engine)?;
+        if !patch.ops.is_empty() {
+            self.send_server_message(
+                None,
+                ServerMessage::Patch {
+                    patch: patch.clone(),
+                },
+            )?;
+        }
         self.sync_runtime_views()?;
         Ok(patch)
     }
@@ -245,35 +327,81 @@ impl<H: CefHost + 'static> AppRuntime<H> {
         &mut self,
         event: ContentEvent,
     ) -> Result<Patch, RuntimeError<H::Error>> {
-        let (intent, tab_id, should_capture_thumbnail) = match event {
-            ContentEvent::UrlChanged { tab_id, url } => {
-                (Intent::ObserveTabUrl { tab_id, url }, tab_id, false)
+        if let ContentEvent::BrowserClosed { tab_id, .. } = &event {
+            if let Some(pending) = self.pending_restores.get(tab_id) {
+                if !self.host.has_live_content_browser(*tab_id) {
+                    self.send_server_message(
+                        None,
+                        ServerMessage::RestoreRequested {
+                            tab_id: *tab_id,
+                            generation: pending.generation,
+                        },
+                    )?;
+                }
             }
-            ContentEvent::TitleChanged { tab_id, title } => {
-                (Intent::ObserveTabTitle { tab_id, title }, tab_id, false)
+            return Ok(self.empty_patch());
+        }
+        let (tab_id, generation) = match &event {
+            ContentEvent::UrlChanged {
+                tab_id, generation, ..
             }
-            ContentEvent::LoadingChanged { tab_id, is_loading } => (
-                Intent::ObserveTabLoading { tab_id, is_loading },
-                tab_id,
-                !is_loading,
-            ),
+            | ContentEvent::TitleChanged {
+                tab_id, generation, ..
+            }
+            | ContentEvent::LoadingChanged {
+                tab_id, generation, ..
+            }
+            | ContentEvent::MainFrameLoadSucceeded { tab_id, generation }
+            | ContentEvent::NavigationStateChanged {
+                tab_id, generation, ..
+            } => (*tab_id, *generation),
+            ContentEvent::BrowserClosed { .. } => unreachable!(),
         };
 
-        if !self.engine.state().tabs.contains_key(&tab_id) {
-            let revision = self.revision();
-            return Ok(Patch {
-                ops: Vec::new(),
-                from_revision: revision,
-                to_revision: revision,
-            });
+        let binding_is_current = self
+            .tab_bindings
+            .get(&tab_id)
+            .is_some_and(|binding| binding.content.generation == generation);
+        if !binding_is_current || !self.engine.state().tabs.contains_key(&tab_id) {
+            return Ok(self.empty_patch());
         }
 
-        let patch = self.handle_intent(intent)?;
-        if should_capture_thumbnail {
-            self.capture_thumbnail_for_tab(tab_id)?;
-            self.cleanup_thumbnail_storage()?;
+        if matches!(&event, ContentEvent::MainFrameLoadSucceeded { .. }) {
+            if let Some(tab) = self.engine.state().tabs.get(&tab_id).cloned() {
+                if tab.status.is_open()
+                    && (tab.url.starts_with("https://") || tab.url.starts_with("http://"))
+                {
+                    return self.handle_intent(Intent::RecordHistory {
+                        profile_id: tab.profile_id,
+                        url: tab.url,
+                        title: tab.title,
+                        visited_at_ms: now_ms(),
+                    });
+                }
+            }
+            return Ok(self.empty_patch());
         }
-        Ok(patch)
+
+        let intent = match event {
+            ContentEvent::UrlChanged { url, .. } => Intent::ObserveTabUrl { tab_id, url },
+            ContentEvent::TitleChanged { title, .. } => Intent::ObserveTabTitle { tab_id, title },
+            ContentEvent::LoadingChanged { is_loading, .. } => {
+                Intent::ObserveTabLoading { tab_id, is_loading }
+            }
+            ContentEvent::NavigationStateChanged {
+                can_go_back,
+                can_go_forward,
+                ..
+            } => Intent::ObserveTabNavigationState {
+                tab_id,
+                can_go_back,
+                can_go_forward,
+            },
+            ContentEvent::MainFrameLoadSucceeded { .. } => unreachable!(),
+            ContentEvent::BrowserClosed { .. } => unreachable!(),
+        };
+
+        self.handle_intent(intent)
     }
 
     pub fn handle_window_event(
@@ -308,6 +436,21 @@ impl<H: CefHost + 'static> AppRuntime<H> {
 
     fn resolve_active_profile_id(&self) -> Option<ProfileId> {
         self.engine.state().active_profile_id
+    }
+
+    fn active_binding(&self) -> Option<ContentBinding> {
+        let tab_id = self.resolve_active_tab_id()?;
+        self.tab_bindings
+            .get(&tab_id)
+            .map(|binding| binding.content)
+    }
+
+    fn empty_patch(&self) -> Patch {
+        Patch {
+            ops: Vec::new(),
+            from_revision: self.revision(),
+            to_revision: self.revision(),
+        }
     }
 
     fn persist_window_size(
@@ -354,7 +497,16 @@ impl<H: CefHost + 'static> AppRuntime<H> {
 
     fn sync_runtime_views(&mut self) -> Result<(), RuntimeError<H::Error>> {
         let active_profile_id = self.resolve_active_profile_id();
-        let active_tab_id = self.resolve_active_tab_id();
+        let active_workspace = self
+            .resolve_active_workspace_id()
+            .and_then(|id| self.engine.state().workspaces.get(&id).cloned());
+        let primary_tab_id = active_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.primary_tab_id);
+        let secondary_tab_id = active_workspace
+            .as_ref()
+            .filter(|workspace| workspace.split_enabled)
+            .and_then(|workspace| workspace.secondary_tab_id);
 
         let desired_live_tabs: Vec<(TabId, ProfileId, String)> = self
             .engine
@@ -364,7 +516,10 @@ impl<H: CefHost + 'static> AppRuntime<H> {
             .filter(|tab| {
                 matches!(
                     tab.runtime_state,
-                    TabRuntimeState::Active | TabRuntimeState::Warm
+                    TabRuntimeState::Active
+                        | TabRuntimeState::Secondary
+                        | TabRuntimeState::Warm
+                        | TabRuntimeState::Restoring
                 )
             })
             .map(|tab| (tab.id, tab.profile_id, tab.url.clone()))
@@ -373,6 +528,8 @@ impl<H: CefHost + 'static> AppRuntime<H> {
             .iter()
             .map(|(tab_id, _, _)| *tab_id)
             .collect();
+        self.pending_restores
+            .retain(|tab_id, _| desired_live_ids.contains(tab_id));
 
         let stale_tabs: Vec<TabId> = self
             .tab_bindings
@@ -388,6 +545,7 @@ impl<H: CefHost + 'static> AppRuntime<H> {
             }
         }
 
+        let mut restore_requests = Vec::new();
         for (tab_id, profile_id, url) in desired_live_tabs {
             match self.tab_bindings.get(&tab_id).cloned() {
                 Some(existing) => {
@@ -402,22 +560,30 @@ impl<H: CefHost + 'static> AppRuntime<H> {
                     }
                 }
                 None => {
-                    let view_id = self
-                        .host
-                        .create_content_view(self.window_id, tab_id, &url)
-                        .map_err(RuntimeError::Host)?;
-                    self.tab_bindings.insert(
-                        tab_id,
-                        LiveTabBinding {
-                            content: ContentBinding {
-                                view_id,
-                                profile_id,
-                            },
-                            last_url: url,
-                        },
-                    );
+                    let pending = self.pending_restores.entry(tab_id).or_insert_with(|| {
+                        let generation = self.next_browser_generation;
+                        self.next_browser_generation =
+                            self.next_browser_generation.saturating_add(1);
+                        PendingRestore {
+                            profile_id,
+                            generation,
+                            url: url.clone(),
+                        }
+                    });
+                    if pending.profile_id != profile_id || pending.url != url {
+                        pending.profile_id = profile_id;
+                        pending.url = url;
+                        pending.generation = self.next_browser_generation;
+                        self.next_browser_generation =
+                            self.next_browser_generation.saturating_add(1);
+                    }
+                    restore_requests.push((tab_id, pending.generation));
                 }
             }
+        }
+
+        for (tab_id, generation) in restore_requests {
+            self.send_server_message(None, ServerMessage::RestoreRequested { tab_id, generation })?;
         }
 
         let visibility: Vec<(TabId, ContentBinding)> = self
@@ -426,198 +592,342 @@ impl<H: CefHost + 'static> AppRuntime<H> {
             .map(|(tab_id, binding)| (*tab_id, binding.content))
             .collect();
         for (tab_id, binding) in visibility {
-            let visible =
-                Some(tab_id) == active_tab_id && Some(binding.profile_id) == active_profile_id;
+            let visible = (Some(tab_id) == primary_tab_id || Some(tab_id) == secondary_tab_id)
+                && Some(binding.profile_id) == active_profile_id;
             self.host
                 .set_content_view_visible(binding.view_id, visible)
                 .map_err(RuntimeError::Host)?;
         }
 
-        Ok(())
-    }
-
-    fn capture_thumbnail_for_tab(&mut self, tab_id: TabId) -> Result<(), RuntimeError<H::Error>> {
-        let Some(tab) = self.engine.state().tabs.get(&tab_id).cloned() else {
-            self.thumbnail_lru.retain(|candidate| *candidate != tab_id);
-            return Ok(());
-        };
-        let data_url = build_thumbnail_data_url(&tab.title, &tab.url);
-        self.engine
-            .dispatch(Intent::ObserveTabThumbnail {
-                tab_id,
-                data_url: Some(data_url),
-            })
-            .map_err(RuntimeError::Engine)?;
-        self.touch_thumbnail_lru(tab_id);
-        Ok(())
-    }
-
-    fn touch_thumbnail_lru(&mut self, tab_id: TabId) {
-        if let Some(index) = self
-            .thumbnail_lru
-            .iter()
-            .position(|candidate| *candidate == tab_id)
-        {
-            self.thumbnail_lru.remove(index);
-        }
-        self.thumbnail_lru.push(tab_id);
-    }
-
-    fn cleanup_thumbnail_storage(&mut self) -> Result<(), RuntimeError<H::Error>> {
-        self.thumbnail_lru.retain(|tab_id| {
-            self.engine
-                .state()
-                .tabs
-                .get(tab_id)
-                .and_then(|tab| tab.thumbnail_data_url.as_ref())
-                .is_some()
+        let primary_view = primary_tab_id
+            .and_then(|tab_id| self.tab_bindings.get(&tab_id))
+            .map(|binding| binding.content.view_id);
+        let secondary_view = secondary_tab_id
+            .and_then(|tab_id| self.tab_bindings.get(&tab_id))
+            .map(|binding| binding.content.view_id);
+        let ratio = active_workspace
+            .as_ref()
+            .map(|workspace| workspace.split_ratio)
+            .unwrap_or(0.5);
+        let split_enabled = active_workspace.as_ref().is_some_and(|workspace| {
+            workspace.split_enabled && workspace.secondary_tab_id.is_some()
         });
+        self.host
+            .layout_content_views(primary_view, secondary_view, ratio, split_enabled)
+            .map_err(RuntimeError::Host)?;
 
-        while self.thumbnail_lru.len() > THUMBNAIL_MAX_ENTRIES {
-            let tab_id = self.thumbnail_lru.remove(0);
-            let has_thumbnail = self
-                .engine
-                .state()
-                .tabs
-                .get(&tab_id)
-                .and_then(|tab| tab.thumbnail_data_url.as_ref())
-                .is_some();
-            if !has_thumbnail {
-                continue;
-            }
-            self.engine
-                .dispatch(Intent::ObserveTabThumbnail {
-                    tab_id,
-                    data_url: None,
-                })
-                .map_err(RuntimeError::Engine)?;
-        }
         Ok(())
+    }
+
+    fn commit_restored_frame(
+        &mut self,
+        tab_id: TabId,
+        generation: u64,
+    ) -> Result<Patch, RuntimeError<H::Error>> {
+        let Some(pending) = self.pending_restores.get(&tab_id).cloned() else {
+            return Ok(self.empty_patch());
+        };
+        if pending.generation != generation
+            || !self.engine.state().tabs.get(&tab_id).is_some_and(|tab| {
+                tab.profile_id == pending.profile_id
+                    && tab.url == pending.url
+                    && matches!(
+                        tab.runtime_state,
+                        TabRuntimeState::Active
+                            | TabRuntimeState::Secondary
+                            | TabRuntimeState::Warm
+                            | TabRuntimeState::Restoring
+                    )
+            })
+        {
+            return Ok(self.empty_patch());
+        }
+        if self.host.has_live_content_browser(tab_id) {
+            return Ok(self.empty_patch());
+        }
+        self.pending_restores.remove(&tab_id);
+        let view_id = self
+            .host
+            .create_content_view(
+                self.window_id,
+                pending.profile_id,
+                tab_id,
+                generation,
+                &pending.url,
+            )
+            .map_err(RuntimeError::Host)?;
+        self.tab_bindings.insert(
+            tab_id,
+            LiveTabBinding {
+                content: ContentBinding {
+                    view_id,
+                    profile_id: pending.profile_id,
+                    generation,
+                },
+                last_url: pending.url,
+            },
+        );
+        let patch = self
+            .engine
+            .dispatch(Intent::TabFrameCommitted { tab_id, generation })
+            .map_err(RuntimeError::Engine)?;
+        if !patch.ops.is_empty() {
+            self.send_server_message(None, ServerMessage::Patch { patch })?;
+        }
+        self.sync_runtime_views()?;
+        Ok(self.empty_patch())
     }
 
     pub fn ui_shell_state_json(&self) -> String {
+        serde_json::to_string(&self.ui_snapshot()).unwrap_or_else(|error| {
+            format!(
+                "{{\"revision\":{},\"error\":{}}}",
+                self.revision(),
+                serde_json::to_string(&error.to_string()).unwrap_or_default()
+            )
+        })
+    }
+
+    fn ui_snapshot(&self) -> UiSnapshot {
         let state = self.engine.state();
-        let mut json = String::new();
-        json.push('{');
-        json.push_str("\"revision\":");
-        json.push_str(&self.revision().to_string());
-        json.push(',');
-        json.push_str("\"active_profile_id\":");
-        match state.active_profile_id {
-            Some(profile_id) => json.push_str(&profile_id.0.to_string()),
-            None => json.push_str("null"),
+        UiSnapshot {
+            revision: self.revision(),
+            active_profile_id: state.active_profile_id,
+            profiles: state.profiles.values().cloned().collect(),
+            workspaces: state.workspaces.values().cloned().collect(),
+            tabs: state.tabs.values().cloned().collect(),
+            settings: state.settings.clone(),
         }
-        json.push(',');
-        json.push_str("\"profiles\":[");
-        let mut first = true;
-        for profile in state.profiles.values() {
-            if !first {
-                json.push(',');
-            }
-            first = false;
-            json.push('{');
-            json.push_str("\"id\":");
-            json.push_str(&profile.id.0.to_string());
-            json.push(',');
-            json.push_str("\"name\":");
-            push_json_string(&mut json, &profile.name);
-            json.push(',');
-            json.push_str("\"active_workspace_id\":");
-            match profile.active_workspace_id {
-                Some(workspace_id) => json.push_str(&workspace_id.0.to_string()),
-                None => json.push_str("null"),
-            }
-            json.push(',');
-            json.push_str("\"workspace_order\":[");
-            for (index, workspace_id) in profile.workspace_order.iter().enumerate() {
-                if index > 0 {
-                    json.push(',');
+    }
+
+    fn send_snapshot(&mut self, request_id: Option<String>) -> Result<(), RuntimeError<H::Error>> {
+        self.send_server_message(
+            request_id,
+            ServerMessage::Snapshot {
+                snapshot: self.ui_snapshot(),
+            },
+        )
+    }
+
+    fn send_server_message(
+        &mut self,
+        request_id: Option<String>,
+        message: ServerMessage,
+    ) -> Result<(), RuntimeError<H::Error>> {
+        let envelope = ServerEnvelope {
+            protocol_version: BRIDGE_PROTOCOL_VERSION,
+            request_id,
+            revision: self.revision(),
+            message,
+        };
+        let payload = encode_server_message(&envelope).map_err(|error| {
+            RuntimeError::PersistenceInit(format!("bridge serialization failed: {error}"))
+        })?;
+        self.host
+            .send_ui_message(&payload)
+            .map_err(RuntimeError::Host)
+    }
+
+    fn search(&self, raw_query: &str, limit: usize) -> Vec<SearchResult> {
+        let state = self.engine.state();
+        let trimmed = raw_query.trim();
+        let (mode, query) = if let Some(value) = trimmed.strip_prefix("done:") {
+            ("done", value.trim())
+        } else if let Some(value) = trimmed.strip_prefix("history:") {
+            ("history", value.trim())
+        } else if let Some(value) = trimmed.strip_prefix('>') {
+            ("commands", value.trim())
+        } else {
+            ("all", trimmed)
+        };
+        let needle = query.to_ascii_lowercase();
+        let mut ranked: Vec<(u8, u64, i64, SearchResult)> = Vec::new();
+
+        if mode == "all" || mode == "commands" {
+            for (id, title, subtitle) in [
+                (
+                    "new_workspace",
+                    "New workspace",
+                    "Create a workspace in the active profile",
+                ),
+                (
+                    "show_archive",
+                    "Open archive",
+                    "Restore or permanently delete completed tabs",
+                ),
+                (
+                    "toggle_split",
+                    "Toggle split view",
+                    "Show two tabs side by side",
+                ),
+                (
+                    "toggle_focus",
+                    "Toggle focus mode",
+                    "Hide or show Switchboard chrome",
+                ),
+                (
+                    "open_settings",
+                    "Open settings",
+                    "Configure browser behavior and shortcuts",
+                ),
+                (
+                    "clear_profile_history",
+                    "Clear profile history",
+                    "Remove history for the active profile",
+                ),
+                (
+                    "clear_archive",
+                    "Clear completed tabs",
+                    "Permanently delete unlocked completed tabs in this profile",
+                ),
+            ] {
+                if let Some(score) = match_score(&needle, title, subtitle) {
+                    ranked.push((
+                        score,
+                        0,
+                        0,
+                        SearchResult {
+                            id: format!("command:{id}"),
+                            kind: SearchResultKind::Command,
+                            title: title.into(),
+                            subtitle: subtitle.into(),
+                            url: None,
+                            profile_id: None,
+                            workspace_id: None,
+                            tab_id: None,
+                            command: Some(id.into()),
+                        },
+                    ));
                 }
-                json.push_str(&workspace_id.0.to_string());
             }
-            json.push_str("]}");
         }
-        json.push_str("],");
-        json.push_str("\"workspaces\":[");
-        let mut first = true;
-        for workspace in state.workspaces.values() {
-            if !first {
-                json.push(',');
-            }
-            first = false;
-            json.push('{');
-            json.push_str("\"id\":");
-            json.push_str(&workspace.id.0.to_string());
-            json.push(',');
-            json.push_str("\"profile_id\":");
-            json.push_str(&workspace.profile_id.0.to_string());
-            json.push(',');
-            json.push_str("\"name\":");
-            push_json_string(&mut json, &workspace.name);
-            json.push(',');
-            json.push_str("\"active_tab_id\":");
-            match workspace.active_tab_id {
-                Some(tab_id) => json.push_str(&tab_id.0.to_string()),
-                None => json.push_str("null"),
-            }
-            json.push(',');
-            json.push_str("\"tab_order\":[");
-            for (index, tab_id) in workspace.tab_order.iter().enumerate() {
-                if index > 0 {
-                    json.push(',');
+
+        if mode == "all" {
+            for tab in state.tabs.values().filter(|tab| tab.status.is_open()) {
+                if let Some(score) = match_score(&needle, &tab.title, &tab.url) {
+                    let profile = state
+                        .profiles
+                        .get(&tab.profile_id)
+                        .map(|value| value.name.as_str())
+                        .unwrap_or("Profile");
+                    let workspace = state
+                        .workspaces
+                        .get(&tab.workspace_id)
+                        .map(|value| value.name.as_str())
+                        .unwrap_or("Workspace");
+                    ranked.push((
+                        score.saturating_add(1),
+                        0,
+                        0,
+                        SearchResult {
+                            id: format!("tab:{}", tab.id.0),
+                            kind: SearchResultKind::OpenTab,
+                            title: display_title(&tab.title, &tab.url),
+                            subtitle: format!("{profile} · {workspace} · {}", tab.url),
+                            url: Some(tab.url.clone()),
+                            profile_id: Some(tab.profile_id),
+                            workspace_id: Some(tab.workspace_id),
+                            tab_id: Some(tab.id),
+                            command: None,
+                        },
+                    ));
                 }
-                json.push_str(&tab_id.0.to_string());
             }
-            json.push_str("]}");
         }
-        json.push_str("],");
-        json.push_str("\"tabs\":[");
-        let mut first = true;
-        for tab in state.tabs.values() {
-            if !first {
-                json.push(',');
+
+        if mode == "done" {
+            for tab in state
+                .tabs
+                .values()
+                .filter(|tab| matches!(tab.status, TabStatus::Done { .. }))
+            {
+                if let Some(score) = match_score(&needle, &tab.title, &tab.url) {
+                    let completed = match tab.status {
+                        TabStatus::Done {
+                            completed_at_ms, ..
+                        } => completed_at_ms,
+                        _ => 0,
+                    };
+                    ranked.push((
+                        score,
+                        0,
+                        completed,
+                        SearchResult {
+                            id: format!("done:{}", tab.id.0),
+                            kind: SearchResultKind::ArchivedTab,
+                            title: display_title(&tab.title, &tab.url),
+                            subtitle: tab.url.clone(),
+                            url: Some(tab.url.clone()),
+                            profile_id: Some(tab.profile_id),
+                            workspace_id: Some(tab.workspace_id),
+                            tab_id: Some(tab.id),
+                            command: None,
+                        },
+                    ));
+                }
             }
-            first = false;
-            json.push('{');
-            json.push_str("\"id\":");
-            json.push_str(&tab.id.0.to_string());
-            json.push(',');
-            json.push_str("\"profile_id\":");
-            json.push_str(&tab.profile_id.0.to_string());
-            json.push(',');
-            json.push_str("\"workspace_id\":");
-            json.push_str(&tab.workspace_id.0.to_string());
-            json.push(',');
-            json.push_str("\"url\":");
-            push_json_string(&mut json, &tab.url);
-            json.push(',');
-            json.push_str("\"title\":");
-            push_json_string(&mut json, &tab.title);
-            json.push(',');
-            json.push_str("\"loading\":");
-            json.push_str(if tab.loading { "true" } else { "false" });
-            json.push(',');
-            json.push_str("\"thumbnail_data_url\":");
-            match &tab.thumbnail_data_url {
-                Some(value) => push_json_string(&mut json, value),
-                None => json.push_str("null"),
-            }
-            json.push_str("}");
         }
-        json.push_str("],");
-        json.push_str("\"settings\":{");
-        let mut first = true;
-        for (key, value) in &state.settings {
-            if !first {
-                json.push(',');
+
+        if mode == "all" || mode == "history" {
+            if let Some(profile_id) = state.active_profile_id {
+                if let Some(history) = state.history.get(&profile_id) {
+                    for entry in history {
+                        if let Some(score) = match_score(&needle, &entry.title, &entry.url) {
+                            ranked.push((
+                                score,
+                                entry.visit_count,
+                                entry.last_visit_ms,
+                                SearchResult {
+                                    id: format!("history:{}:{}", profile_id.0, entry.last_visit_ms),
+                                    kind: SearchResultKind::History,
+                                    title: display_title(&entry.title, &entry.url),
+                                    subtitle: entry.url.clone(),
+                                    url: Some(entry.url.clone()),
+                                    profile_id: Some(profile_id),
+                                    workspace_id: None,
+                                    tab_id: None,
+                                    command: None,
+                                },
+                            ));
+                        }
+                    }
+                }
             }
-            first = false;
-            push_json_string(&mut json, key);
-            json.push(':');
-            push_json_setting_value(&mut json, value);
         }
-        json.push_str("}}");
-        json
+
+        if mode == "all" && !query.is_empty() {
+            let url = web_fallback_url(state, query);
+            ranked.push((
+                0,
+                0,
+                0,
+                SearchResult {
+                    id: "web:fallback".into(),
+                    kind: SearchResultKind::Web,
+                    title: format!("Search the web for “{query}”"),
+                    subtitle: url.clone(),
+                    url: Some(url),
+                    profile_id: state.active_profile_id,
+                    workspace_id: state.active_workspace_id(),
+                    tab_id: None,
+                    command: None,
+                },
+            ));
+        }
+
+        ranked.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.cmp(&left.1))
+                .then_with(|| right.2.cmp(&left.2))
+                .then_with(|| left.3.title.cmp(&right.3.title))
+        });
+        ranked
+            .into_iter()
+            .take(limit)
+            .map(|(_, _, _, result)| result)
+            .collect()
     }
 }
 
@@ -632,6 +942,77 @@ fn restored_window_size(state: &BrowserState) -> WindowSize {
         .unwrap_or(defaults.height)
         .max(WINDOW_MIN_HEIGHT);
     WindowSize { width, height }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+fn match_score(needle: &str, title: &str, subtitle: &str) -> Option<u8> {
+    if needle.is_empty() {
+        return Some(1);
+    }
+    let title = title.to_ascii_lowercase();
+    let subtitle = subtitle.to_ascii_lowercase();
+    if title == needle || subtitle == needle {
+        Some(4)
+    } else if title.starts_with(needle) || subtitle.starts_with(needle) {
+        Some(3)
+    } else if title.contains(needle) || subtitle.contains(needle) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+fn display_title(title: &str, url: &str) -> String {
+    if title.trim().is_empty() {
+        url.to_owned()
+    } else {
+        title.to_owned()
+    }
+}
+
+fn web_fallback_url(state: &BrowserState, query: &str) -> String {
+    let direct = query.trim();
+    if direct.eq_ignore_ascii_case("about:blank")
+        || direct.starts_with("https://")
+        || direct.starts_with("http://")
+    {
+        return direct.to_owned();
+    }
+    if direct.contains('.') && !direct.contains(char::is_whitespace) {
+        return format!("https://{direct}");
+    }
+    let encoded = percent_encode_query(direct);
+    let engine = match state.settings.get(SEARCH_ENGINE_SETTING_KEY) {
+        Some(SettingValue::Text(value)) => value.as_str(),
+        _ => "google",
+    };
+    match engine {
+        "duckduckgo" => format!("https://duckduckgo.com/?q={encoded}"),
+        "bing" => format!("https://www.bing.com/search?q={encoded}"),
+        _ => format!("https://www.google.com/search?q={encoded}"),
+    }
+}
+
+fn percent_encode_query(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else if byte == b' ' {
+            encoded.push('+');
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn setting_int(state: &BrowserState, key: &str) -> Option<i64> {
@@ -674,22 +1055,6 @@ fn ensure_default_settings(state: &mut BrowserState) {
         .settings
         .entry(KEYBINDING_TOGGLE_DEVTOOLS_SETTING_KEY.to_owned())
         .or_insert_with(|| SettingValue::Text("mod+shift+i".to_owned()));
-    state
-        .settings
-        .entry(PASSWORD_MANAGER_DEFAULT_PROVIDER_SETTING_KEY.to_owned())
-        .or_insert_with(|| SettingValue::Text("builtin".to_owned()));
-    state
-        .settings
-        .entry(PASSWORD_MANAGER_DEFAULT_AUTOFILL_SETTING_KEY.to_owned())
-        .or_insert_with(|| SettingValue::Text("enabled".to_owned()));
-    state
-        .settings
-        .entry(PASSWORD_MANAGER_DEFAULT_SAVE_PROMPT_SETTING_KEY.to_owned())
-        .or_insert_with(|| SettingValue::Text("enabled".to_owned()));
-    state
-        .settings
-        .entry(PASSWORD_MANAGER_DEFAULT_FALLBACK_SETTING_KEY.to_owned())
-        .or_insert_with(|| SettingValue::Text("builtin".to_owned()));
 }
 
 fn ensure_bootstrap_state(state: &mut BrowserState) -> WorkspaceId {
@@ -743,7 +1108,7 @@ fn ensure_bootstrap_state(state: &mut BrowserState) -> WorkspaceId {
         let mut tab_order = state
             .tabs
             .iter()
-            .filter(|(_, tab)| tab.workspace_id == workspace_id)
+            .filter(|(_, tab)| tab.workspace_id == workspace_id && tab.status.is_open())
             .map(|(tab_id, _)| *tab_id)
             .collect::<Vec<_>>();
         tab_order.sort();
@@ -753,14 +1118,23 @@ fn ensure_bootstrap_state(state: &mut BrowserState) -> WorkspaceId {
                 workspace.tab_order = tab_order;
             }
             if workspace
-                .active_tab_id
+                .primary_tab_id
                 .map(|tab_id| !workspace.tab_order.contains(&tab_id))
                 .unwrap_or(true)
             {
-                workspace.active_tab_id = workspace.tab_order.first().copied();
+                workspace.set_primary(workspace.tab_order.first().copied());
             }
 
-            if let Some(active_tab_id) = workspace.active_tab_id {
+            workspace.active_tab_id = workspace.primary_tab_id;
+            if workspace
+                .secondary_tab_id
+                .is_some_and(|tab_id| !workspace.tab_order.contains(&tab_id))
+            {
+                workspace.secondary_tab_id = None;
+                workspace.split_enabled = false;
+            }
+
+            if let Some(active_tab_id) = workspace.primary_tab_id {
                 if let Some(active_tab) = state.tabs.get_mut(&active_tab_id) {
                     active_tab.runtime_state = TabRuntimeState::Active;
                 }
@@ -827,85 +1201,10 @@ impl<HError: Display> Display for RuntimeError<HError> {
 
 impl<HError: Error + 'static> Error for RuntimeError<HError> {}
 
-fn build_thumbnail_data_url(title: &str, url: &str) -> String {
-    let title_line = if title.trim().is_empty() {
-        "Untitled Tab"
-    } else {
-        title.trim()
-    };
-    let subtitle = if url.trim().is_empty() {
-        "about:blank"
-    } else {
-        url.trim()
-    };
-    let title_line = escape_xml(title_line);
-    let subtitle = escape_xml(subtitle);
-    let svg = format!(
-        "<svg xmlns='http://www.w3.org/2000/svg' width='288' height='180' viewBox='0 0 288 180'><defs><linearGradient id='bg' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='#111b31'/><stop offset='100%' stop-color='#1f365f'/></linearGradient></defs><rect width='288' height='180' fill='url(#bg)'/><rect x='12' y='12' width='264' height='156' rx='10' fill='rgba(8,16,30,0.62)' stroke='rgba(126,164,255,0.35)'/><text x='20' y='74' fill='#e7efff' font-size='15' font-family='-apple-system, Segoe UI, sans-serif'>{title_line}</text><text x='20' y='101' fill='#9fb5e3' font-size='11' font-family='-apple-system, Segoe UI, sans-serif'>{subtitle}</text></svg>"
-    );
-    format!(
-        "data:image/svg+xml;utf8,{}",
-        percent_encode_uri_component(&svg)
-    )
-}
-
-fn percent_encode_uri_component(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len() + 32);
-    for byte in value.bytes() {
-        let keep = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
-        if keep {
-            encoded.push(byte as char);
-        } else {
-            encoded.push('%');
-            encoded.push_str(&format!("{byte:02X}"));
-        }
-    }
-    encoded
-}
-
-fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('\"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-fn push_json_string(json: &mut String, value: &str) {
-    json.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => json.push_str("\\\""),
-            '\\' => json.push_str("\\\\"),
-            '\n' => json.push_str("\\n"),
-            '\r' => json.push_str("\\r"),
-            '\t' => json.push_str("\\t"),
-            '\u{08}' => json.push_str("\\b"),
-            '\u{0c}' => json.push_str("\\f"),
-            c if c <= '\u{1f}' => {
-                let code = c as u32;
-                json.push_str("\\u");
-                let hex = format!("{code:04x}");
-                json.push_str(&hex);
-            }
-            c => json.push(c),
-        }
-    }
-    json.push('"');
-}
-
-fn push_json_setting_value(json: &mut String, value: &SettingValue) {
-    match value {
-        SettingValue::Bool(flag) => json.push_str(if *flag { "true" } else { "false" }),
-        SettingValue::Int(number) => json.push_str(&number.to_string()),
-        SettingValue::Text(text) => push_json_string(json, text),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::BTreeSet;
     use std::rc::Rc;
 
     use crate::bridge::UiCommand;
@@ -923,6 +1222,7 @@ mod tests {
         next_ui_view_id: u64,
         next_content_view_id: u64,
         events: Rc<RefCell<Vec<HostEvent>>>,
+        live_tabs: Option<Rc<RefCell<BTreeSet<TabId>>>>,
     }
 
     impl RecordingHost {
@@ -932,7 +1232,17 @@ mod tests {
                 next_ui_view_id: 0,
                 next_content_view_id: 0,
                 events,
+                live_tabs: None,
             }
+        }
+
+        fn with_live_tracking(
+            events: Rc<RefCell<Vec<HostEvent>>>,
+            live_tabs: Rc<RefCell<BTreeSet<TabId>>>,
+        ) -> Self {
+            let mut host = Self::new(events);
+            host.live_tabs = Some(live_tabs);
+            host
         }
     }
 
@@ -975,17 +1285,24 @@ mod tests {
         fn create_content_view(
             &mut self,
             window_id: WindowId,
+            profile_id: switchboard_core::ProfileId,
             tab_id: TabId,
+            generation: u64,
             url: &str,
         ) -> Result<ContentViewId, Self::Error> {
             self.next_content_view_id += 1;
             let view_id = ContentViewId(self.next_content_view_id);
+            if let Some(live_tabs) = &self.live_tabs {
+                live_tabs.borrow_mut().insert(tab_id);
+            }
             self.events
                 .borrow_mut()
                 .push(HostEvent::ContentViewCreated {
                     window_id,
                     view_id,
+                    profile_id,
                     tab_id,
+                    generation,
                     url: url.to_owned(),
                 });
             Ok(view_id)
@@ -1013,6 +1330,68 @@ mod tests {
             Ok(())
         }
 
+        fn layout_content_views(
+            &mut self,
+            primary: Option<ContentViewId>,
+            secondary: Option<ContentViewId>,
+            ratio: f64,
+            split_enabled: bool,
+        ) -> Result<(), Self::Error> {
+            self.events
+                .borrow_mut()
+                .push(HostEvent::ContentLayoutChanged {
+                    primary,
+                    secondary,
+                    ratio_millis: (ratio.clamp(0.25, 0.75) * 1_000.0).round() as u16,
+                    split_enabled,
+                });
+            Ok(())
+        }
+
+        fn set_focus_mode(&mut self, active: bool) -> Result<(), Self::Error> {
+            self.events
+                .borrow_mut()
+                .push(HostEvent::FocusModeChanged { active });
+            Ok(())
+        }
+
+        fn go_back(&mut self, view_id: ContentViewId) -> Result<(), Self::Error> {
+            self.events
+                .borrow_mut()
+                .push(HostEvent::ContentHistoryAction {
+                    view_id,
+                    action: "back",
+                });
+            Ok(())
+        }
+
+        fn go_forward(&mut self, view_id: ContentViewId) -> Result<(), Self::Error> {
+            self.events
+                .borrow_mut()
+                .push(HostEvent::ContentHistoryAction {
+                    view_id,
+                    action: "forward",
+                });
+            Ok(())
+        }
+
+        fn reload(&mut self, view_id: ContentViewId) -> Result<(), Self::Error> {
+            self.events
+                .borrow_mut()
+                .push(HostEvent::ContentHistoryAction {
+                    view_id,
+                    action: "reload",
+                });
+            Ok(())
+        }
+
+        fn send_ui_message(&mut self, payload: &str) -> Result<(), Self::Error> {
+            self.events.borrow_mut().push(HostEvent::UiMessageSent {
+                payload: payload.to_owned(),
+            });
+            Ok(())
+        }
+
         fn toggle_dev_tools_for_active_content(&mut self) -> Result<(), Self::Error> {
             Ok(())
         }
@@ -1028,8 +1407,33 @@ mod tests {
             Ok(())
         }
 
+        fn has_live_content_browser(&self, tab_id: TabId) -> bool {
+            self.live_tabs
+                .as_ref()
+                .is_some_and(|live_tabs| live_tabs.borrow().contains(&tab_id))
+        }
+
         fn run_event_loop(&mut self) -> Result<(), Self::Error> {
             Ok(())
+        }
+    }
+
+    fn commit_pending<H: CefHost + 'static>(runtime: &mut AppRuntime<H>)
+    where
+        H::Error: std::fmt::Debug,
+    {
+        while let Some((tab_id, generation)) = runtime
+            .pending_restores
+            .iter()
+            .next()
+            .map(|(tab_id, pending)| (*tab_id, pending.generation))
+        {
+            runtime
+                .handle_ui_command(UiCommand::FrameCommitted {
+                    tab_id: tab_id.0,
+                    generation,
+                })
+                .expect("pending frame should commit");
         }
     }
 
@@ -1067,6 +1471,7 @@ mod tests {
         let tab_id = runtime
             .active_tab_id(workspace_id)
             .expect("new tab should be active");
+        commit_pending(&mut runtime);
 
         runtime
             .handle_ui_command(UiCommand::Navigate {
@@ -1145,6 +1550,7 @@ mod tests {
                 url: "https://example.com".to_owned(),
             })
             .expect("navigate active should succeed");
+        commit_pending(&mut runtime);
 
         let content_create_count = runtime
             .host()
@@ -1216,6 +1622,7 @@ mod tests {
         let first_tab_id = runtime
             .active_tab_id(workspace_id)
             .expect("first tab should be active");
+        commit_pending(&mut runtime);
 
         runtime
             .handle_ui_command(UiCommand::NewTab {
@@ -1224,6 +1631,7 @@ mod tests {
                 make_active: true,
             })
             .expect("second tab should succeed");
+        commit_pending(&mut runtime);
 
         runtime
             .handle_ui_command(UiCommand::ActivateTab {
@@ -1263,6 +1671,7 @@ mod tests {
         let active_tab_id = runtime
             .active_tab_id(workspace_id)
             .expect("tab should be active");
+        commit_pending(&mut runtime);
         let revision_before = runtime.revision();
 
         let patch = runtime
@@ -1309,16 +1718,20 @@ mod tests {
         let tab_id = runtime
             .active_tab_id(workspace_id)
             .expect("tab should be active");
+        commit_pending(&mut runtime);
+        let generation = runtime.tab_bindings[&tab_id].content.generation;
 
         runtime
             .handle_content_event(ContentEvent::TitleChanged {
                 tab_id,
+                generation,
                 title: "One Example".to_owned(),
             })
             .expect("title event should apply");
         runtime
             .handle_content_event(ContentEvent::LoadingChanged {
                 tab_id,
+                generation,
                 is_loading: true,
             })
             .expect("loading event should apply");
@@ -1331,6 +1744,44 @@ mod tests {
             .expect("tab should exist");
         assert_eq!(tab.title, "One Example");
         assert!(tab.loading);
+    }
+
+    #[test]
+    fn history_is_recorded_only_after_successful_main_frame_load() {
+        let host = MockCefHost::default();
+        let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
+        let workspace_id = runtime.default_workspace_id();
+
+        runtime
+            .handle_ui_command(UiCommand::NewTab {
+                workspace_id: workspace_id.0,
+                url: Some("https://history.example/path".to_owned()),
+                make_active: true,
+            })
+            .expect("tab should be created");
+        let tab_id = runtime
+            .active_tab_id(workspace_id)
+            .expect("tab should be active");
+        commit_pending(&mut runtime);
+        let generation = runtime.tab_bindings[&tab_id].content.generation;
+
+        runtime
+            .handle_content_event(ContentEvent::LoadingChanged {
+                tab_id,
+                generation,
+                is_loading: false,
+            })
+            .expect("loading state should apply");
+        assert!(runtime.engine().state().history.is_empty());
+
+        runtime
+            .handle_content_event(ContentEvent::MainFrameLoadSucceeded { tab_id, generation })
+            .expect("successful load should record history");
+
+        let profile_id = runtime.engine().state().tabs[&tab_id].profile_id;
+        let history = &runtime.engine().state().history[&profile_id];
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].url, "https://history.example/path");
     }
 
     #[test]
@@ -1349,6 +1800,8 @@ mod tests {
         let tab_id = runtime
             .active_tab_id(workspace_id)
             .expect("tab should be active");
+        commit_pending(&mut runtime);
+        let generation = runtime.tab_bindings[&tab_id].content.generation;
 
         runtime
             .handle_ui_command(UiCommand::CloseTab { tab_id: tab_id.0 })
@@ -1358,6 +1811,7 @@ mod tests {
         let patch = runtime
             .handle_content_event(ContentEvent::TitleChanged {
                 tab_id,
+                generation,
                 title: "stale".to_owned(),
             })
             .expect("stale event should be ignored");
@@ -1382,22 +1836,20 @@ mod tests {
             })
             .expect("tab creation should succeed");
 
-        let initial_content_creates = events
+        let before_commit_content_creates = events
             .borrow()
             .iter()
             .filter(|event| matches!(event, HostEvent::ContentViewCreated { .. }))
             .count();
-        assert_eq!(initial_content_creates, 1);
-
-        runtime.tab_bindings.clear();
-        runtime.run().expect("run should succeed");
-
-        let post_run_content_creates = events
+        assert_eq!(before_commit_content_creates, 0);
+        assert_eq!(runtime.pending_restores.len(), 1);
+        commit_pending(&mut runtime);
+        let after_commit_content_creates = events
             .borrow()
             .iter()
             .filter(|event| matches!(event, HostEvent::ContentViewCreated { .. }))
             .count();
-        assert_eq!(post_run_content_creates, 2);
+        assert_eq!(after_commit_content_creates, 1);
     }
 
     #[test]
@@ -1473,6 +1925,9 @@ mod tests {
         assert_eq!(patch.from_revision, expected_revision);
         assert_eq!(patch.to_revision, expected_revision + 1);
         expected_revision = patch.to_revision;
+        commit_pending(&mut runtime);
+        assert_eq!(runtime.revision(), expected_revision + 1);
+        expected_revision = runtime.revision();
 
         let patch = runtime
             .handle_ui_command(UiCommand::NewWorkspace {
@@ -1540,10 +1995,7 @@ mod tests {
         assert!(initial.contains("\"keybinding_command_palette\":\"space\""));
         assert!(initial.contains("\"keybinding_focus_navigation\":\"mod+l\""));
         assert!(initial.contains("\"keybinding_toggle_devtools\":\"mod+shift+i\""));
-        assert!(initial.contains("\"password_manager.default_provider\":\"builtin\""));
-        assert!(initial.contains("\"password_manager.default_autofill\":\"enabled\""));
-        assert!(initial.contains("\"password_manager.default_save_prompt\":\"enabled\""));
-        assert!(initial.contains("\"password_manager.default_fallback\":\"builtin\""));
+        assert!(!initial.contains("password_manager."));
 
         runtime
             .handle_ui_command(UiCommand::SettingSet {
@@ -1632,6 +2084,7 @@ mod tests {
                     make_active: true,
                 })
                 .expect("tab creation should succeed");
+            commit_pending(&mut runtime);
 
             let live_state_count = runtime
                 .engine()
@@ -1683,6 +2136,7 @@ mod tests {
                 make_active: true,
             })
             .expect("default profile tab should be created");
+        commit_pending(&mut runtime);
 
         runtime
             .handle_ui_command(UiCommand::NewProfile {
@@ -1712,6 +2166,7 @@ mod tests {
                 make_active: true,
             })
             .expect("second profile tab should be created");
+        commit_pending(&mut runtime);
 
         runtime
             .handle_ui_command(UiCommand::SwitchProfile {
@@ -1733,10 +2188,110 @@ mod tests {
             .count();
         assert!(content_create_count >= 2);
         assert!(content_destroy_count >= 1);
+        let created_profiles: BTreeSet<_> = runtime
+            .host()
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                HostEvent::ContentViewCreated { profile_id, .. } => Some(*profile_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(created_profiles.len(), 2);
     }
 
     #[test]
-    fn loading_complete_captures_thumbnail_placeholder() {
+    fn restore_waits_for_explicit_browser_close_completion() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let live_tabs = Rc::new(RefCell::new(BTreeSet::new()));
+        let host = RecordingHost::with_live_tracking(events.clone(), live_tabs.clone());
+        let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
+        let default_profile_id = runtime.engine().state().active_profile_id.unwrap();
+        let default_workspace_id = runtime.default_workspace_id();
+
+        runtime
+            .handle_ui_command(UiCommand::NewTab {
+                workspace_id: default_workspace_id.0,
+                url: Some("https://one.example".to_owned()),
+                make_active: true,
+            })
+            .unwrap();
+        let first_tab = runtime.active_tab_id(default_workspace_id).unwrap();
+        commit_pending(&mut runtime);
+        let first_generation = runtime.tab_bindings[&first_tab].content.generation;
+
+        runtime
+            .handle_ui_command(UiCommand::NewProfile {
+                name: "Work".to_owned(),
+            })
+            .unwrap();
+        let second_profile_id = runtime
+            .engine()
+            .state()
+            .active_profile_id
+            .filter(|profile_id| *profile_id != default_profile_id)
+            .unwrap();
+        let second_workspace_id = runtime.engine().state().profiles[&second_profile_id]
+            .active_workspace_id
+            .unwrap();
+        runtime
+            .handle_ui_command(UiCommand::NewTab {
+                workspace_id: second_workspace_id.0,
+                url: Some("https://two.example".to_owned()),
+                make_active: true,
+            })
+            .unwrap();
+        commit_pending(&mut runtime);
+
+        runtime
+            .handle_ui_command(UiCommand::SwitchProfile {
+                profile_id: default_profile_id.0,
+            })
+            .unwrap();
+        let restore_generation = runtime.pending_restores[&first_tab].generation;
+        runtime
+            .handle_ui_command(UiCommand::FrameCommitted {
+                tab_id: first_tab.0,
+                generation: restore_generation,
+            })
+            .unwrap();
+        assert!(runtime.pending_restores.contains_key(&first_tab));
+        assert_eq!(
+            events
+                .borrow()
+                .iter()
+                .filter(|event| matches!(event, HostEvent::ContentViewCreated { .. }))
+                .count(),
+            2
+        );
+
+        live_tabs.borrow_mut().remove(&first_tab);
+        runtime
+            .handle_content_event(ContentEvent::BrowserClosed {
+                tab_id: first_tab,
+                generation: first_generation,
+            })
+            .unwrap();
+        runtime
+            .handle_ui_command(UiCommand::FrameCommitted {
+                tab_id: first_tab.0,
+                generation: restore_generation,
+            })
+            .unwrap();
+
+        assert!(!runtime.pending_restores.contains_key(&first_tab));
+        assert_eq!(
+            events
+                .borrow()
+                .iter()
+                .filter(|event| matches!(event, HostEvent::ContentViewCreated { .. }))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn loading_complete_does_not_persist_synthetic_thumbnail() {
         let host = MockCefHost::default();
         let mut runtime = AppRuntime::bootstrap(host, "0.1.0").expect("bootstrap should succeed");
         let workspace_id = runtime.default_workspace_id();
@@ -1751,24 +2306,18 @@ mod tests {
         let tab_id = runtime
             .active_tab_id(workspace_id)
             .expect("tab should be active");
+        commit_pending(&mut runtime);
+        let generation = runtime.tab_bindings[&tab_id].content.generation;
 
         runtime
             .handle_content_event(ContentEvent::LoadingChanged {
                 tab_id,
+                generation,
                 is_loading: false,
             })
             .expect("loading complete should update metadata");
 
-        let tab = runtime
-            .engine()
-            .state()
-            .tabs
-            .get(&tab_id)
-            .expect("tab should exist");
-        let data_url = tab
-            .thumbnail_data_url
-            .as_ref()
-            .expect("thumbnail placeholder should be captured");
-        assert!(data_url.starts_with("data:image/svg+xml;utf8,"));
+        let state_json = runtime.ui_shell_state_json();
+        assert!(!state_json.contains("thumbnail_data_url"));
     }
 }

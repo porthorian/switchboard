@@ -1,6 +1,9 @@
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ProfileId(pub u64);
 
 impl Display for ProfileId {
@@ -9,7 +12,8 @@ impl Display for ProfileId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct WorkspaceId(pub u64);
 
 impl Display for WorkspaceId {
@@ -18,7 +22,8 @@ impl Display for WorkspaceId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct TabId(pub u64);
 
 impl Display for TabId {

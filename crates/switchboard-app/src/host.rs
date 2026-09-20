@@ -5,10 +5,10 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(target_os = "macos")]
-use std::sync::OnceLock;
-use switchboard_core::{SettingValue, TabId};
+use std::sync::{Mutex, OnceLock};
+use switchboard_core::{ProfileId, TabId};
 
-use crate::bridge::UiCommand;
+use crate::bridge::{decode_client_message, UiCommand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowId(pub u64);
@@ -50,13 +50,31 @@ pub enum HostEvent {
     ContentViewCreated {
         window_id: WindowId,
         view_id: ContentViewId,
+        profile_id: ProfileId,
         tab_id: TabId,
+        generation: u64,
         url: String,
     },
     ContentNavigated {
         view_id: ContentViewId,
         tab_id: TabId,
         url: String,
+    },
+    UiMessageSent {
+        payload: String,
+    },
+    ContentHistoryAction {
+        view_id: ContentViewId,
+        action: &'static str,
+    },
+    ContentLayoutChanged {
+        primary: Option<ContentViewId>,
+        secondary: Option<ContentViewId>,
+        ratio_millis: u16,
+        split_enabled: bool,
+    },
+    FocusModeChanged {
+        active: bool,
     },
     ContentViewDestroyed {
         view_id: ContentViewId,
@@ -98,7 +116,9 @@ pub trait CefHost {
     fn create_content_view(
         &mut self,
         window_id: WindowId,
+        profile_id: ProfileId,
         tab_id: TabId,
+        generation: u64,
         url: &str,
     ) -> Result<ContentViewId, Self::Error>;
 
@@ -115,6 +135,24 @@ pub trait CefHost {
         visible: bool,
     ) -> Result<(), Self::Error>;
 
+    fn layout_content_views(
+        &mut self,
+        primary: Option<ContentViewId>,
+        secondary: Option<ContentViewId>,
+        ratio: f64,
+        split_enabled: bool,
+    ) -> Result<(), Self::Error>;
+
+    fn set_focus_mode(&mut self, active: bool) -> Result<(), Self::Error>;
+
+    fn go_back(&mut self, view_id: ContentViewId) -> Result<(), Self::Error>;
+
+    fn go_forward(&mut self, view_id: ContentViewId) -> Result<(), Self::Error>;
+
+    fn reload(&mut self, view_id: ContentViewId) -> Result<(), Self::Error>;
+
+    fn send_ui_message(&mut self, payload: &str) -> Result<(), Self::Error>;
+
     fn toggle_dev_tools_for_active_content(&mut self) -> Result<(), Self::Error>;
 
     #[allow(dead_code)]
@@ -122,19 +160,48 @@ pub trait CefHost {
 
     fn destroy_content_view(&mut self, view_id: ContentViewId) -> Result<(), Self::Error>;
 
+    fn has_live_content_browser(&self, _tab_id: TabId) -> bool {
+        false
+    }
+
     fn run_event_loop(&mut self) -> Result<(), Self::Error>;
 }
 
 pub type UiCommandHandler = Box<dyn FnMut(UiCommand) + 'static>;
-pub type UiStateProvider = Box<dyn FnMut() -> String + 'static>;
 pub type ContentEventHandler = Box<dyn FnMut(ContentEvent) + 'static>;
 pub type WindowEventHandler = Box<dyn FnMut(WindowEvent) + 'static>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentEvent {
-    UrlChanged { tab_id: TabId, url: String },
-    TitleChanged { tab_id: TabId, title: String },
-    LoadingChanged { tab_id: TabId, is_loading: bool },
+    UrlChanged {
+        tab_id: TabId,
+        generation: u64,
+        url: String,
+    },
+    TitleChanged {
+        tab_id: TabId,
+        generation: u64,
+        title: String,
+    },
+    LoadingChanged {
+        tab_id: TabId,
+        generation: u64,
+        is_loading: bool,
+    },
+    MainFrameLoadSucceeded {
+        tab_id: TabId,
+        generation: u64,
+    },
+    BrowserClosed {
+        tab_id: TabId,
+        generation: u64,
+    },
+    NavigationStateChanged {
+        tab_id: TabId,
+        generation: u64,
+        can_go_back: bool,
+        can_go_forward: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,20 +258,42 @@ struct BrowserShortcutBindings {
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiShortcutAction {
+    Reload,
     CloseTab,
     CommandPalette,
     FocusNavigation,
     ToggleDevTools,
+    EnterBrowserMode,
+    EnterInsertMode,
+    NextTab,
+    PreviousTab,
+    NextWorkspace,
+    CompleteTab,
+    SnoozeTab,
+    ToggleFocus,
+    RestoreCompleted,
+    ToggleSplit,
 }
 
 #[cfg(target_os = "macos")]
 impl UiShortcutAction {
     fn host_token(self) -> &'static str {
         match self {
+            Self::Reload => "reload",
             Self::CloseTab => "close_tab",
             Self::CommandPalette => "command_palette",
             Self::FocusNavigation => "focus_navigation",
             Self::ToggleDevTools => "toggle_devtools",
+            Self::EnterBrowserMode => "enter_browser_mode",
+            Self::EnterInsertMode => "enter_insert_mode",
+            Self::NextTab => "next_tab",
+            Self::PreviousTab => "previous_tab",
+            Self::NextWorkspace => "next_workspace",
+            Self::CompleteTab => "complete_tab",
+            Self::SnoozeTab => "snooze_tab",
+            Self::ToggleFocus => "toggle_focus",
+            Self::RestoreCompleted => "restore_completed",
+            Self::ToggleSplit => "toggle_split",
         }
     }
 }
@@ -267,12 +356,10 @@ const DEFAULT_BROWSER_SHORTCUT_BINDINGS: BrowserShortcutBindings = BrowserShortc
 
 thread_local! {
     static UI_COMMAND_HANDLER: RefCell<Option<UiCommandHandler>> = RefCell::new(None);
-    static UI_STATE_PROVIDER: RefCell<Option<UiStateProvider>> = RefCell::new(None);
     static CONTENT_EVENT_HANDLER: RefCell<Option<ContentEventHandler>> = RefCell::new(None);
     static CONTENT_EVENT_QUEUE: RefCell<VecDeque<ContentEvent>> = RefCell::new(VecDeque::new());
     static CONTENT_EVENT_DISPATCHING: Cell<bool> = const { Cell::new(false) };
     static WINDOW_EVENT_HANDLER: RefCell<Option<WindowEventHandler>> = RefCell::new(None);
-    static ACTIVE_CONTENT_URI: RefCell<Option<String>> = const { RefCell::new(None) };
     static ACTIVE_CONTENT_TAB: RefCell<Option<TabId>> = const { RefCell::new(None) };
     #[cfg(target_os = "macos")]
     static UI_ROOT_VIEW: RefCell<ObjcId> = const { RefCell::new(std::ptr::null_mut()) };
@@ -280,6 +367,8 @@ thread_local! {
     static UI_SHELL_VIEW: RefCell<ObjcId> = const { RefCell::new(std::ptr::null_mut()) };
     #[cfg(target_os = "macos")]
     static UI_SHELL_BROWSER: RefCell<*mut cef_browser_t> = const { RefCell::new(std::ptr::null_mut()) };
+    #[cfg(target_os = "macos")]
+    static UI_SHELL_BROWSER_IDENTIFIER: Cell<Option<c_int>> = const { Cell::new(None) };
     #[cfg(target_os = "macos")]
     static ACTIVE_CONTENT_CONTAINER: RefCell<ObjcId> = const { RefCell::new(std::ptr::null_mut()) };
     #[cfg(target_os = "macos")]
@@ -289,18 +378,45 @@ thread_local! {
     #[cfg(target_os = "macos")]
     static ACTIVE_CONTENT_BROWSER: RefCell<*mut cef_browser_t> = const { RefCell::new(std::ptr::null_mut()) };
     #[cfg(target_os = "macos")]
-    static CONTENT_BROWSERS_BY_TAB: RefCell<HashMap<TabId, *mut cef_browser_t>> = RefCell::new(HashMap::new());
+    static CONTENT_BROWSERS_BY_TAB: RefCell<HashMap<TabId, RetainedContentBrowser>> = RefCell::new(HashMap::new());
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct RetainedContentBrowser {
+    generation: u64,
+    identifier: c_int,
+    browser: *mut cef_browser_t,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserCallbackAction {
+    Insert,
+    Keep,
+    RefreshWrapper,
+    Reject,
+}
+
+#[cfg(target_os = "macos")]
+fn browser_callback_action(
+    current_generation: Option<u64>,
+    incoming_generation: u64,
+    exact_pointer: bool,
+    same_browser: bool,
+) -> BrowserCallbackAction {
+    match current_generation {
+        None => BrowserCallbackAction::Insert,
+        Some(current) if current != incoming_generation => BrowserCallbackAction::Reject,
+        Some(_) if exact_pointer => BrowserCallbackAction::Keep,
+        Some(_) if same_browser => BrowserCallbackAction::RefreshWrapper,
+        Some(_) => BrowserCallbackAction::Reject,
+    }
 }
 
 pub fn install_ui_command_handler(handler: Option<UiCommandHandler>) {
     UI_COMMAND_HANDLER.with(|slot| {
         *slot.borrow_mut() = handler;
-    });
-}
-
-pub fn install_ui_state_provider(provider: Option<UiStateProvider>) {
-    UI_STATE_PROVIDER.with(|slot| {
-        *slot.borrow_mut() = provider;
     });
 }
 
@@ -324,15 +440,24 @@ fn emit_ui_command(command: UiCommand) {
     });
 }
 
-fn query_ui_shell_state() -> String {
-    UI_STATE_PROVIDER.with(|slot| {
-        let mut slot_ref = slot.borrow_mut();
-        if let Some(provider) = slot_ref.as_mut() {
-            return provider();
-        }
-        "{\"revision\":0,\"active_profile_id\":null,\"profiles\":[],\"workspaces\":[],\"tabs\":[]}"
-            .to_owned()
-    })
+#[cfg(target_os = "macos")]
+fn defer_ui_command(command: UiCommand) {
+    let context = Box::into_raw(Box::new(command)).cast::<c_void>();
+    unsafe {
+        let main_queue = std::ptr::addr_of!(_dispatch_main_q)
+            .cast::<c_void>()
+            .cast_mut();
+        dispatch_async_f(main_queue, context, run_deferred_ui_command);
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn run_deferred_ui_command(context: *mut c_void) {
+    if context.is_null() {
+        return;
+    }
+    let command = *Box::from_raw(context.cast::<UiCommand>());
+    emit_ui_command(command);
 }
 
 fn emit_content_event(event: ContentEvent) {
@@ -382,13 +507,6 @@ fn emit_window_event(event: WindowEvent) {
 }
 
 #[cfg(target_os = "macos")]
-fn set_active_content_uri(url: String) {
-    ACTIVE_CONTENT_URI.with(|slot| {
-        *slot.borrow_mut() = Some(url);
-    });
-}
-
-#[cfg(target_os = "macos")]
 fn set_active_content_tab(tab_id: Option<TabId>) {
     ACTIVE_CONTENT_TAB.with(|slot| {
         *slot.borrow_mut() = tab_id;
@@ -398,13 +516,6 @@ fn set_active_content_tab(tab_id: Option<TabId>) {
 #[cfg(target_os = "macos")]
 fn active_content_tab() -> Option<TabId> {
     ACTIVE_CONTENT_TAB.with(|slot| *slot.borrow())
-}
-
-#[cfg(target_os = "macos")]
-fn active_content_uri() -> String {
-    ACTIVE_CONTENT_URI
-        .with(|slot| slot.borrow().clone())
-        .unwrap_or_default()
 }
 
 #[cfg(target_os = "macos")]
@@ -420,50 +531,179 @@ fn active_content_browser() -> *mut cef_browser_t {
 }
 
 #[cfg(target_os = "macos")]
-fn remember_browser_for_active_tab(browser: *mut cef_browser_t) {
-    set_active_content_browser(browser);
+unsafe fn retain_cef_browser(browser: *mut cef_browser_t) {
     if browser.is_null() {
         return;
     }
-    if let Some(tab_id) = active_content_tab() {
-        CONTENT_BROWSERS_BY_TAB.with(|slot| {
-            slot.borrow_mut().insert(tab_id, browser);
-        });
+    if let Some(add_ref) = (*browser).base.add_ref {
+        add_ref(&mut (*browser).base);
     }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn release_cef_browser(browser: *mut cef_browser_t) {
+    if browser.is_null() {
+        return;
+    }
+    if let Some(release) = (*browser).base.release {
+        release(&mut (*browser).base);
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn remember_browser_for_tab(
+    tab_id: TabId,
+    generation: u64,
+    browser: *mut cef_browser_t,
+) -> bool {
+    if browser.is_null() {
+        return false;
+    }
+    let Some(identifier) = cef_browser_identifier(browser) else {
+        return false;
+    };
+    let accepted = CONTENT_BROWSERS_BY_TAB.with(|slot| {
+        let mut browsers = slot.borrow_mut();
+        if let Some(current) = browsers.get(&tab_id).copied() {
+            let action = browser_callback_action(
+                Some(current.generation),
+                generation,
+                current.browser == browser,
+                current.generation == generation && current.identifier == identifier,
+            );
+            match action {
+                BrowserCallbackAction::Keep => return true,
+                BrowserCallbackAction::RefreshWrapper => {
+                    // CEF may provide a different C wrapper for the same browser.
+                    // Retain the callback's current wrapper before releasing the
+                    // previously retained wrapper used by host actions.
+                    retain_cef_browser(browser);
+                    browsers.insert(
+                        tab_id,
+                        RetainedContentBrowser {
+                            generation,
+                            identifier,
+                            browser,
+                        },
+                    );
+                    release_cef_browser(current.browser);
+                    return true;
+                }
+                BrowserCallbackAction::Reject => {}
+                BrowserCallbackAction::Insert => unreachable!(),
+            }
+            // A tab must never own two live browsers. Keep the retained
+            // browser until its OnBeforeClose callback removes it; callbacks
+            // from a replacement/obsolete generation must not steal routing.
+            eprintln!(
+                "switchboard-app: ignored duplicate live CEF browser for tab {}",
+                tab_id.0
+            );
+            return false;
+        }
+        debug_assert_eq!(
+            browser_callback_action(None, generation, false, false),
+            BrowserCallbackAction::Insert
+        );
+        retain_cef_browser(browser);
+        browsers.insert(
+            tab_id,
+            RetainedContentBrowser {
+                generation,
+                identifier,
+                browser,
+            },
+        );
+        true
+    });
+    if accepted && active_content_tab() == Some(tab_id) {
+        set_active_content_browser(browser_for_tab(tab_id));
+    }
+    accepted
 }
 
 #[cfg(target_os = "macos")]
 fn browser_for_tab(tab_id: TabId) -> *mut cef_browser_t {
     CONTENT_BROWSERS_BY_TAB
-        .with(|slot| slot.borrow().get(&tab_id).copied())
+        .with(|slot| slot.borrow().get(&tab_id).map(|entry| entry.browser))
         .unwrap_or(std::ptr::null_mut())
 }
 
 #[cfg(target_os = "macos")]
-fn forget_browser_for_tab(tab_id: TabId) {
+unsafe fn content_browser_matches(
+    tab_id: TabId,
+    generation: u64,
+    browser: *mut cef_browser_t,
+) -> bool {
+    let Some(identifier) = cef_browser_identifier(browser) else {
+        return false;
+    };
     CONTENT_BROWSERS_BY_TAB.with(|slot| {
-        slot.borrow_mut().remove(&tab_id);
+        slot.borrow()
+            .get(&tab_id)
+            .is_some_and(|entry| entry.generation == generation && entry.identifier == identifier)
+    })
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn forget_browser_for_tab(tab_id: TabId, generation: u64) {
+    CONTENT_BROWSERS_BY_TAB.with(|slot| {
+        let should_remove = slot
+            .borrow()
+            .get(&tab_id)
+            .is_some_and(|entry| entry.generation == generation);
+        if should_remove {
+            if let Some(entry) = slot.borrow_mut().remove(&tab_id) {
+                release_cef_browser(entry.browser);
+            }
+        }
     });
 }
 
 #[cfg(target_os = "macos")]
-fn set_ui_shell_browser(browser: *mut cef_browser_t) {
+unsafe fn set_ui_shell_browser(browser: *mut cef_browser_t) {
+    let identifier = cef_browser_identifier(browser);
+    UI_SHELL_BROWSER_IDENTIFIER.with(|slot| slot.set(identifier));
     UI_SHELL_BROWSER.with(|slot| {
-        *slot.borrow_mut() = browser;
+        let mut current = slot.borrow_mut();
+        if *current == browser {
+            return;
+        }
+        let previous = std::mem::replace(&mut *current, browser);
+        retain_cef_browser(browser);
+        release_cef_browser(previous);
     });
 }
 
 #[cfg(target_os = "macos")]
-fn remember_ui_shell_browser(browser: *mut cef_browser_t) {
+unsafe fn remember_ui_shell_browser(browser: *mut cef_browser_t) {
     if browser.is_null() {
         return;
     }
-    set_ui_shell_browser(browser);
+    if ui_shell_browser().is_null() {
+        set_ui_shell_browser(browser);
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn ui_shell_browser() -> *mut cef_browser_t {
     UI_SHELL_BROWSER.with(|slot| *slot.borrow())
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn cef_browser_identifier(browser: *mut cef_browser_t) -> Option<c_int> {
+    if browser.is_null() {
+        return None;
+    }
+    (*browser).get_identifier.map(|callback| callback(browser))
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn ui_shell_browser_matches(browser: *mut cef_browser_t) -> bool {
+    let Some(identifier) = cef_browser_identifier(browser) else {
+        return false;
+    };
+    UI_SHELL_BROWSER_IDENTIFIER.with(|slot| slot.get() == Some(identifier))
 }
 
 #[cfg(target_os = "macos")]
@@ -500,7 +740,11 @@ fn parse_keybinding(value: &str) -> Option<Keybinding> {
     }
     let mut modifiers = KeybindingModifiers::default();
     let mut key = None;
-    for part in raw.split('+').map(str::trim).filter(|part| !part.is_empty()) {
+    for part in raw
+        .split('+')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
         match part {
             "mod" => modifiers.mod_key = true,
             "ctrl" => modifiers.ctrl = true,
@@ -656,6 +900,15 @@ fn event_key_token(event: &cef_key_event_t_switchboard) -> Option<KeyToken> {
 
 #[cfg(target_os = "macos")]
 fn fallback_shortcut_action(event: &cef_key_event_t_switchboard) -> Option<UiShortcutAction> {
+    let token = event_key_token(event)?;
+    let modifiers = event.modifiers
+        & (CEF_EVENTFLAG_SHIFT_DOWN
+            | CEF_EVENTFLAG_CONTROL_DOWN
+            | CEF_EVENTFLAG_ALT_DOWN
+            | CEF_EVENTFLAG_COMMAND_DOWN);
+    if modifiers == CEF_EVENTFLAG_COMMAND_DOWN && token == KeyToken::Character('r') {
+        return Some(UiShortcutAction::Reload);
+    }
     let bindings = browser_shortcut_bindings();
     if keybinding_matches_event(bindings.command_palette, event) {
         return Some(UiShortcutAction::CommandPalette);
@@ -669,7 +922,24 @@ fn fallback_shortcut_action(event: &cef_key_event_t_switchboard) -> Option<UiSho
     if keybinding_matches_event(bindings.toggle_devtools, event) {
         return Some(UiShortcutAction::ToggleDevTools);
     }
-    None
+    if modifiers == CEF_EVENTFLAG_SHIFT_DOWN && token == KeyToken::Space {
+        return Some(UiShortcutAction::ToggleSplit);
+    }
+    if modifiers != 0 {
+        return None;
+    }
+    match token {
+        KeyToken::Escape => Some(UiShortcutAction::EnterBrowserMode),
+        KeyToken::Character('i') => Some(UiShortcutAction::EnterInsertMode),
+        KeyToken::Character('j') => Some(UiShortcutAction::NextTab),
+        KeyToken::Character('k') => Some(UiShortcutAction::PreviousTab),
+        KeyToken::Character('w') => Some(UiShortcutAction::NextWorkspace),
+        KeyToken::Character('d') => Some(UiShortcutAction::CompleteTab),
+        KeyToken::Character('h') => Some(UiShortcutAction::SnoozeTab),
+        KeyToken::Character('f') => Some(UiShortcutAction::ToggleFocus),
+        KeyToken::Character('z') => Some(UiShortcutAction::RestoreCompleted),
+        _ => None,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -792,7 +1062,11 @@ fn apply_content_keybindings_border(container: ObjcId, active: bool) -> Result<(
         if layer == NIL {
             return Ok(());
         }
-        msg_send_void_bool(layer, selector("setMasksToBounds:")?, if active { YES } else { NO });
+        msg_send_void_bool(
+            layer,
+            selector("setMasksToBounds:")?,
+            if active { YES } else { NO },
+        );
         msg_send_void_f64(
             layer,
             selector("setCornerRadius:")?,
@@ -857,7 +1131,7 @@ impl CefHost for MockCefHost {
     }
 
     fn create_ui_view(&mut self, window_id: WindowId, url: &str) -> Result<UiViewId, Self::Error> {
-        if !url.starts_with("app://ui") {
+        if !is_exact_ui_url(url) {
             return Err(HostError::InvalidUiUrl(url.to_owned()));
         }
 
@@ -874,7 +1148,9 @@ impl CefHost for MockCefHost {
     fn create_content_view(
         &mut self,
         window_id: WindowId,
+        profile_id: ProfileId,
         tab_id: TabId,
+        generation: u64,
         url: &str,
     ) -> Result<ContentViewId, Self::Error> {
         self.next_content_view_id += 1;
@@ -882,7 +1158,9 @@ impl CefHost for MockCefHost {
         self.events.push(HostEvent::ContentViewCreated {
             window_id,
             view_id,
+            profile_id,
             tab_id,
+            generation,
             url: url.to_owned(),
         });
         Ok(view_id)
@@ -907,6 +1185,58 @@ impl CefHost for MockCefHost {
         _view_id: ContentViewId,
         _visible: bool,
     ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn layout_content_views(
+        &mut self,
+        primary: Option<ContentViewId>,
+        secondary: Option<ContentViewId>,
+        ratio: f64,
+        split_enabled: bool,
+    ) -> Result<(), Self::Error> {
+        self.events.push(HostEvent::ContentLayoutChanged {
+            primary,
+            secondary,
+            ratio_millis: (ratio.clamp(0.25, 0.75) * 1_000.0).round() as u16,
+            split_enabled,
+        });
+        Ok(())
+    }
+
+    fn set_focus_mode(&mut self, active: bool) -> Result<(), Self::Error> {
+        self.events.push(HostEvent::FocusModeChanged { active });
+        Ok(())
+    }
+
+    fn go_back(&mut self, view_id: ContentViewId) -> Result<(), Self::Error> {
+        self.events.push(HostEvent::ContentHistoryAction {
+            view_id,
+            action: "back",
+        });
+        Ok(())
+    }
+
+    fn go_forward(&mut self, view_id: ContentViewId) -> Result<(), Self::Error> {
+        self.events.push(HostEvent::ContentHistoryAction {
+            view_id,
+            action: "forward",
+        });
+        Ok(())
+    }
+
+    fn reload(&mut self, view_id: ContentViewId) -> Result<(), Self::Error> {
+        self.events.push(HostEvent::ContentHistoryAction {
+            view_id,
+            action: "reload",
+        });
+        Ok(())
+    }
+
+    fn send_ui_message(&mut self, payload: &str) -> Result<(), Self::Error> {
+        self.events.push(HostEvent::UiMessageSent {
+            payload: payload.to_owned(),
+        });
         Ok(())
     }
 
@@ -944,18 +1274,19 @@ use std::path::{Path, PathBuf};
 use std::slice;
 
 #[cfg(target_os = "macos")]
-use switchboard_cef_sys::loader::CefLibrary;
+use switchboard_cef_sys::loader::{CefLibrary, CefSandboxContext};
 #[cfg(target_os = "macos")]
 use switchboard_cef_sys::raw::{
     cef_app_t, cef_base_ref_counted_t, cef_browser_host_create_browser_fn, cef_browser_settings_t,
-    cef_browser_t, cef_callback_t, cef_client_t, cef_display_handler_t, cef_frame_t,
-    cef_jsdialog_callback_t, cef_jsdialog_handler_t, cef_keyboard_handler_t, cef_main_args_t,
-    cef_rect_t, cef_request_t, cef_resource_handler_t, cef_response_t,
-    cef_scheme_handler_factory_t, cef_scheme_registrar_t, cef_settings_t, cef_string_t,
-    cef_string_utf16_t, cef_window_info_t, CEF_RUNTIME_STYLE_ALLOY,
-    CEF_SCHEME_OPTION_CORS_ENABLED, CEF_SCHEME_OPTION_DISPLAY_ISOLATED,
-    CEF_SCHEME_OPTION_FETCH_ENABLED, CEF_SCHEME_OPTION_SECURE, CEF_SCHEME_OPTION_STANDARD,
-    JSDIALOGTYPE_PROMPT,
+    cef_browser_t, cef_callback_t, cef_client_t, cef_dictionary_value_t, cef_display_handler_t,
+    cef_errorcode_t, cef_frame_t, cef_keyboard_handler_t, cef_life_span_handler_t,
+    cef_load_handler_t, cef_main_args_t, cef_popup_features_t, cef_rect_t,
+    cef_request_context_settings_t, cef_request_context_t, cef_request_t, cef_resource_handler_t,
+    cef_response_t, cef_scheme_handler_factory_t, cef_scheme_registrar_t, cef_settings_t,
+    cef_string_t, cef_string_utf16_t, cef_transition_type_t, cef_window_info_t,
+    cef_window_open_disposition_t, CEF_RUNTIME_STYLE_ALLOY, CEF_SCHEME_OPTION_CORS_ENABLED,
+    CEF_SCHEME_OPTION_DISPLAY_ISOLATED, CEF_SCHEME_OPTION_FETCH_ENABLED, CEF_SCHEME_OPTION_SECURE,
+    CEF_SCHEME_OPTION_STANDARD,
 };
 
 #[cfg(target_os = "macos")]
@@ -972,6 +1303,15 @@ const NO: i8 = 0;
 
 const DEFAULT_WINDOW_WIDTH_PX: u32 = 1280;
 const DEFAULT_WINDOW_HEIGHT_PX: u32 = 840;
+
+fn is_exact_ui_url(url: &str) -> bool {
+    url.strip_prefix("app://ui").is_some_and(|suffix| {
+        suffix.is_empty()
+            || suffix.starts_with('/')
+            || suffix.starts_with('?')
+            || suffix.starts_with('#')
+    })
+}
 
 #[cfg(target_os = "macos")]
 const UI_TOP_HEIGHT: f64 = 44.0;
@@ -1010,16 +1350,6 @@ const DEFAULT_CEF_AUTOPLAY_POLICY: &str = "no-user-gesture-required";
 #[cfg(target_os = "macos")]
 const DEFAULT_CEF_API_VERSION: i32 = 14500;
 #[cfg(target_os = "macos")]
-const CEF_RELEASE_RUNTIME_FILES: &[&str] = &[
-    "libffmpeg.dylib",
-    "libEGL.dylib",
-    "libGLESv2.dylib",
-    "libvk_swiftshader.dylib",
-    "libcef_sandbox.dylib",
-    "vk_swiftshader_icd.json",
-];
-
-#[cfg(target_os = "macos")]
 const STYLE_TITLED: u64 = 1 << 0;
 #[cfg(target_os = "macos")]
 const STYLE_CLOSABLE: u64 = 1 << 1;
@@ -1046,7 +1376,6 @@ const CONTENT_VIEW_AUTORE_SIZE_MASK: u64 = NS_VIEW_WIDTH_SIZABLE | NS_VIEW_HEIGH
 #[cfg(target_os = "macos")]
 const UI_SCHEME: &str = "app";
 #[cfg(target_os = "macos")]
-const UI_INTENT_PROMPT_MARKER: &str = "__switchboard_intent__";
 #[cfg(target_os = "macos")]
 const UI_SCHEME_OPTIONS: u32 = CEF_SCHEME_OPTION_STANDARD
     | CEF_SCHEME_OPTION_SECURE
@@ -1115,6 +1444,14 @@ const VK_9: c_int = 0x39;
 const VK_A: c_int = 0x41;
 #[cfg(target_os = "macos")]
 const VK_Z: c_int = 0x5A;
+#[cfg(target_os = "macos")]
+const WOD_NEW_FOREGROUND_TAB: cef_window_open_disposition_t = 3;
+#[cfg(target_os = "macos")]
+const WOD_NEW_BACKGROUND_TAB: cef_window_open_disposition_t = 4;
+#[cfg(target_os = "macos")]
+const WOD_NEW_POPUP: cef_window_open_disposition_t = 5;
+#[cfg(target_os = "macos")]
+const WOD_NEW_WINDOW: cef_window_open_disposition_t = 6;
 
 #[cfg(target_os = "macos")]
 type CefKeyEventTypeSwitchboard = c_int;
@@ -1213,9 +1550,26 @@ extern "C" {
 extern "C" {}
 
 #[cfg(target_os = "macos")]
+#[link(name = "System")]
+unsafe extern "C" {
+    static _dispatch_main_q: u8;
+    fn dispatch_async_f(
+        queue: *mut c_void,
+        context: *mut c_void,
+        work: unsafe extern "C" fn(*mut c_void),
+    );
+}
+
+#[cfg(target_os = "macos")]
 static NSAPP_HANDLING_SEND_EVENT: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static CEF_QUIT_MESSAGE_LOOP_FN: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "macos")]
+static CEF_OPEN_BROWSER_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "macos")]
+static CEF_CLOSE_ALL_REQUESTED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static UI_SCHEME_DECLARED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
@@ -1231,6 +1585,8 @@ struct CefRuntime {
     _app: *mut cef_app_t,
     _ui_scheme_factory: *mut cef_scheme_handler_factory_t,
     ui_client: *mut cef_client_t,
+    ui_request_context: *mut cef_request_context_t,
+    profile_request_contexts: RefCell<HashMap<ProfileId, *mut cef_request_context_t>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1272,35 +1628,64 @@ struct SwitchboardUiResourceHandler {
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
-struct SwitchboardUiJsDialogHandler {
-    handler: cef_jsdialog_handler_t,
+#[repr(C)]
+struct SwitchboardUiDisplayHandler {
+    handler: cef_display_handler_t,
 }
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
 struct SwitchboardUiClient {
     client: cef_client_t,
-    jsdialog_handler: *mut cef_jsdialog_handler_t,
+    display_handler: *mut cef_display_handler_t,
+    life_span_handler: *mut cef_life_span_handler_t,
 }
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
 struct SwitchboardContentDisplayHandler {
     handler: cef_display_handler_t,
+    tab_id: TabId,
+    generation: u64,
 }
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
 struct SwitchboardContentKeyboardHandler {
     handler: cef_keyboard_handler_t_switchboard,
+    tab_id: TabId,
+    generation: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct SwitchboardContentLoadHandler {
+    handler: cef_load_handler_t,
+    tab_id: TabId,
+    generation: u64,
+    main_frame_failed: AtomicBool,
 }
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
 struct SwitchboardContentClient {
     client: cef_client_t,
+    profile_id: ProfileId,
+    tab_id: TabId,
+    generation: u64,
     display_handler: *mut cef_display_handler_t,
     keyboard_handler: *mut cef_keyboard_handler_t,
+    load_handler: *mut cef_load_handler_t,
+    life_span_handler: *mut cef_life_span_handler_t,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct SwitchboardLifeSpanHandler {
+    handler: cef_life_span_handler_t,
+    tab_id: Option<TabId>,
+    generation: u64,
+    before_close_seen: AtomicBool,
 }
 
 #[cfg(target_os = "macos")]
@@ -1337,7 +1722,37 @@ impl CefConfig {
             }));
         }
 
-        Ok(None)
+        Self::from_current_bundle()
+    }
+
+    fn from_current_bundle() -> Result<Option<Self>, HostError> {
+        let executable = std::env::current_exe().map_err(|error| {
+            HostError::Native(format!("failed to resolve Switchboard executable: {error}"))
+        })?;
+        let Some(bundle_path) = main_app_bundle_for_executable(&executable) else {
+            return Ok(None);
+        };
+        let contents_dir = bundle_path.join("Contents");
+        let frameworks = contents_dir.join("Frameworks");
+        let framework_dir_path = frameworks.join("Chromium Embedded Framework.framework");
+        let library_path = framework_dir_path.join("Chromium Embedded Framework");
+        let helper = frameworks
+            .join("Switchboard Helper.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("Switchboard Helper");
+        let root_cache_path =
+            env_path(ENV_CEF_ROOT_CACHE_PATH).unwrap_or(default_root_cache_path()?);
+        Ok(Some(Self {
+            library_path,
+            framework_dir_path: framework_dir_path.clone(),
+            resources_dir_path: Some(framework_dir_path.join("Resources")),
+            browser_subprocess_path: Some(helper),
+            main_bundle_path: Some(bundle_path),
+            cache_path: root_cache_path.join("default"),
+            root_cache_path,
+            temp_dir: env_path(ENV_CEF_TMPDIR).unwrap_or(default_temp_dir()),
+        }))
     }
 
     fn from_library_path(library_path: PathBuf) -> Result<Self, HostError> {
@@ -1383,6 +1798,74 @@ impl CefConfig {
             describe_path(&self.temp_dir),
         )
     }
+
+    fn validate_for_sandboxed_bundle(&self) -> Result<(), HostError> {
+        let executable = std::env::current_exe().map_err(|error| {
+            HostError::Native(format!("failed to resolve current executable: {error}"))
+        })?;
+        if !executable
+            .ancestors()
+            .any(|path| path.extension().and_then(|value| value.to_str()) == Some("app"))
+        {
+            return Err(HostError::Native(
+                "CEF startup refused outside a generated macOS .app bundle".to_owned(),
+            ));
+        }
+        for (label, path) in [
+            ("CEF framework binary", Some(&self.library_path)),
+            ("CEF resources", self.resources_dir_path.as_ref()),
+            (
+                "CEF helper executable",
+                self.browser_subprocess_path.as_ref(),
+            ),
+        ] {
+            let Some(path) = path else {
+                return Err(HostError::Native(format!("{label} is not configured")));
+            };
+            if !path.exists() {
+                return Err(HostError::Native(format!(
+                    "{label} is missing: {}",
+                    path.display()
+                )));
+            }
+        }
+        let sandbox_library = self
+            .framework_dir_path
+            .join("Libraries/libcef_sandbox.dylib");
+        if !sandbox_library.exists() {
+            return Err(HostError::Native(format!(
+                "CEF sandbox library is missing: {}",
+                sandbox_library.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn sandbox_library_path(&self) -> PathBuf {
+        self.framework_dir_path
+            .join("Libraries/libcef_sandbox.dylib")
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn main_app_bundle_for_executable(executable: &Path) -> Option<PathBuf> {
+    let containing_bundle = executable
+        .ancestors()
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("app"))?;
+
+    // CEF helpers live at:
+    // Main.app/Contents/Frameworks/Main Helper.app/Contents/MacOS/Helper.
+    // A helper must resolve framework/resources/main_bundle_path against the
+    // outer application, not against its own nested bundle.
+    let outer_bundle = containing_bundle
+        .parent()
+        .filter(|path| path.file_name().and_then(|value| value.to_str()) == Some("Frameworks"))
+        .and_then(Path::parent)
+        .filter(|path| path.file_name().and_then(|value| value.to_str()) == Some("Contents"))
+        .and_then(Path::parent)
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("app"));
+
+    Some(outer_bundle.unwrap_or(containing_bundle).to_path_buf())
 }
 
 #[cfg(target_os = "macos")]
@@ -1423,35 +1906,67 @@ impl Drop for CefString {
 }
 
 #[cfg(target_os = "macos")]
-unsafe extern "C" fn cef_ref_counted_add_ref_noop(_self_: *mut cef_base_ref_counted_t) {}
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" fn cef_ref_counted_release_noop(_self_: *mut cef_base_ref_counted_t) -> c_int {
-    0
+fn cef_reference_counts() -> &'static Mutex<HashMap<usize, usize>> {
+    static COUNTS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[cfg(target_os = "macos")]
-unsafe extern "C" fn cef_ref_counted_has_one_ref_true(
-    _self_: *mut cef_base_ref_counted_t,
-) -> c_int {
-    1
+unsafe extern "C" fn cef_ref_counted_add_ref(self_: *mut cef_base_ref_counted_t) {
+    if self_.is_null() {
+        return;
+    }
+    let mut counts = cef_reference_counts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let count = counts.entry(self_ as usize).or_insert(1);
+    *count = count.saturating_add(1);
 }
 
 #[cfg(target_os = "macos")]
-unsafe extern "C" fn cef_ref_counted_has_at_least_one_ref_true(
-    _self_: *mut cef_base_ref_counted_t,
+unsafe extern "C" fn cef_ref_counted_release(self_: *mut cef_base_ref_counted_t) -> c_int {
+    if self_.is_null() {
+        return 0;
+    }
+    let mut counts = cef_reference_counts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let count = counts.entry(self_ as usize).or_insert(1);
+    if *count <= 1 {
+        counts.remove(&(self_ as usize));
+        1
+    } else {
+        *count -= 1;
+        0
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn cef_ref_counted_has_one_ref(self_: *mut cef_base_ref_counted_t) -> c_int {
+    if self_.is_null() {
+        return 0;
+    }
+    let counts = cef_reference_counts()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    i32::from(counts.get(&(self_ as usize)).copied().unwrap_or(1) == 1)
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn cef_ref_counted_has_at_least_one_ref(
+    self_: *mut cef_base_ref_counted_t,
 ) -> c_int {
-    1
+    i32::from(!self_.is_null())
 }
 
 #[cfg(target_os = "macos")]
 fn ref_counted_base<T>() -> cef_base_ref_counted_t {
     cef_base_ref_counted_t {
         size: size_of::<T>(),
-        add_ref: Some(cef_ref_counted_add_ref_noop),
-        release: Some(cef_ref_counted_release_noop),
-        has_one_ref: Some(cef_ref_counted_has_one_ref_true),
-        has_at_least_one_ref: Some(cef_ref_counted_has_at_least_one_ref_true),
+        add_ref: Some(cef_ref_counted_add_ref),
+        release: Some(cef_ref_counted_release),
+        has_one_ref: Some(cef_ref_counted_has_one_ref),
+        has_at_least_one_ref: Some(cef_ref_counted_has_at_least_one_ref),
     }
 }
 
@@ -1490,7 +2005,18 @@ unsafe extern "C" fn switchboard_app_on_register_custom_schemes(
         return;
     };
     with_stack_cef_string(UI_SCHEME, |scheme_name| unsafe {
-        let _ = add_custom_scheme(registrar, scheme_name, UI_SCHEME_OPTIONS as c_int);
+        let registered = add_custom_scheme(registrar, scheme_name, UI_SCHEME_OPTIONS as c_int);
+        if registered != 0 {
+            UI_SCHEME_DECLARED.store(true, Ordering::Release);
+            if env_flag(ENV_CEF_VERBOSE_ERRORS) {
+                eprintln!(
+                    "switchboard-app: declared custom app:// scheme (pid={})",
+                    std::process::id()
+                );
+            }
+        } else {
+            eprintln!("switchboard-app: failed to declare custom app:// scheme");
+        }
     });
 }
 
@@ -1560,18 +2086,58 @@ fn quit_cef_message_loop_if_available() {
 }
 
 #[cfg(target_os = "macos")]
+unsafe fn request_cef_browser_close(browser: *mut cef_browser_t) {
+    if browser.is_null() {
+        return;
+    }
+    let Some(get_host) = (*browser).get_host else {
+        return;
+    };
+    let host = get_host(browser);
+    if host.is_null() {
+        return;
+    }
+    if let Some(close_browser) = (*host).close_browser {
+        close_browser(host, 1);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn request_all_cef_browsers_close() {
+    CEF_CLOSE_ALL_REQUESTED.store(true, Ordering::Release);
+    let mut browsers = Vec::new();
+    let ui_browser = ui_shell_browser();
+    if !ui_browser.is_null() {
+        browsers.push(ui_browser);
+    }
+    CONTENT_BROWSERS_BY_TAB.with(|slot| {
+        for browser in slot.borrow().values().map(|entry| entry.browser) {
+            if !browser.is_null() && !browsers.contains(&browser) {
+                browsers.push(browser);
+            }
+        }
+    });
+
+    if browsers.is_empty() {
+        quit_cef_message_loop_if_available();
+        return;
+    }
+    for browser in browsers {
+        unsafe {
+            request_cef_browser_close(browser);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn switchboard_nsapp_window_should_close(
     self_: ObjcId,
     _cmd: ObjcSel,
     _window: ObjcId,
 ) -> i8 {
-    quit_cef_message_loop_if_available();
-    let terminate_sel = sel_registerName(b"terminate:\0".as_ptr() as *const c_char);
-    if terminate_sel != NIL {
-        msg_send_void_id(self_, terminate_sel, NIL);
-        return NO;
-    }
-    YES
+    let _ = self_;
+    request_all_cef_browsers_close();
+    NO
 }
 
 #[cfg(target_os = "macos")]
@@ -1580,7 +2146,21 @@ unsafe extern "C" fn switchboard_nsapp_application_will_terminate(
     _cmd: ObjcSel,
     _notification: ObjcId,
 ) {
-    quit_cef_message_loop_if_available();
+    request_all_cef_browsers_close();
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_nsapp_application_did_become_active(
+    _self: ObjcId,
+    _cmd: ObjcSel,
+    _notification: ObjcId,
+) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    emit_ui_command(UiCommand::WakeSnoozed { now_ms });
 }
 
 #[cfg(target_os = "macos")]
@@ -1677,11 +2257,14 @@ fn install_nsapplication_suspend_shim() -> Result<(), HostError> {
         let should_handle_reopen_selector =
             selector("applicationShouldHandleReopen:hasVisibleWindows:")?;
         let will_terminate_selector = selector("applicationWillTerminate:")?;
+        let did_become_active_selector = selector("applicationDidBecomeActive:")?;
         let window_close_encoding = CString::new("c@:@").expect("static signature should be valid");
         let window_resize_encoding =
             CString::new("v@:@").expect("static signature should be valid");
         let reopen_encoding = CString::new("c@:@c").expect("static signature should be valid");
         let will_terminate_encoding =
+            CString::new("v@:@").expect("static signature should be valid");
+        let did_become_active_encoding =
             CString::new("v@:@").expect("static signature should be valid");
 
         let _ = class_addMethod(
@@ -1714,6 +2297,12 @@ fn install_nsapplication_suspend_shim() -> Result<(), HostError> {
             switchboard_nsapp_application_will_terminate as *const c_void,
             will_terminate_encoding.as_ptr(),
         );
+        let _ = class_addMethod(
+            app_class,
+            did_become_active_selector,
+            switchboard_nsapp_application_did_become_active as *const c_void,
+            did_become_active_encoding.as_ptr(),
+        );
     }
     Ok(())
 }
@@ -1735,450 +2324,300 @@ fn allocate_cef_app() -> *mut cef_app_t {
 }
 
 #[cfg(target_os = "macos")]
-enum UiPromptAction {
-    Intent(UiCommand),
-    QueryActiveUri,
-    QueryShellState,
-    UiOverlay { visible: bool },
-    WebsiteKeybindings { active: bool },
-    KeybindingsSync {
-        close_tab: String,
-        command_palette: String,
-        focus_navigation: String,
-        toggle_devtools: String,
-    },
-    UiReady,
+fn decode_uri_component(value: &str) -> Result<String, &'static str> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                let high = (bytes[index + 1] as char)
+                    .to_digit(16)
+                    .ok_or("invalid percent escape")?;
+                let low = (bytes[index + 2] as char)
+                    .to_digit(16)
+                    .ok_or("invalid percent escape")?;
+                decoded.push(((high << 4) | low) as u8);
+                index += 3;
+            }
+            b'%' => return Err("truncated percent escape"),
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| "bridge payload is not UTF-8")
 }
 
 #[cfg(target_os = "macos")]
-fn is_allowed_setting_key(key: &str) -> bool {
-    let fixed_key_allowed = matches!(
-        key,
-        "search_engine"
-            | "homepage"
-            | "new_tab_behavior"
-            | "new_tab_custom_url"
-            | "keybinding_close_tab"
-            | "keybinding_command_palette"
-            | "keybinding_focus_navigation"
-            | "keybinding_toggle_devtools"
-            | "password_manager.default_provider"
-            | "password_manager.default_autofill"
-            | "password_manager.default_save_prompt"
-            | "password_manager.default_fallback"
-    );
-    fixed_key_allowed
-        || is_profile_scoped_setting_key(key, "password_manager.provider.profile.")
-        || is_profile_scoped_setting_key(key, "password_manager.autofill.profile.")
-        || is_profile_scoped_setting_key(key, "password_manager.save_prompt.profile.")
-        || is_profile_scoped_setting_key(key, "password_manager.fallback.profile.")
-}
-
-#[cfg(target_os = "macos")]
-fn is_profile_scoped_setting_key(key: &str, prefix: &str) -> bool {
-    let Some(suffix) = key.strip_prefix(prefix) else {
-        return false;
-    };
-    !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
-}
-
-#[cfg(target_os = "macos")]
-fn parse_ui_prompt_payload(payload: &str) -> Result<UiPromptAction, &'static str> {
-    let trimmed = payload.trim();
-    if trimmed == "query_active_uri" {
-        return Ok(UiPromptAction::QueryActiveUri);
-    }
-    if trimmed == "query_shell_state" {
-        return Ok(UiPromptAction::QueryShellState);
-    }
-    if let Some(raw_name) = trimmed.strip_prefix("new_profile ") {
-        let name = raw_name.trim();
-        if name.is_empty() {
-            return Err("profile name cannot be empty");
-        }
-        return Ok(UiPromptAction::Intent(UiCommand::NewProfile {
-            name: name.to_owned(),
-        }));
-    }
-    if trimmed == "new_profile" {
-        return Ok(UiPromptAction::Intent(UiCommand::NewProfile {
-            name: "Profile".to_owned(),
-        }));
-    }
-    if let Some(value) = trimmed.strip_prefix("switch_profile ") {
-        let profile_id = value
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| "switch_profile requires a numeric profile id")?;
-        return Ok(UiPromptAction::Intent(UiCommand::SwitchProfile {
-            profile_id,
-        }));
-    }
-    if let Some(value) = trimmed.strip_prefix("delete_profile ") {
-        let profile_id = value
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| "delete_profile requires a numeric profile id")?;
-        return Ok(UiPromptAction::Intent(UiCommand::DeleteProfile {
-            profile_id,
-        }));
-    }
-    if let Some(rest) = trimmed.strip_prefix("rename_profile ") {
-        let mut parts = rest.trim().splitn(2, ' ');
-        let profile_id = parts
-            .next()
-            .ok_or("rename_profile requires profile id")?
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| "rename_profile requires a numeric profile id")?;
-        let name = parts.next().ok_or("rename_profile requires a name")?.trim();
-        if name.is_empty() {
-            return Err("profile name cannot be empty");
-        }
-        return Ok(UiPromptAction::Intent(UiCommand::RenameProfile {
-            profile_id,
-            name: name.to_owned(),
-        }));
-    }
-    if let Some(raw_name) = trimmed.strip_prefix("new_workspace ") {
-        let name = raw_name.trim();
-        if name.is_empty() {
-            return Err("workspace name cannot be empty");
-        }
-        return Ok(UiPromptAction::Intent(UiCommand::NewWorkspace {
-            name: name.to_owned(),
-        }));
-    }
-    if trimmed == "new_workspace" {
-        return Ok(UiPromptAction::Intent(UiCommand::NewWorkspace {
-            name: "New Workspace".to_owned(),
-        }));
-    }
-    if let Some(rest) = trimmed.strip_prefix("rename_workspace ") {
-        let mut parts = rest.trim().splitn(2, ' ');
-        let workspace_id = parts
-            .next()
-            .ok_or("rename_workspace requires workspace id")?
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| "rename_workspace requires a numeric workspace id")?;
-        let name = parts
-            .next()
-            .ok_or("rename_workspace requires a name")?
-            .trim();
-        if name.is_empty() {
-            return Err("workspace name cannot be empty");
-        }
-        return Ok(UiPromptAction::Intent(UiCommand::RenameWorkspace {
-            workspace_id,
-            name: name.to_owned(),
-        }));
-    }
-    if let Some(value) = trimmed.strip_prefix("delete_workspace ") {
-        let workspace_id = value
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| "delete_workspace requires a numeric workspace id")?;
-        return Ok(UiPromptAction::Intent(UiCommand::DeleteWorkspace {
-            workspace_id,
-        }));
-    }
-    if let Some(value) = trimmed.strip_prefix("switch_workspace ") {
-        let workspace_id = value
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| "switch_workspace requires a numeric workspace id")?;
-        return Ok(UiPromptAction::Intent(UiCommand::SwitchWorkspace {
-            workspace_id,
-        }));
-    }
-    if let Some(value) = trimmed.strip_prefix("activate_tab ") {
-        let tab_id = value
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| "activate_tab requires a numeric tab id")?;
-        return Ok(UiPromptAction::Intent(UiCommand::ActivateTab { tab_id }));
-    }
-    if let Some(value) = trimmed.strip_prefix("close_tab ") {
-        let tab_id = value
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| "close_tab requires a numeric tab id")?;
-        return Ok(UiPromptAction::Intent(UiCommand::CloseTab { tab_id }));
-    }
-    if let Some(value) = trimmed.strip_prefix("new_tab ") {
-        let workspace_id = value
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| "new_tab requires a numeric workspace id")?;
-        return Ok(UiPromptAction::Intent(UiCommand::NewTab {
-            workspace_id,
-            url: None,
-            make_active: true,
-        }));
-    }
-    if let Some(url) = trimmed.strip_prefix("navigate ") {
-        let normalized = url.trim();
-        if normalized.starts_with("https://") || normalized.starts_with("http://") {
-            return Ok(UiPromptAction::Intent(UiCommand::NavigateActive {
-                url: normalized.to_owned(),
-            }));
-        }
-        return Err("navigate intents only allow http/https URLs");
-    }
-    if trimmed == "devtools_toggle" {
-        return Ok(UiPromptAction::Intent(UiCommand::ToggleDevTools));
-    }
-    if let Some(rest) = trimmed.strip_prefix("setting_set_text ") {
-        let mut parts = rest.trim().splitn(2, ' ');
-        let key = parts
-            .next()
-            .ok_or("setting_set_text requires a key")?
-            .trim();
-        if key.is_empty() || !is_allowed_setting_key(key) {
-            return Err("setting key is not in allowlist");
-        }
-        let value = parts
-            .next()
-            .ok_or("setting_set_text requires a value")?
-            .trim();
-        return Ok(UiPromptAction::Intent(UiCommand::SettingSet {
-            key: key.to_owned(),
-            value: SettingValue::Text(value.to_owned()),
-        }));
-    }
-    if let Some(rest) = trimmed.strip_prefix("setting_set_int ") {
-        let mut parts = rest.trim().splitn(2, ' ');
-        let key = parts.next().ok_or("setting_set_int requires a key")?.trim();
-        if key.is_empty() || !is_allowed_setting_key(key) {
-            return Err("setting key is not in allowlist");
-        }
-        let value = parts
-            .next()
-            .ok_or("setting_set_int requires a value")?
-            .trim()
-            .parse::<i64>()
-            .map_err(|_| "setting_set_int value must be integer")?;
-        return Ok(UiPromptAction::Intent(UiCommand::SettingSet {
-            key: key.to_owned(),
-            value: SettingValue::Int(value),
-        }));
-    }
-    if let Some(rest) = trimmed.strip_prefix("setting_set_bool ") {
-        let mut parts = rest.trim().splitn(2, ' ');
-        let key = parts
-            .next()
-            .ok_or("setting_set_bool requires a key")?
-            .trim();
-        if key.is_empty() || !is_allowed_setting_key(key) {
-            return Err("setting key is not in allowlist");
-        }
-        let raw = parts
-            .next()
-            .ok_or("setting_set_bool requires a value")?
-            .trim()
-            .to_ascii_lowercase();
-        let value = match raw.as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => return Err("setting_set_bool value must be true/false"),
-        };
-        return Ok(UiPromptAction::Intent(UiCommand::SettingSet {
-            key: key.to_owned(),
-            value: SettingValue::Bool(value),
-        }));
-    }
-    if trimmed == "ui_overlay on" {
-        return Ok(UiPromptAction::UiOverlay { visible: true });
-    }
-    if trimmed == "ui_overlay off" {
-        return Ok(UiPromptAction::UiOverlay { visible: false });
-    }
-    if trimmed == "website_keybindings on" {
-        return Ok(UiPromptAction::WebsiteKeybindings { active: true });
-    }
-    if trimmed == "website_keybindings off" {
-        return Ok(UiPromptAction::WebsiteKeybindings { active: false });
-    }
-    if let Some(rest) = trimmed.strip_prefix("keybindings_sync ") {
-        let mut parts = rest.split_whitespace();
-        let close_tab = parts.next().ok_or("keybindings_sync requires close_tab binding")?;
-        let command_palette = parts
-            .next()
-            .ok_or("keybindings_sync requires command_palette binding")?;
-        let focus_navigation = parts
-            .next()
-            .ok_or("keybindings_sync requires focus_navigation binding")?;
-        let toggle_devtools = parts
-            .next()
-            .ok_or("keybindings_sync requires toggle_devtools binding")?;
-        if parts.next().is_some() {
-            return Err("keybindings_sync only accepts four bindings");
-        }
-        return Ok(UiPromptAction::KeybindingsSync {
-            close_tab: close_tab.to_owned(),
-            command_palette: command_palette.to_owned(),
-            focus_navigation: focus_navigation.to_owned(),
-            toggle_devtools: toggle_devtools.to_owned(),
-        });
-    }
-    if trimmed.starts_with("ui_ready ") {
-        return Ok(UiPromptAction::UiReady);
-    }
-    Err("prompt payload is not in the allowlist")
-}
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" fn switchboard_ui_on_jsdialog(
-    _self_: *mut cef_jsdialog_handler_t,
+unsafe extern "C" fn switchboard_ui_on_address_change(
+    _self_: *mut cef_display_handler_t,
     browser: *mut cef_browser_t,
-    _origin_url: *const cef_string_t,
-    dialog_type: switchboard_cef_sys::raw::cef_jsdialog_type_t,
-    message_text: *const cef_string_t,
-    default_prompt_text: *const cef_string_t,
-    callback: *mut cef_jsdialog_callback_t,
-    suppress_message: *mut c_int,
-) -> c_int {
-    if dialog_type != JSDIALOGTYPE_PROMPT {
-        return 0;
+    frame: *mut cef_frame_t,
+    url: *const cef_string_t,
+) {
+    if browser.is_null() || frame.is_null() {
+        return;
     }
-
-    let marker = cef_string_to_owned(message_text);
-    if marker != UI_INTENT_PROMPT_MARKER {
-        return 0;
+    if !(*frame).is_main.is_some_and(|is_main| is_main(frame) != 0) {
+        return;
     }
-    remember_ui_shell_browser(browser);
-
-    let payload = cef_string_to_owned(default_prompt_text);
-    match parse_ui_prompt_payload(&payload) {
-        Ok(UiPromptAction::Intent(command)) => {
-            if !suppress_message.is_null() {
-                *suppress_message = 1;
-            }
-            eprintln!("switchboard-app: accepted UI intent `{payload}`");
-            emit_ui_command(command);
-            0
+    let url = cef_string_to_owned(url);
+    if !is_exact_ui_url(&url) {
+        return;
+    }
+    if !ui_shell_browser_matches(browser) {
+        eprintln!("switchboard-app: rejected bridge callback from a non-UI browser");
+        return;
+    }
+    // CEF may expose a different C wrapper for the same underlying browser in
+    // each callback. Retain the wrapper from this callback before dispatching
+    // the intent because the synchronous response path immediately accesses
+    // the UI browser again.
+    set_ui_shell_browser(browser);
+    let Some((_, encoded)) = url.split_once("#bridge=") else {
+        return;
+    };
+    let payload = match decode_uri_component(encoded) {
+        Ok(payload) => payload,
+        Err(reason) => {
+            eprintln!("switchboard-app: rejected UI bridge payload ({reason})");
+            return;
         }
-        Ok(UiPromptAction::UiReady) => {
-            if !suppress_message.is_null() {
-                *suppress_message = 1;
+    };
+    match decode_client_message(&payload) {
+        Ok(envelope) => match envelope.command {
+            UiCommand::SetUiOverlay { visible } => {
+                if let Err(error) = set_ui_overlay_visible(visible) {
+                    eprintln!("switchboard-app: failed to update UI overlay: {error}");
+                }
             }
-            0
-        }
-        Ok(UiPromptAction::UiOverlay { visible }) => {
-            if !suppress_message.is_null() {
-                *suppress_message = 1;
+            UiCommand::SetBrowserMode { active } => {
+                if let Err(error) = set_website_keybindings_active(active) {
+                    eprintln!("switchboard-app: failed to update browser keyboard mode: {error}");
+                }
             }
-            if let Err(error) = set_ui_overlay_visible(visible) {
-                eprintln!("switchboard-app: failed to set UI overlay visible={visible}: {error}");
-            }
-            0
-        }
-        Ok(UiPromptAction::WebsiteKeybindings { active }) => {
-            if !suppress_message.is_null() {
-                *suppress_message = 1;
-            }
-            if let Err(error) = set_website_keybindings_active(active) {
-                eprintln!(
-                    "switchboard-app: failed to set website keybindings active={active}: {error}"
-                );
-            }
-            0
-        }
-        Ok(UiPromptAction::KeybindingsSync {
-            close_tab,
-            command_palette,
-            focus_navigation,
-            toggle_devtools,
-        }) => {
-            if !suppress_message.is_null() {
-                *suppress_message = 1;
-            }
-            set_browser_shortcut_bindings(
+            UiCommand::SyncKeybindings {
+                close_tab,
+                command_palette,
+                focus_navigation,
+                toggle_devtools,
+            } => set_browser_shortcut_bindings(
                 &close_tab,
                 &command_palette,
                 &focus_navigation,
                 &toggle_devtools,
-            );
-            0
-        }
-        Ok(UiPromptAction::QueryShellState) => {
-            if callback.is_null() {
-                if !suppress_message.is_null() {
-                    *suppress_message = 1;
-                }
-                return 0;
-            }
-            let Some(cont) = (*callback).cont else {
-                if !suppress_message.is_null() {
-                    *suppress_message = 1;
-                }
-                return 0;
-            };
-            let json = query_ui_shell_state();
-            with_stack_cef_string(&json, |value| unsafe {
-                cont(callback, 1, value);
-            });
-            1
-        }
-        Ok(UiPromptAction::QueryActiveUri) => {
-            if callback.is_null() {
-                if !suppress_message.is_null() {
-                    *suppress_message = 1;
-                }
-                return 0;
-            }
-            let Some(cont) = (*callback).cont else {
-                if !suppress_message.is_null() {
-                    *suppress_message = 1;
-                }
-                return 0;
-            };
-            let url = active_content_uri();
-            with_stack_cef_string(&url, |value| unsafe {
-                cont(callback, 1, value);
-            });
-            1
-        }
-        Err(reason) => {
-            if !suppress_message.is_null() {
-                *suppress_message = 1;
-            }
-            eprintln!("switchboard-app: rejected UI prompt `{payload}` ({reason})");
-            0
-        }
+            ),
+            // Browser creation is illegal while CEF is still inside this
+            // display callback. Run all stateful bridge intents on the next
+            // main-queue turn so the callback has fully unwound first.
+            command => defer_ui_command(command),
+        },
+        Err(error) => eprintln!("switchboard-app: rejected UI bridge payload: {error:?}"),
     }
 }
 
 #[cfg(target_os = "macos")]
-unsafe extern "C" fn switchboard_ui_client_get_jsdialog_handler(
+unsafe extern "C" fn switchboard_ui_client_get_display_handler(
     self_: *mut cef_client_t,
-) -> *mut cef_jsdialog_handler_t {
+) -> *mut cef_display_handler_t {
     if self_.is_null() {
         return std::ptr::null_mut();
     }
     let client = self_ as *mut SwitchboardUiClient;
-    (*client).jsdialog_handler
+    (*client).display_handler
 }
 
 #[cfg(target_os = "macos")]
-fn allocate_ui_jsdialog_handler() -> *mut cef_jsdialog_handler_t {
-    let handler = Box::new(SwitchboardUiJsDialogHandler {
-        handler: cef_jsdialog_handler_t {
-            base: ref_counted_base::<cef_jsdialog_handler_t>(),
-            on_jsdialog: Some(switchboard_ui_on_jsdialog),
-            on_before_unload_dialog: None,
-            on_reset_dialog_state: None,
-            on_dialog_closed: None,
+unsafe extern "C" fn switchboard_ui_client_get_life_span_handler(
+    self_: *mut cef_client_t,
+) -> *mut cef_life_span_handler_t {
+    if self_.is_null() {
+        return std::ptr::null_mut();
+    }
+    let client = self_ as *mut SwitchboardUiClient;
+    (*client).life_span_handler
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_content_client_get_life_span_handler(
+    self_: *mut cef_client_t,
+) -> *mut cef_life_span_handler_t {
+    if self_.is_null() {
+        return std::ptr::null_mut();
+    }
+    let client = self_ as *mut SwitchboardContentClient;
+    (*client).life_span_handler
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_content_before_popup(
+    self_: *mut cef_life_span_handler_t,
+    _browser: *mut cef_browser_t,
+    _frame: *mut cef_frame_t,
+    _popup_id: c_int,
+    target_url: *const cef_string_t,
+    _target_frame_name: *const cef_string_t,
+    target_disposition: cef_window_open_disposition_t,
+    user_gesture: c_int,
+    _popup_features: *const cef_popup_features_t,
+    _window_info: *mut cef_window_info_t,
+    _client: *mut *mut cef_client_t,
+    _settings: *mut cef_browser_settings_t,
+    _extra_info: *mut *mut cef_dictionary_value_t,
+    no_javascript_access: *mut c_int,
+) -> c_int {
+    if !no_javascript_access.is_null() {
+        *no_javascript_access = 1;
+    }
+    if self_.is_null() {
+        return 1;
+    }
+    let handler = self_ as *mut SwitchboardLifeSpanHandler;
+    let Some(source_tab_id) = (*handler).tab_id else {
+        return 1;
+    };
+    let url = cef_string_to_owned(target_url);
+    if user_gesture == 0 || url.is_empty() || url.starts_with("app://") {
+        return 1;
+    }
+
+    let supported_disposition = matches!(
+        target_disposition,
+        WOD_NEW_FOREGROUND_TAB | WOD_NEW_BACKGROUND_TAB | WOD_NEW_POPUP | WOD_NEW_WINDOW
+    );
+    if supported_disposition {
+        emit_ui_command(UiCommand::OpenLinkFromTab {
+            source_tab_id: source_tab_id.0,
+            generation: (*handler).generation,
+            url,
+            secondary: target_disposition == WOD_NEW_WINDOW,
+        });
+    }
+    // Switchboard owns tab and split creation. Never allow CEF to create an
+    // unmanaged native popup/Chrome window.
+    1
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_browser_after_created(
+    self_: *mut cef_life_span_handler_t,
+    browser: *mut cef_browser_t,
+) {
+    if self_.is_null() || browser.is_null() {
+        return;
+    }
+    let handler = self_ as *mut SwitchboardLifeSpanHandler;
+    (*handler).before_close_seen.store(false, Ordering::Release);
+    CEF_OPEN_BROWSER_COUNT.fetch_add(1, Ordering::AcqRel);
+    if let Some(tab_id) = (*handler).tab_id {
+        remember_browser_for_tab(tab_id, (*handler).generation, browser);
+    } else {
+        remember_ui_shell_browser(browser);
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_browser_before_close(
+    self_: *mut cef_life_span_handler_t,
+    browser: *mut cef_browser_t,
+) {
+    if self_.is_null() {
+        return;
+    }
+    let handler = self_ as *mut SwitchboardLifeSpanHandler;
+    if (*handler).before_close_seen.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    if let Some(tab_id) = (*handler).tab_id {
+        let is_current_browser = content_browser_matches(tab_id, (*handler).generation, browser);
+        if active_content_tab() == Some(tab_id) && is_current_browser {
+            set_active_content_browser(std::ptr::null_mut());
+        }
+        if is_current_browser {
+            // Drop Switchboard's retained reference only after all routing
+            // checks for this OnBeforeClose callback are complete.
+            forget_browser_for_tab(tab_id, (*handler).generation);
+        }
+        emit_content_event(ContentEvent::BrowserClosed {
+            tab_id,
+            generation: (*handler).generation,
+        });
+    } else if ui_shell_browser_matches(browser) {
+        set_ui_shell_browser(std::ptr::null_mut());
+    }
+
+    let previous = CEF_OPEN_BROWSER_COUNT
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            Some(count.saturating_sub(1))
+        })
+        .unwrap_or(0);
+    if previous <= 1 {
+        CEF_OPEN_BROWSER_COUNT.store(0, Ordering::Release);
+        if CEF_CLOSE_ALL_REQUESTED.load(Ordering::Acquire) {
+            quit_cef_message_loop_if_available();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn allocate_life_span_handler(
+    tab_id: Option<TabId>,
+    generation: u64,
+) -> *mut cef_life_span_handler_t {
+    let on_before_popup = if tab_id.is_some() {
+        Some(switchboard_content_before_popup as _)
+    } else {
+        None
+    };
+    let handler = Box::new(SwitchboardLifeSpanHandler {
+        handler: cef_life_span_handler_t {
+            base: ref_counted_base::<cef_life_span_handler_t>(),
+            on_before_popup,
+            on_before_popup_aborted: None,
+            on_before_dev_tools_popup: None,
+            on_after_created: Some(switchboard_browser_after_created),
+            do_close: None,
+            on_before_close: Some(switchboard_browser_before_close),
+        },
+        tab_id,
+        generation,
+        before_close_seen: AtomicBool::new(false),
+    });
+    let pointer = Box::into_raw(handler);
+    unsafe { &mut (*pointer).handler }
+}
+
+#[cfg(target_os = "macos")]
+fn allocate_ui_display_handler() -> *mut cef_display_handler_t {
+    let handler = Box::new(SwitchboardUiDisplayHandler {
+        handler: cef_display_handler_t {
+            base: ref_counted_base::<cef_display_handler_t>(),
+            on_address_change: Some(switchboard_ui_on_address_change),
+            on_title_change: None,
+            on_favicon_urlchange: None,
+            on_fullscreen_mode_change: None,
+            on_tooltip: None,
+            on_status_message: None,
+            on_console_message: None,
+            on_auto_resize: None,
+            on_loading_progress_change: None,
+            on_cursor_change: None,
+            on_media_access_change: None,
+            on_contents_bounds_change: None,
+            get_root_window_screen_rect: None,
         },
     });
-    let ptr = Box::into_raw(handler);
-    unsafe { &mut (*ptr).handler as *mut cef_jsdialog_handler_t }
+    let pointer = Box::into_raw(handler);
+    unsafe { &mut (*pointer).handler }
 }
 
 #[cfg(target_os = "macos")]
 fn allocate_ui_cef_client() -> *mut cef_client_t {
-    let jsdialog_handler = allocate_ui_jsdialog_handler();
+    let display_handler = allocate_ui_display_handler();
+    let life_span_handler = allocate_life_span_handler(None, 0);
     let client = Box::new(SwitchboardUiClient {
         client: cef_client_t {
             base: ref_counted_base::<cef_client_t>(),
@@ -2186,23 +2625,24 @@ fn allocate_ui_cef_client() -> *mut cef_client_t {
             get_command_handler: None,
             get_context_menu_handler: None,
             get_dialog_handler: None,
-            get_display_handler: None,
+            get_display_handler: Some(switchboard_ui_client_get_display_handler),
             get_download_handler: None,
             get_drag_handler: None,
             get_find_handler: None,
             get_focus_handler: None,
             get_frame_handler: None,
             get_permission_handler: None,
-            get_jsdialog_handler: Some(switchboard_ui_client_get_jsdialog_handler),
+            get_jsdialog_handler: None,
             get_keyboard_handler: None,
-            get_life_span_handler: None,
+            get_life_span_handler: Some(switchboard_ui_client_get_life_span_handler),
             get_load_handler: None,
             get_print_handler: None,
             get_render_handler: None,
             get_request_handler: None,
             on_process_message_received: None,
         },
-        jsdialog_handler,
+        display_handler,
+        life_span_handler,
     });
     let ptr = Box::into_raw(client);
     unsafe { &mut (*ptr).client as *mut cef_client_t }
@@ -2282,6 +2722,19 @@ unsafe extern "C" fn switchboard_resource_handler_get_response_headers(
         });
         with_stack_cef_string("Expires", |name| {
             with_stack_cef_string("0", |value| unsafe {
+                set_header_by_name(response, name, value, 1);
+            });
+        });
+        with_stack_cef_string("Content-Security-Policy", |name| {
+            with_stack_cef_string(
+                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'",
+                |value| unsafe {
+                    set_header_by_name(response, name, value, 1);
+                },
+            );
+        });
+        with_stack_cef_string("X-Content-Type-Options", |name| {
+            with_stack_cef_string("nosniff", |value| unsafe {
                 set_header_by_name(response, name, value, 1);
             });
         });
@@ -2375,11 +2828,14 @@ unsafe extern "C" fn switchboard_resource_handler_cancel(_self_: *mut cef_resour
 #[cfg(target_os = "macos")]
 unsafe extern "C" fn switchboard_scheme_factory_create(
     _self_: *mut cef_scheme_handler_factory_t,
-    _browser: *mut cef_browser_t,
+    browser: *mut cef_browser_t,
     _frame: *mut cef_frame_t,
     _scheme_name: *const cef_string_t,
     _request: *mut cef_request_t,
 ) -> *mut cef_resource_handler_t {
+    if browser.is_null() {
+        return std::ptr::null_mut();
+    }
     let handler = Box::new(SwitchboardUiResourceHandler {
         handler: cef_resource_handler_t {
             base: ref_counted_base::<cef_resource_handler_t>(),
@@ -2411,17 +2867,19 @@ fn allocate_ui_scheme_factory() -> *mut cef_scheme_handler_factory_t {
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" fn switchboard_content_on_address_change(
-    _self_: *mut cef_display_handler_t,
+    self_: *mut cef_display_handler_t,
     browser: *mut cef_browser_t,
     frame: *mut cef_frame_t,
     url: *const cef_string_t,
 ) {
-    if !frame.is_null() {
-        if let Some(is_main) = (*frame).is_main {
-            if is_main(frame) == 0 {
-                return;
-            }
-        }
+    if self_.is_null() {
+        return;
+    }
+    let handler = self_ as *mut SwitchboardContentDisplayHandler;
+    let tab_id = (*handler).tab_id;
+    let generation = (*handler).generation;
+    if !cef_frame_is_main(frame) {
+        return;
     }
     let next = cef_string_to_owned(url);
     if next.is_empty() {
@@ -2430,16 +2888,14 @@ unsafe extern "C" fn switchboard_content_on_address_change(
     if !(next.starts_with("https://") || next.starts_with("http://")) {
         return;
     }
-    if !browser.is_null() {
-        remember_browser_for_active_tab(browser);
+    if !remember_browser_for_tab(tab_id, generation, browser) {
+        return;
     }
-    set_active_content_uri(next.clone());
-    if let Some(tab_id) = active_content_tab() {
-        emit_content_event(ContentEvent::UrlChanged {
-            tab_id,
-            url: next.clone(),
-        });
-    }
+    emit_content_event(ContentEvent::UrlChanged {
+        tab_id,
+        generation,
+        url: next.clone(),
+    });
     if env_flag(ENV_CEF_VERBOSE_ERRORS) {
         eprintln!("switchboard-app: observed content URL change -> {next}");
     }
@@ -2447,54 +2903,173 @@ unsafe extern "C" fn switchboard_content_on_address_change(
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" fn switchboard_content_on_title_change(
-    _self_: *mut cef_display_handler_t,
+    self_: *mut cef_display_handler_t,
     browser: *mut cef_browser_t,
     title: *const cef_string_t,
 ) {
-    if !browser.is_null() {
-        remember_browser_for_active_tab(browser);
+    if self_.is_null() {
+        return;
+    }
+    let handler = self_ as *mut SwitchboardContentDisplayHandler;
+    let tab_id = (*handler).tab_id;
+    let generation = (*handler).generation;
+    if !remember_browser_for_tab(tab_id, generation, browser) {
+        return;
     }
     let next = cef_string_to_owned(title);
-    if let Some(tab_id) = active_content_tab() {
-        emit_content_event(ContentEvent::TitleChanged {
-            tab_id,
-            title: next,
+    emit_content_event(ContentEvent::TitleChanged {
+        tab_id,
+        generation,
+        title: next,
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn cef_frame_is_main(frame: *mut cef_frame_t) -> bool {
+    if frame.is_null() {
+        return false;
+    }
+    unsafe { (*frame).is_main.is_some_and(|is_main| is_main(frame) != 0) }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_content_on_loading_state_change(
+    self_: *mut cef_load_handler_t,
+    browser: *mut cef_browser_t,
+    is_loading: c_int,
+    can_go_back: c_int,
+    can_go_forward: c_int,
+) {
+    if self_.is_null() {
+        return;
+    }
+    let handler = self_ as *mut SwitchboardContentLoadHandler;
+    let tab_id = (*handler).tab_id;
+    let generation = (*handler).generation;
+    if !remember_browser_for_tab(tab_id, generation, browser) {
+        return;
+    }
+    emit_content_event(ContentEvent::LoadingChanged {
+        tab_id,
+        generation,
+        is_loading: is_loading != 0,
+    });
+    emit_content_event(ContentEvent::NavigationStateChanged {
+        tab_id,
+        generation,
+        can_go_back: can_go_back != 0,
+        can_go_forward: can_go_forward != 0,
+    });
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_content_on_load_start(
+    self_: *mut cef_load_handler_t,
+    browser: *mut cef_browser_t,
+    frame: *mut cef_frame_t,
+    _transition_type: cef_transition_type_t,
+) {
+    if self_.is_null() || !cef_frame_is_main(frame) {
+        return;
+    }
+    let handler = self_ as *mut SwitchboardContentLoadHandler;
+    if !remember_browser_for_tab((*handler).tab_id, (*handler).generation, browser) {
+        return;
+    }
+    (*handler).main_frame_failed.store(false, Ordering::Release);
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_content_on_load_end(
+    self_: *mut cef_load_handler_t,
+    browser: *mut cef_browser_t,
+    frame: *mut cef_frame_t,
+    _http_status_code: c_int,
+) {
+    if self_.is_null() || !cef_frame_is_main(frame) {
+        return;
+    }
+    let handler = self_ as *mut SwitchboardContentLoadHandler;
+    if !remember_browser_for_tab((*handler).tab_id, (*handler).generation, browser) {
+        return;
+    }
+    if !(*handler).main_frame_failed.swap(false, Ordering::AcqRel) {
+        emit_content_event(ContentEvent::MainFrameLoadSucceeded {
+            tab_id: (*handler).tab_id,
+            generation: (*handler).generation,
         });
     }
 }
 
 #[cfg(target_os = "macos")]
-unsafe extern "C" fn switchboard_content_on_loading_progress_change(
-    _self_: *mut cef_display_handler_t,
+unsafe extern "C" fn switchboard_content_on_load_error(
+    self_: *mut cef_load_handler_t,
     browser: *mut cef_browser_t,
-    progress: f64,
+    frame: *mut cef_frame_t,
+    error_code: cef_errorcode_t,
+    error_text: *const cef_string_t,
+    failed_url: *const cef_string_t,
 ) {
-    let mut is_loading = progress < 0.999_999;
-    if !browser.is_null() {
-        remember_browser_for_active_tab(browser);
-        if let Some(is_loading_fn) = (*browser).is_loading {
-            is_loading = is_loading_fn(browser) != 0;
-        }
+    if self_.is_null() || !cef_frame_is_main(frame) {
+        return;
     }
-    if let Some(tab_id) = active_content_tab() {
-        emit_content_event(ContentEvent::LoadingChanged { tab_id, is_loading });
+    let handler = self_ as *mut SwitchboardContentLoadHandler;
+    if !remember_browser_for_tab((*handler).tab_id, (*handler).generation, browser) {
+        return;
     }
+    (*handler).main_frame_failed.store(true, Ordering::Release);
+    let error_text = bounded_diagnostic(&cef_string_to_owned(error_text), 256);
+    let failed_url = bounded_diagnostic(&cef_string_to_owned(failed_url), 512);
+    eprintln!(
+        "switchboard-app: main-frame load failed tab={} generation={} code={} error={} url={}",
+        (*handler).tab_id.0,
+        (*handler).generation,
+        error_code,
+        error_text,
+        failed_url
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn bounded_diagnostic(value: &str, max_chars: usize) -> String {
+    let mut output: String = value.chars().take(max_chars).collect();
+    if value.chars().count() > max_chars {
+        output.push('…');
+    }
+    output
 }
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" fn switchboard_content_on_pre_key_event(
-    _self_: *mut cef_keyboard_handler_t,
-    _browser: *mut cef_browser_t,
-    _event: *const cef_key_event_t_switchboard,
+    self_: *mut cef_keyboard_handler_t,
+    browser: *mut cef_browser_t,
+    event: *const cef_key_event_t_switchboard,
     _os_event: CefEventHandleSwitchboard,
     _is_keyboard_shortcut: *mut c_int,
 ) -> c_int {
+    if self_.is_null() || browser.is_null() || event.is_null() {
+        return 0;
+    }
+    let handler = self_ as *mut SwitchboardContentKeyboardHandler;
+    if !remember_browser_for_tab((*handler).tab_id, (*handler).generation, browser) {
+        return 0;
+    }
+    let key_event = &*event;
+    if (key_event.type_ != CEF_KEYEVENT_RAWKEYDOWN && key_event.type_ != CEF_KEYEVENT_KEYDOWN)
+        || (key_event.modifiers & CEF_EVENTFLAG_IS_REPEAT) != 0
+        || fallback_shortcut_action(key_event) != Some(UiShortcutAction::Reload)
+    {
+        return 0;
+    }
+    if dispatch_ui_shortcut_action(UiShortcutAction::Reload) {
+        return 1;
+    }
     0
 }
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" fn switchboard_content_on_key_event(
-    _self_: *mut cef_keyboard_handler_t,
+    self_: *mut cef_keyboard_handler_t,
     browser: *mut cef_browser_t,
     event: *const cef_key_event_t_switchboard,
     _os_event: CefEventHandleSwitchboard,
@@ -2502,19 +3077,37 @@ unsafe extern "C" fn switchboard_content_on_key_event(
     if browser.is_null() || event.is_null() {
         return 0;
     }
-    remember_browser_for_active_tab(browser);
-    if !WEBSITE_KEYBINDINGS_ACTIVE.with(|slot| slot.get()) {
-        return 0;
+    if !self_.is_null() {
+        let handler = self_ as *mut SwitchboardContentKeyboardHandler;
+        if !remember_browser_for_tab((*handler).tab_id, (*handler).generation, browser) {
+            return 0;
+        }
     }
     let key_event = &*event;
     if key_event.type_ != CEF_KEYEVENT_RAWKEYDOWN && key_event.type_ != CEF_KEYEVENT_KEYDOWN {
         return 0;
+    }
+    let browser_mode = WEBSITE_KEYBINDINGS_ACTIVE.with(|slot| slot.get());
+    if !browser_mode {
+        let escape = event_key_token(key_event) == Some(KeyToken::Escape)
+            && key_event.modifiers
+                & (CEF_EVENTFLAG_SHIFT_DOWN
+                    | CEF_EVENTFLAG_CONTROL_DOWN
+                    | CEF_EVENTFLAG_ALT_DOWN
+                    | CEF_EVENTFLAG_COMMAND_DOWN)
+                == 0;
+        return i32::from(
+            escape && dispatch_ui_shortcut_action(UiShortcutAction::EnterBrowserMode),
+        );
     }
     if key_event.focus_on_editable_field != 0 {
         return 0;
     }
     if (key_event.modifiers & CEF_EVENTFLAG_IS_REPEAT) != 0 {
         return 0;
+    }
+    if fallback_shortcut_action(key_event) == Some(UiShortcutAction::Reload) {
+        return i32::from(dispatch_ui_shortcut_action(UiShortcutAction::Reload));
     }
     let Some(action) = fallback_shortcut_action(key_event) else {
         return 0;
@@ -2548,7 +3141,18 @@ unsafe extern "C" fn switchboard_content_client_get_keyboard_handler(
 }
 
 #[cfg(target_os = "macos")]
-fn allocate_content_display_handler() -> *mut cef_display_handler_t {
+unsafe extern "C" fn switchboard_content_client_get_load_handler(
+    self_: *mut cef_client_t,
+) -> *mut cef_load_handler_t {
+    if self_.is_null() {
+        return std::ptr::null_mut();
+    }
+    let client = self_ as *mut SwitchboardContentClient;
+    (*client).load_handler
+}
+
+#[cfg(target_os = "macos")]
+fn allocate_content_display_handler(tab_id: TabId, generation: u64) -> *mut cef_display_handler_t {
     let handler = Box::new(SwitchboardContentDisplayHandler {
         handler: cef_display_handler_t {
             base: ref_counted_base::<cef_display_handler_t>(),
@@ -2560,34 +3164,68 @@ fn allocate_content_display_handler() -> *mut cef_display_handler_t {
             on_status_message: None,
             on_console_message: None,
             on_auto_resize: None,
-            on_loading_progress_change: Some(switchboard_content_on_loading_progress_change),
+            on_loading_progress_change: None,
             on_cursor_change: None,
             on_media_access_change: None,
             on_contents_bounds_change: None,
             get_root_window_screen_rect: None,
         },
+        tab_id,
+        generation,
     });
     let ptr = Box::into_raw(handler);
     unsafe { &mut (*ptr).handler as *mut cef_display_handler_t }
 }
 
 #[cfg(target_os = "macos")]
-fn allocate_content_keyboard_handler() -> *mut cef_keyboard_handler_t {
+fn allocate_content_keyboard_handler(
+    tab_id: TabId,
+    generation: u64,
+) -> *mut cef_keyboard_handler_t {
     let handler = Box::new(SwitchboardContentKeyboardHandler {
         handler: cef_keyboard_handler_t_switchboard {
             base: ref_counted_base::<cef_keyboard_handler_t_switchboard>(),
             on_pre_key_event: Some(switchboard_content_on_pre_key_event),
             on_key_event: Some(switchboard_content_on_key_event),
         },
+        tab_id,
+        generation,
     });
     let ptr = Box::into_raw(handler);
-    unsafe { &mut (*ptr).handler as *mut cef_keyboard_handler_t_switchboard as *mut cef_keyboard_handler_t }
+    unsafe {
+        &mut (*ptr).handler as *mut cef_keyboard_handler_t_switchboard
+            as *mut cef_keyboard_handler_t
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn allocate_content_cef_client() -> *mut cef_client_t {
-    let display_handler = allocate_content_display_handler();
-    let keyboard_handler = allocate_content_keyboard_handler();
+fn allocate_content_load_handler(tab_id: TabId, generation: u64) -> *mut cef_load_handler_t {
+    let handler = Box::new(SwitchboardContentLoadHandler {
+        handler: cef_load_handler_t {
+            base: ref_counted_base::<cef_load_handler_t>(),
+            on_loading_state_change: Some(switchboard_content_on_loading_state_change),
+            on_load_start: Some(switchboard_content_on_load_start),
+            on_load_end: Some(switchboard_content_on_load_end),
+            on_load_error: Some(switchboard_content_on_load_error),
+        },
+        tab_id,
+        generation,
+        main_frame_failed: AtomicBool::new(false),
+    });
+    let pointer = Box::into_raw(handler);
+    unsafe { &mut (*pointer).handler }
+}
+
+#[cfg(target_os = "macos")]
+fn allocate_content_cef_client(
+    profile_id: ProfileId,
+    tab_id: TabId,
+    generation: u64,
+) -> *mut cef_client_t {
+    let display_handler = allocate_content_display_handler(tab_id, generation);
+    let keyboard_handler = allocate_content_keyboard_handler(tab_id, generation);
+    let load_handler = allocate_content_load_handler(tab_id, generation);
+    let life_span_handler = allocate_life_span_handler(Some(tab_id), generation);
     let client = Box::new(SwitchboardContentClient {
         client: cef_client_t {
             base: ref_counted_base::<cef_client_t>(),
@@ -2604,15 +3242,20 @@ fn allocate_content_cef_client() -> *mut cef_client_t {
             get_permission_handler: None,
             get_jsdialog_handler: None,
             get_keyboard_handler: Some(switchboard_content_client_get_keyboard_handler),
-            get_life_span_handler: None,
-            get_load_handler: None,
+            get_life_span_handler: Some(switchboard_content_client_get_life_span_handler),
+            get_load_handler: Some(switchboard_content_client_get_load_handler),
             get_print_handler: None,
             get_render_handler: None,
             get_request_handler: None,
             on_process_message_received: None,
         },
+        profile_id,
+        tab_id,
+        generation,
         display_handler,
         keyboard_handler,
+        load_handler,
+        life_span_handler,
     });
     let client_ptr = Box::into_raw(client);
     if env_flag(ENV_CEF_VERBOSE_ERRORS) {
@@ -2632,6 +3275,18 @@ unsafe fn free_content_cef_client(client: *mut cef_client_t) {
         return;
     }
     let content_client = client as *mut SwitchboardContentClient;
+    let life_span_handler = (*content_client).life_span_handler;
+    if !life_span_handler.is_null() {
+        let handler = life_span_handler as *mut SwitchboardLifeSpanHandler;
+        if !(*handler).before_close_seen.load(Ordering::Acquire) {
+            eprintln!(
+                "switchboard-app: refusing to release tab {} generation {} client before OnBeforeClose",
+                (*content_client).tab_id.0,
+                (*content_client).generation
+            );
+            return;
+        }
+    }
     let display_handler = (*content_client).display_handler;
     if !display_handler.is_null() {
         drop(Box::from_raw(
@@ -2644,7 +3299,46 @@ unsafe fn free_content_cef_client(client: *mut cef_client_t) {
             keyboard_handler as *mut SwitchboardContentKeyboardHandler,
         ));
     }
+    let load_handler = (*content_client).load_handler;
+    if !load_handler.is_null() {
+        drop(Box::from_raw(
+            load_handler as *mut SwitchboardContentLoadHandler,
+        ));
+    }
+    if !life_span_handler.is_null() {
+        drop(Box::from_raw(
+            life_span_handler as *mut SwitchboardLifeSpanHandler,
+        ));
+    }
     drop(Box::from_raw(content_client));
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn free_ui_cef_client(client: *mut cef_client_t) {
+    if client.is_null() {
+        return;
+    }
+    let ui_client = client as *mut SwitchboardUiClient;
+    let life_span_handler = (*ui_client).life_span_handler;
+    if !life_span_handler.is_null() {
+        let handler = life_span_handler as *mut SwitchboardLifeSpanHandler;
+        if !(*handler).before_close_seen.load(Ordering::Acquire) {
+            eprintln!("switchboard-app: refusing to release UI client before OnBeforeClose");
+            return;
+        }
+    }
+    let display_handler = (*ui_client).display_handler;
+    if !display_handler.is_null() {
+        drop(Box::from_raw(
+            display_handler as *mut SwitchboardUiDisplayHandler,
+        ));
+    }
+    if !life_span_handler.is_null() {
+        drop(Box::from_raw(
+            life_span_handler as *mut SwitchboardLifeSpanHandler,
+        ));
+    }
+    drop(Box::from_raw(ui_client));
 }
 
 #[cfg(target_os = "macos")]
@@ -2653,10 +3347,42 @@ impl CefRuntime {
         let Some(config) = CefConfig::from_env()? else {
             return Ok(None);
         };
+        config.validate_for_sandboxed_bundle()?;
         let config_summary = config.summary();
         let verbose_errors = env_flag(ENV_CEF_VERBOSE_ERRORS);
 
         unsafe {
+            let is_subprocess = std::env::args().any(|arg| arg.starts_with("--type="));
+            let mut sandbox_argv_storage = if is_subprocess {
+                Some(cef_argv_storage(std::env::args())?)
+            } else {
+                None
+            };
+            let sandbox_context = if let Some(argv_storage) = sandbox_argv_storage.as_mut() {
+                let mut argv_ptrs = cef_argv_ptrs(argv_storage);
+                let argc = i32::try_from(argv_ptrs.len())
+                    .map_err(|_| HostError::Native("too many argv values for CEF".to_owned()))?;
+                let context = CefSandboxContext::initialize(
+                    config.sandbox_library_path(),
+                    argc,
+                    argv_ptrs.as_mut_ptr(),
+                )
+                .map_err(|error| {
+                    HostError::Native(format!(
+                        "CEF bootstrap failed at: initialize helper sandbox\nreason: {error}\nconfiguration:\n{config_summary}"
+                    ))
+                })?;
+                if verbose_errors {
+                    eprintln!(
+                        "switchboard-app: initialized CEF helper sandbox (pid={})",
+                        std::process::id()
+                    );
+                }
+                Some(context)
+            } else {
+                None
+            };
+
             let library = CefLibrary::open(&config.library_path).map_err(|err| {
                 let raw_error = err.to_string();
                 let reason = short_cef_loader_reason(&raw_error);
@@ -2694,8 +3420,16 @@ impl CefRuntime {
             }
 
             let mut cef_args: Vec<String> = std::env::args().collect();
-            let use_mock_keychain =
-                env_flag_or_default(ENV_CEF_USE_MOCK_KEYCHAIN, cfg!(debug_assertions));
+            let mock_keychain_requested = env_flag(ENV_CEF_USE_MOCK_KEYCHAIN);
+            let smoke_bundle = std::env::current_exe()
+                .ok()
+                .is_some_and(|path| path.to_string_lossy().contains("Switchboard Smoke.app/"));
+            if mock_keychain_requested && !smoke_bundle {
+                return Err(HostError::Native(format!(
+                    "{ENV_CEF_USE_MOCK_KEYCHAIN} is restricted to the dedicated Switchboard Smoke.app bundle"
+                )));
+            }
+            let use_mock_keychain = mock_keychain_requested && smoke_bundle;
             if use_mock_keychain {
                 upsert_cef_switch(&mut cef_args, "--use-mock-keychain");
             }
@@ -2720,16 +3454,8 @@ impl CefRuntime {
                 );
             }
 
-            let mut argv_storage = Vec::new();
-            for arg in cef_args {
-                let c_arg = CString::new(arg)
-                    .map_err(|_| HostError::Native("argv contained interior NUL".to_owned()))?;
-                argv_storage.push(c_arg);
-            }
-            let mut argv_ptrs: Vec<*mut c_char> = argv_storage
-                .iter()
-                .map(|arg| arg.as_ptr() as *mut c_char)
-                .collect();
+            let argv_storage = cef_argv_storage(cef_args.into_iter())?;
+            let mut argv_ptrs = cef_argv_ptrs(&argv_storage);
             let main_args = cef_main_args_t {
                 argc: i32::try_from(argv_ptrs.len())
                     .map_err(|_| HostError::Native("too many argv values for CEF".to_owned()))?,
@@ -2745,13 +3471,17 @@ impl CefRuntime {
                 );
             }
             if secondary_exit_code >= 0 {
+                // `process::exit` does not run destructors. CEF requires the
+                // framework to unload before the helper sandbox is destroyed.
+                drop(library);
+                drop(sandbox_context);
                 std::process::exit(secondary_exit_code);
             }
             eprintln!("switchboard-app: CEF bootstrap configuration\n{config_summary}");
 
             let mut settings: cef_settings_t = zeroed();
             settings.size = size_of::<cef_settings_t>();
-            settings.no_sandbox = 1;
+            settings.no_sandbox = 0;
             settings.background_color = DEFAULT_BACKGROUND_COLOR;
 
             std::fs::create_dir_all(&config.root_cache_path).map_err(|error| {
@@ -2775,13 +3505,6 @@ impl CefRuntime {
             std::env::set_var("TMPDIR", &config.temp_dir);
             std::env::set_var("TEMP", &config.temp_dir);
             std::env::set_var("TMP", &config.temp_dir);
-            if !has_cef_ffmpeg_runtime_library(&config) {
-                eprintln!(
-                    "switchboard-app: warning: libffmpeg.dylib was not found in the configured CEF distribution; H264/AAC livestream playback (for example YouTube Live) may fail"
-                );
-            }
-            stage_cef_runtime_libraries(&config)?;
-
             let mut settings_strings = Vec::new();
             set_cef_path_string(
                 &library,
@@ -2834,18 +3557,38 @@ impl CefRuntime {
                     "CEF bootstrap failed at: initialize\nreason: cef_initialize returned false\nconfiguration:\n{config_summary}\nnotes:\n  - if logs mention ProcessSingleton/SingletonSocket, ensure tmp/cache paths are writable\n  - override with SWITCHBOARD_CEF_ROOT_CACHE_PATH and SWITCHBOARD_CEF_TMPDIR if needed"
                 )));
             }
+            if !UI_SCHEME_DECLARED.load(Ordering::Acquire) {
+                return Err(HostError::Native(
+                    "CEF bootstrap failed at: declare app:// scheme\nreason: OnRegisterCustomSchemes was not accepted in the browser process"
+                        .to_owned(),
+                ));
+            }
 
             let app_scheme = CefString::new(&library, UI_SCHEME)?;
+            let ui_domain = CefString::new(&library, "ui")?;
             let ui_scheme_factory = allocate_ui_scheme_factory();
-            let registered = (library.api.cef_register_scheme_handler_factory)(
+            let ui_request_context = create_cef_request_context(&library, None, false, false)?;
+            let register_scheme_handler_factory = (*ui_request_context)
+                .register_scheme_handler_factory
+                .ok_or_else(|| {
+                    HostError::Native(
+                        "CEF UI request context does not expose scheme registration".to_owned(),
+                    )
+                })?;
+            let registered = register_scheme_handler_factory(
+                ui_request_context,
                 app_scheme.as_ptr(),
-                std::ptr::null(),
+                ui_domain.as_ptr(),
                 ui_scheme_factory,
             );
             if registered == 0 {
                 return Err(HostError::Native(
-                    "CEF bootstrap failed at: register app:// scheme handler".to_owned(),
+                    "CEF bootstrap failed at: register app:// scheme handler on the isolated UI request context"
+                        .to_owned(),
                 ));
+            }
+            if verbose_errors {
+                eprintln!("switchboard-app: registered app:// handler on isolated UI context");
             }
             let ui_client = allocate_ui_cef_client();
 
@@ -2855,6 +3598,8 @@ impl CefRuntime {
                 _app: app,
                 _ui_scheme_factory: ui_scheme_factory,
                 ui_client,
+                ui_request_context,
+                profile_request_contexts: RefCell::new(HashMap::new()),
             }))
         }
     }
@@ -2864,6 +3609,7 @@ impl CefRuntime {
         parent_view: ObjcId,
         url: &str,
         client: *mut cef_client_t,
+        request_context: *mut cef_request_context_t,
         width: f64,
         height: f64,
     ) -> Result<(), HostError> {
@@ -2891,13 +3637,18 @@ impl CefRuntime {
             let url_value = CefString::new(&self.library, url)?;
             let create_browser: cef_browser_host_create_browser_fn =
                 self.library.api.cef_browser_host_create_browser;
+            // Ref-counted C API parameters use transfer semantics. Transfer
+            // additional references so the host-owned client and persistent
+            // profile request context remain valid after this call returns.
+            retain_cef_client(client);
+            retain_cef_request_context(request_context);
             let result = create_browser(
                 &window_info,
                 client,
                 url_value.as_ptr(),
                 &browser_settings,
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                request_context,
             );
             if env_flag(ENV_CEF_VERBOSE_ERRORS) {
                 eprintln!(
@@ -2919,6 +3670,49 @@ impl CefRuntime {
         self.ui_client
     }
 
+    fn ui_request_context(&self) -> *mut cef_request_context_t {
+        self.ui_request_context
+    }
+
+    fn request_context_for_profile(
+        &self,
+        profile_id: ProfileId,
+    ) -> Result<*mut cef_request_context_t, HostError> {
+        if let Some(context) = self
+            .profile_request_contexts
+            .borrow()
+            .get(&profile_id)
+            .copied()
+        {
+            if env_flag(ENV_CEF_VERBOSE_ERRORS) {
+                eprintln!(
+                    "switchboard-app: reusing profile {} request context {context:p}",
+                    profile_id.0
+                );
+            }
+            return Ok(context);
+        }
+        let path = profile_cache_path(&self.config.root_cache_path, profile_id);
+        std::fs::create_dir_all(&path).map_err(|error| {
+            HostError::Native(format!(
+                "failed creating profile {} CEF cache {}: {error}",
+                profile_id.0,
+                path.display()
+            ))
+        })?;
+        let context = create_cef_request_context(&self.library, Some(&path), true, true)?;
+        if env_flag(ENV_CEF_VERBOSE_ERRORS) {
+            eprintln!(
+                "switchboard-app: created profile {} request context {context:p}",
+                profile_id.0
+            );
+        }
+        self.profile_request_contexts
+            .borrow_mut()
+            .insert(profile_id, context);
+        Ok(context)
+    }
+
     fn run_message_loop(&self) {
         unsafe {
             (self.library.api.cef_run_message_loop)();
@@ -2927,9 +3721,89 @@ impl CefRuntime {
 
     fn shutdown(&self) {
         unsafe {
+            for context in self
+                .profile_request_contexts
+                .borrow_mut()
+                .drain()
+                .map(|(_, value)| value)
+            {
+                release_cef_request_context(context);
+            }
+            release_cef_request_context(self.ui_request_context);
+        }
+        unsafe {
             (self.library.api.cef_shutdown)();
         }
         clear_cef_quit_message_loop_hook();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn profile_cache_path(root_cache_path: &Path, profile_id: ProfileId) -> PathBuf {
+    root_cache_path.join(format!("profile-{}", profile_id.0))
+}
+
+#[cfg(target_os = "macos")]
+fn create_cef_request_context(
+    library: &CefLibrary,
+    cache_path: Option<&Path>,
+    persist_session_cookies: bool,
+    allow_default_cookie_schemes: bool,
+) -> Result<*mut cef_request_context_t, HostError> {
+    unsafe {
+        let mut settings: cef_request_context_settings_t = zeroed();
+        settings.size = size_of::<cef_request_context_settings_t>();
+        settings.persist_session_cookies = i32::from(persist_session_cookies);
+        settings.cookieable_schemes_exclude_defaults = i32::from(!allow_default_cookie_schemes);
+        let cache = cache_path
+            .map(|path| CefString::new(library, &path.to_string_lossy()))
+            .transpose()?;
+        if let Some(cache) = cache.as_ref() {
+            settings.cache_path = cache.value();
+        }
+        let context =
+            (library.api.cef_request_context_create_context)(&settings, std::ptr::null_mut());
+        if context.is_null() {
+            return Err(HostError::Native(format!(
+                "CEF failed to create {} request context",
+                if cache_path.is_some() {
+                    "profile"
+                } else {
+                    "ephemeral UI"
+                }
+            )));
+        }
+        Ok(context)
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn release_cef_request_context(context: *mut cef_request_context_t) {
+    if context.is_null() {
+        return;
+    }
+    if let Some(release) = (*context).base.base.release {
+        release(&mut (*context).base.base);
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn retain_cef_request_context(context: *mut cef_request_context_t) {
+    if context.is_null() {
+        return;
+    }
+    if let Some(add_ref) = (*context).base.base.add_ref {
+        add_ref(&mut (*context).base.base);
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn retain_cef_client(client: *mut cef_client_t) {
+    if client.is_null() {
+        return;
+    }
+    if let Some(add_ref) = (*client).base.add_ref {
+        add_ref(&mut (*client).base);
     }
 }
 
@@ -2951,12 +3825,14 @@ fn default_subprocess_path() -> Result<PathBuf, HostError> {
 
 #[cfg(target_os = "macos")]
 fn default_root_cache_path() -> Result<PathBuf, HostError> {
-    let current_dir = std::env::current_dir().map_err(|error| {
-        HostError::Native(format!(
-            "failed to resolve current directory for CEF cache path: {error}"
-        ))
+    let user_home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        HostError::Native("HOME is not set; cannot resolve CEF cache path".to_owned())
     })?;
-    Ok(current_dir.join("target").join("cef_user_data"))
+    Ok(user_home
+        .join("Library")
+        .join("Application Support")
+        .join("Switchboard")
+        .join("CEF"))
 }
 
 #[cfg(target_os = "macos")]
@@ -2982,110 +3858,10 @@ fn describe_optional_path(path: &Option<PathBuf>) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn stage_cef_runtime_libraries(config: &CefConfig) -> Result<(), HostError> {
-    let subprocess = config
-        .browser_subprocess_path
-        .as_ref()
-        .ok_or_else(|| HostError::Native("browser_subprocess_path was not resolved".to_owned()))?;
-    let target_dir = subprocess.parent().ok_or_else(|| {
-        HostError::Native(format!(
-            "cannot resolve executable directory from browser_subprocess_path {}",
-            subprocess.display()
-        ))
-    })?;
-
-    let framework_libraries_dir = config.framework_dir_path.join("Libraries");
-    if framework_libraries_dir.is_dir() {
-        for entry in std::fs::read_dir(&framework_libraries_dir).map_err(|error| {
-            HostError::Native(format!(
-                "failed reading CEF Libraries dir {}: {error}",
-                framework_libraries_dir.display()
-            ))
-        })? {
-            let entry = entry.map_err(|error| {
-                HostError::Native(format!(
-                    "failed iterating CEF Libraries dir {}: {error}",
-                    framework_libraries_dir.display()
-                ))
-            })?;
-            let source = entry.path();
-            if !source.is_file() {
-                continue;
-            }
-            stage_cef_runtime_file(&source, &target_dir.join(entry.file_name()))?;
-        }
-    }
-
-    if let Some(release_dir) = config.framework_dir_path.parent() {
-        for file_name in CEF_RELEASE_RUNTIME_FILES {
-            let source = release_dir.join(file_name);
-            if source.is_file() {
-                stage_cef_runtime_file(&source, &target_dir.join(file_name))?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn has_cef_ffmpeg_runtime_library(config: &CefConfig) -> bool {
-    let framework_candidate = config.framework_dir_path.join("Libraries").join("libffmpeg.dylib");
-    if framework_candidate.is_file() {
-        return true;
-    }
-
-    config
-        .framework_dir_path
-        .parent()
-        .map(|release_dir| release_dir.join("libffmpeg.dylib").is_file())
-        .unwrap_or(false)
-}
-
-#[cfg(target_os = "macos")]
-fn stage_cef_runtime_file(source: &Path, target: &Path) -> Result<(), HostError> {
-    if source == target {
-        return Ok(());
-    }
-
-    if std::fs::symlink_metadata(target).is_ok() {
-        std::fs::remove_file(target).map_err(|error| {
-            HostError::Native(format!(
-                "failed replacing staged CEF runtime lib {}: {error}",
-                target.display()
-            ))
-        })?;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if std::os::unix::fs::symlink(source, target).is_ok() {
-            return Ok(());
-        }
-    }
-
-    std::fs::copy(source, target).map_err(|error| {
-        HostError::Native(format!(
-            "failed staging CEF runtime lib {} -> {}: {error}",
-            source.display(),
-            target.display()
-        ))
-    })?;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
 fn env_flag(key: &str) -> bool {
     std::env::var(key)
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
-}
-
-#[cfg(target_os = "macos")]
-fn env_flag_or_default(key: &str, default: bool) -> bool {
-    std::env::var(key)
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(default)
 }
 
 #[cfg(target_os = "macos")]
@@ -3168,6 +3944,24 @@ fn upsert_cef_switch_with_value(args: &mut Vec<String>, switch: &str, value: &st
 }
 
 #[cfg(target_os = "macos")]
+fn cef_argv_storage(args: impl IntoIterator<Item = String>) -> Result<Vec<CString>, HostError> {
+    args.into_iter()
+        .map(|arg| {
+            CString::new(arg)
+                .map_err(|_| HostError::Native("argv contained interior NUL".to_owned()))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn cef_argv_ptrs(argv_storage: &[CString]) -> Vec<*mut c_char> {
+    argv_storage
+        .iter()
+        .map(|arg| arg.as_ptr() as *mut c_char)
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
 pub struct NativeMacHost {
     app: ObjcId,
     cef: Option<CefRuntime>,
@@ -3181,6 +3975,7 @@ pub struct NativeMacHost {
     content_view_windows: HashMap<ContentViewId, WindowId>,
     cef_clients: HashMap<ContentViewId, *mut cef_client_t>,
     retired_cef_clients: Vec<*mut cef_client_t>,
+    focus_mode: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -3189,7 +3984,12 @@ impl NativeMacHost {
         let is_cef_subprocess = std::env::args().any(|arg| arg.starts_with("--type="));
         // Initialize CEF first so subprocesses can return from cef_execute_process
         // and exit before any Cocoa app activation/Dock integration happens.
-        let cef = CefRuntime::from_environment()?;
+        let cef = CefRuntime::from_environment()?.ok_or_else(|| {
+            HostError::Native(
+                "Switchboard must be launched from its generated macOS .app bundle; bare cargo run is unsupported"
+                    .to_owned(),
+            )
+        })?;
         if is_cef_subprocess {
             return Err(HostError::Native(
                 "CEF subprocess reached UI host initialization unexpectedly".to_owned(),
@@ -3221,7 +4021,7 @@ impl NativeMacHost {
 
             Ok(Self {
                 app,
-                cef,
+                cef: Some(cef),
                 next_window_id: 0,
                 next_ui_view_id: 0,
                 next_content_view_id: 0,
@@ -3232,6 +4032,7 @@ impl NativeMacHost {
                 content_view_windows: HashMap::new(),
                 cef_clients: HashMap::new(),
                 retired_cef_clients: Vec::new(),
+                focus_mode: false,
             })
         }
     }
@@ -3241,6 +4042,115 @@ impl NativeMacHost {
             .get(&window_id)
             .copied()
             .ok_or_else(|| HostError::Native(format!("window not found: {}", window_id.0)))
+    }
+
+    fn browser_for_content_view(
+        &self,
+        view_id: ContentViewId,
+    ) -> Result<*mut cef_browser_t, HostError> {
+        let tab_id = self
+            .content_view_tabs
+            .get(&view_id)
+            .copied()
+            .ok_or_else(|| HostError::Native(format!("content view not found: {}", view_id.0)))?;
+        let browser = browser_for_tab(tab_id);
+        if browser.is_null() {
+            return Err(HostError::Native(format!(
+                "CEF browser is not ready for tab {}",
+                tab_id.0
+            )));
+        }
+        Ok(browser)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_exact_ui_url;
+    #[cfg(target_os = "macos")]
+    use super::{
+        allocate_content_load_handler, browser_callback_action, main_app_bundle_for_executable,
+        profile_cache_path, BrowserCallbackAction, SwitchboardContentLoadHandler,
+    };
+    #[cfg(target_os = "macos")]
+    use std::path::Path;
+    #[cfg(target_os = "macos")]
+    use switchboard_core::{ProfileId, TabId};
+
+    #[test]
+    fn privileged_ui_origin_match_is_exact() {
+        assert!(is_exact_ui_url("app://ui"));
+        assert!(is_exact_ui_url("app://ui/"));
+        assert!(is_exact_ui_url("app://ui?v=1#bridge=x"));
+        assert!(!is_exact_ui_url("app://ui.evil.example"));
+        assert!(!is_exact_ui_url("https://ui"));
+        assert!(!is_exact_ui_url("app://content"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nested_helpers_resolve_the_outer_application_bundle() {
+        let main = Path::new("/tmp/Switchboard Dev.app/Contents/MacOS/switchboard-app");
+        assert_eq!(
+            main_app_bundle_for_executable(main).as_deref(),
+            Some(Path::new("/tmp/Switchboard Dev.app"))
+        );
+
+        let helper = Path::new(
+            "/tmp/Switchboard Dev.app/Contents/Frameworks/Switchboard Helper (GPU).app/Contents/MacOS/Switchboard Helper (GPU)",
+        );
+        assert_eq!(
+            main_app_bundle_for_executable(helper).as_deref(),
+            Some(Path::new("/tmp/Switchboard Dev.app"))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn browser_callback_attribution_rejects_stale_generations_and_refreshes_wrappers() {
+        assert_eq!(
+            browser_callback_action(None, 4, false, false),
+            BrowserCallbackAction::Insert
+        );
+        assert_eq!(
+            browser_callback_action(Some(4), 3, false, true),
+            BrowserCallbackAction::Reject
+        );
+        assert_eq!(
+            browser_callback_action(Some(4), 4, true, true),
+            BrowserCallbackAction::Keep
+        );
+        assert_eq!(
+            browser_callback_action(Some(4), 4, false, true),
+            BrowserCallbackAction::RefreshWrapper
+        );
+        assert_eq!(
+            browser_callback_action(Some(4), 4, false, false),
+            BrowserCallbackAction::Reject
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn content_load_handler_installs_all_cef_145_callbacks() {
+        let pointer = allocate_content_load_handler(TabId(7), 11);
+        assert!(!pointer.is_null());
+        unsafe {
+            assert!((*pointer).on_loading_state_change.is_some());
+            assert!((*pointer).on_load_start.is_some());
+            assert!((*pointer).on_load_end.is_some());
+            assert!((*pointer).on_load_error.is_some());
+            drop(Box::from_raw(pointer as *mut SwitchboardContentLoadHandler));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn profile_cache_is_a_direct_child_of_the_cef_root() {
+        let root = Path::new("/private/tmp/switchboard-cef-root");
+        let path = profile_cache_path(root, ProfileId(9));
+        assert_eq!(path, root.join("profile-9"));
+        assert_eq!(path.parent(), Some(root));
     }
 }
 
@@ -3298,7 +4208,7 @@ impl CefHost for NativeMacHost {
     }
 
     fn create_ui_view(&mut self, window_id: WindowId, url: &str) -> Result<UiViewId, Self::Error> {
-        if !url.starts_with("app://ui") {
+        if !is_exact_ui_url(url) {
             return Err(HostError::InvalidUiUrl(url.to_owned()));
         }
         let cef = self.cef.as_ref().ok_or_else(|| {
@@ -3338,7 +4248,14 @@ impl CefHost for NativeMacHost {
 
             msg_send_void_id(root_view, selector("addSubview:")?, ui_view);
             set_ui_view_handles(root_view, ui_view);
-            cef.create_browser_in_view(ui_view, url, cef.ui_client(), root_width, root_height)?;
+            cef.create_browser_in_view(
+                ui_view,
+                url,
+                cef.ui_client(),
+                cef.ui_request_context(),
+                root_width,
+                root_height,
+            )?;
 
             self.next_ui_view_id += 1;
             let view_id = UiViewId(self.next_ui_view_id);
@@ -3350,7 +4267,9 @@ impl CefHost for NativeMacHost {
     fn create_content_view(
         &mut self,
         window_id: WindowId,
+        profile_id: ProfileId,
         tab_id: TabId,
+        generation: u64,
         url: &str,
     ) -> Result<ContentViewId, Self::Error> {
         if url.starts_with("app://") {
@@ -3376,11 +4295,13 @@ impl CefHost for NativeMacHost {
             let mut cef_client: Option<*mut cef_client_t> = None;
             let backend = if let Some(cef) = self.cef.as_ref() {
                 set_active_content_browser(std::ptr::null_mut());
-                let client = allocate_content_cef_client();
+                let client = allocate_content_cef_client(profile_id, tab_id, generation);
+                let request_context = cef.request_context_for_profile(profile_id)?;
                 if let Err(error) = cef.create_browser_in_view(
                     content_view,
                     url,
                     client,
+                    request_context,
                     frame.size.width,
                     frame.size.height,
                 ) {
@@ -3388,13 +4309,11 @@ impl CefHost for NativeMacHost {
                     return Err(error);
                 }
                 set_active_content_tab(Some(tab_id));
-                set_active_content_uri(url.to_owned());
                 cef_client = Some(client);
                 ContentBackend::Cef(content_view)
             } else {
                 attach_wk_web_view(content_view, url)?;
                 set_active_content_tab(Some(tab_id));
-                set_active_content_uri(url.to_owned());
                 ContentBackend::WebKit(content_view)
             };
 
@@ -3438,25 +4357,22 @@ impl CefHost for NativeMacHost {
                 ContentBackend::WebKit(view) => {
                     attach_wk_web_view(view, url)?;
                     set_active_content_tab(Some(tab_id));
-                    set_active_content_uri(url.to_owned());
                 }
                 ContentBackend::Cef(view) => {
-                    let cef = self
-                        .cef
-                        .as_ref()
-                        .ok_or_else(|| HostError::Native("CEF runtime unavailable".to_owned()))?;
-                    let client = self.cef_clients.get(&view_id).copied().ok_or_else(|| {
-                        HostError::Native(format!(
-                            "CEF client missing for content view: {}",
-                            view_id.0
-                        ))
+                    let _ = view;
+                    let browser = self.browser_for_content_view(view_id)?;
+                    let get_frame = (*browser).get_main_frame.ok_or_else(|| {
+                        HostError::Native("CEF get_main_frame callback unavailable".to_owned())
                     })?;
-                    set_active_content_browser(std::ptr::null_mut());
-                    remove_all_subviews(view)?;
-                    let (width, height) = current_view_size(view)?;
-                    cef.create_browser_in_view(view, url, client, width, height)?;
+                    let frame = get_frame(browser);
+                    if frame.is_null() {
+                        return Err(HostError::Native("CEF main frame unavailable".to_owned()));
+                    }
+                    let load_url = (*frame).load_url.ok_or_else(|| {
+                        HostError::Native("CEF frame load_url callback unavailable".to_owned())
+                    })?;
+                    with_stack_cef_string(url, |value| load_url(frame, value));
                     set_active_content_tab(Some(tab_id));
-                    set_active_content_uri(url.to_owned());
                 }
             }
             let title_value = nsstring(&format!("Switchboard - {url}"))?;
@@ -3499,6 +4415,157 @@ impl CefHost for NativeMacHost {
             }
         } else {
             clear_active_content_container_if_matches(container)?;
+        }
+        Ok(())
+    }
+
+    fn layout_content_views(
+        &mut self,
+        primary: Option<ContentViewId>,
+        secondary: Option<ContentViewId>,
+        ratio: f64,
+        split_enabled: bool,
+    ) -> Result<(), Self::Error> {
+        let Some(primary_id) = primary else {
+            return Ok(());
+        };
+        let primary_backend = self
+            .content_views
+            .get(&primary_id)
+            .copied()
+            .ok_or_else(|| {
+                HostError::Native(format!("content view not found: {}", primary_id.0))
+            })?;
+        let primary_container = match primary_backend {
+            ContentBackend::WebKit(view) | ContentBackend::Cef(view) => view,
+        };
+        let window_id = self
+            .content_view_windows
+            .get(&primary_id)
+            .copied()
+            .ok_or_else(|| HostError::Native("primary content window is missing".to_owned()))?;
+        unsafe {
+            let window = self.window_for(window_id)?;
+            let root = msg_send_id(window, selector("contentView")?);
+            let full = if self.focus_mode {
+                msg_send_rect(root, selector("bounds")?)
+            } else {
+                content_container_frame(root)?
+            };
+            if split_enabled {
+                let clamped = ratio.clamp(0.25, 0.75);
+                let primary_width = (full.size.width * clamped).max(1.0);
+                msg_send_void_rect(
+                    primary_container,
+                    selector("setFrame:")?,
+                    NSRect {
+                        origin: full.origin,
+                        size: NSSize {
+                            width: primary_width,
+                            height: full.size.height,
+                        },
+                    },
+                );
+            }
+            if let Some(secondary_id) = secondary.filter(|_| split_enabled) {
+                let secondary_backend =
+                    self.content_views
+                        .get(&secondary_id)
+                        .copied()
+                        .ok_or_else(|| {
+                            HostError::Native(format!("content view not found: {}", secondary_id.0))
+                        })?;
+                let secondary_container = match secondary_backend {
+                    ContentBackend::WebKit(view) | ContentBackend::Cef(view) => view,
+                };
+                let primary_width = (full.size.width * ratio.clamp(0.25, 0.75)).max(1.0);
+                let secondary_width = (full.size.width - primary_width).max(1.0);
+                msg_send_void_rect(
+                    secondary_container,
+                    selector("setFrame:")?,
+                    NSRect {
+                        origin: NSPoint {
+                            x: full.origin.x + primary_width,
+                            y: full.origin.y,
+                        },
+                        size: NSSize {
+                            width: secondary_width,
+                            height: full.size.height,
+                        },
+                    },
+                );
+            } else if !split_enabled {
+                msg_send_void_rect(primary_container, selector("setFrame:")?, full);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_focus_mode(&mut self, active: bool) -> Result<(), Self::Error> {
+        self.focus_mode = active;
+        set_ui_overlay_visible(!active)
+    }
+
+    fn go_back(&mut self, view_id: ContentViewId) -> Result<(), Self::Error> {
+        let browser = self.browser_for_content_view(view_id)?;
+        unsafe {
+            let callback = (*browser)
+                .go_back
+                .ok_or_else(|| HostError::Native("CEF go_back callback unavailable".to_owned()))?;
+            callback(browser);
+        }
+        Ok(())
+    }
+
+    fn go_forward(&mut self, view_id: ContentViewId) -> Result<(), Self::Error> {
+        let browser = self.browser_for_content_view(view_id)?;
+        unsafe {
+            let callback = (*browser).go_forward.ok_or_else(|| {
+                HostError::Native("CEF go_forward callback unavailable".to_owned())
+            })?;
+            callback(browser);
+        }
+        Ok(())
+    }
+
+    fn reload(&mut self, view_id: ContentViewId) -> Result<(), Self::Error> {
+        let browser = self.browser_for_content_view(view_id)?;
+        unsafe {
+            let callback = (*browser)
+                .reload
+                .ok_or_else(|| HostError::Native("CEF reload callback unavailable".to_owned()))?;
+            callback(browser);
+        }
+        Ok(())
+    }
+
+    fn send_ui_message(&mut self, payload: &str) -> Result<(), Self::Error> {
+        let browser = ui_shell_browser();
+        if browser.is_null() {
+            return Ok(());
+        }
+        unsafe {
+            let get_frame = (*browser)
+                .get_main_frame
+                .ok_or_else(|| HostError::Native("CEF UI get_main_frame unavailable".to_owned()))?;
+            let frame = get_frame(browser);
+            if frame.is_null() {
+                return Err(HostError::Native(
+                    "CEF UI main frame unavailable".to_owned(),
+                ));
+            }
+            let execute = (*frame).execute_java_script.ok_or_else(|| {
+                HostError::Native("CEF execute_java_script unavailable".to_owned())
+            })?;
+            let literal = serde_json::to_string(payload).map_err(|error| {
+                HostError::Native(format!("failed to encode UI message: {error}"))
+            })?;
+            let script =
+                format!("window.switchboardReceive && window.switchboardReceive({literal});");
+            let script_url = "app://ui/bridge";
+            with_stack_cef_string(&script, |code| {
+                with_stack_cef_string(script_url, |url| execute(frame, code, url, 1));
+            });
         }
         Ok(())
     }
@@ -3566,30 +4633,45 @@ impl CefHost for NativeMacHost {
                 ContentBackend::WebKit(view) => {
                     attach_wk_web_view(view, "about:blank")?;
                 }
-                ContentBackend::Cef(view) => {
-                    let cef = self
-                        .cef
-                        .as_ref()
-                        .ok_or_else(|| HostError::Native("CEF runtime unavailable".to_owned()))?;
-                    let client = self.cef_clients.get(&view_id).copied().ok_or_else(|| {
-                        HostError::Native(format!(
-                            "CEF client missing for content view: {}",
-                            view_id.0
-                        ))
+                ContentBackend::Cef(_) => {
+                    let browser = self.browser_for_content_view(view_id)?;
+                    let get_main_frame = (*browser).get_main_frame.ok_or_else(|| {
+                        HostError::Native("CEF browser get_main_frame unavailable".to_owned())
                     })?;
-                    set_active_content_browser(std::ptr::null_mut());
-                    remove_all_subviews(view)?;
-                    let (width, height) = current_view_size(view)?;
-                    cef.create_browser_in_view(view, "about:blank", client, width, height)?;
+                    let frame = get_main_frame(browser);
+                    if frame.is_null() {
+                        return Err(HostError::Native(
+                            "CEF browser main frame unavailable".to_owned(),
+                        ));
+                    }
+                    let load_url = (*frame).load_url.ok_or_else(|| {
+                        HostError::Native("CEF frame load_url unavailable".to_owned())
+                    })?;
+                    with_stack_cef_string("about:blank", |url| load_url(frame, url));
                 }
             }
         }
         set_active_content_tab(None);
-        set_active_content_uri(String::new());
         Ok(())
     }
 
     fn destroy_content_view(&mut self, view_id: ContentViewId) -> Result<(), Self::Error> {
+        let tab_id = self.content_view_tabs.get(&view_id).copied();
+        if let Some(tab_id) = tab_id {
+            let browser = browser_for_tab(tab_id);
+            if !browser.is_null() {
+                unsafe {
+                    if let Some(get_host) = (*browser).get_host {
+                        let browser_host = get_host(browser);
+                        if !browser_host.is_null() {
+                            if let Some(close_browser) = (*browser_host).close_browser {
+                                close_browser(browser_host, 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let content_backend = self
             .content_views
             .remove(&view_id)
@@ -3599,9 +4681,7 @@ impl CefHost for NativeMacHost {
         };
         clear_active_content_container_if_matches(container)?;
         self.content_view_windows.remove(&view_id);
-        if let Some(tab_id) = self.content_view_tabs.remove(&view_id) {
-            forget_browser_for_tab(tab_id);
-        }
+        self.content_view_tabs.remove(&view_id);
 
         unsafe {
             remove_all_subviews(container)?;
@@ -3616,8 +4696,11 @@ impl CefHost for NativeMacHost {
 
         set_active_content_tab(None);
         set_active_content_browser(std::ptr::null_mut());
-        set_active_content_uri(String::new());
         Ok(())
+    }
+
+    fn has_live_content_browser(&self, tab_id: TabId) -> bool {
+        !browser_for_tab(tab_id).is_null()
     }
 
     fn run_event_loop(&mut self) -> Result<(), Self::Error> {
@@ -3630,7 +4713,9 @@ impl CefHost for NativeMacHost {
                     .cef
                     .as_ref()
                     .ok_or_else(|| HostError::Native("CEF runtime unavailable".to_owned()))?;
+                CEF_CLOSE_ALL_REQUESTED.store(false, Ordering::Release);
                 cef.run_message_loop();
+                let ui_client = cef.ui_client();
                 for client in self.cef_clients.values().copied() {
                     free_content_cef_client(client);
                 }
@@ -3639,6 +4724,7 @@ impl CefHost for NativeMacHost {
                 }
                 self.cef_clients.clear();
                 cef.shutdown();
+                free_ui_cef_client(ui_client);
                 self.cef = None;
                 set_active_content_tab(None);
                 set_active_content_browser(std::ptr::null_mut());
@@ -3897,6 +4983,13 @@ unsafe fn msg_send_void_id(receiver: ObjcId, selector: ObjcSel, arg: ObjcId) {
     let send: unsafe extern "C" fn(ObjcId, ObjcSel, ObjcId) =
         std::mem::transmute(objc_msgSend as *const ());
     send(receiver, selector, arg);
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn msg_send_void_rect(receiver: ObjcId, selector: ObjcSel, rect: NSRect) {
+    let send: unsafe extern "C" fn(ObjcId, ObjcSel, NSRect) =
+        std::mem::transmute(objc_msgSend as *const ());
+    send(receiver, selector, rect);
 }
 
 #[cfg(target_os = "macos")]
