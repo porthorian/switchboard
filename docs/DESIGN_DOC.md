@@ -27,7 +27,7 @@ The supported browser launch is a generated `.app`, not `cargo run`. `scripts/bu
 - main/helper entitlements; and
 - an inside-out ad-hoc signature verified with `codesign --deep --strict`.
 
-Startup fails if the process is outside an app bundle or if the framework, resources, helper executable, or sandbox library is missing. `cef_settings_t.no_sandbox` is always zero. Normal development uses the real macOS Keychain; mock Keychain is accepted only by `Switchboard Smoke.app`.
+Startup fails if the process is outside an app bundle or if the framework, resources, helper executable, or sandbox library is missing. `cef_settings_t.no_sandbox` is always zero. Normal development and `Switchboard Extension QA.app` use the real macOS Keychain; mock Keychain and password-store overrides are accepted only by `Switchboard Smoke.app`. The extension-QA bundle uses isolated state/cache paths and adds diagnostics and local fixtures without adding product extension controls.
 
 Every helper initializes `libcef_sandbox.dylib` before loading the CEF framework, then destroys the sandbox context after `cef_execute_process` returns. The sandbox library and framework handles are owned separately so teardown always unloads CEF before destroying the helper sandbox.
 
@@ -140,4 +140,4 @@ The UI flattens only expanded tree nodes and virtualizes that visible list. Expa
 
 Deterministic tests cover reducer invariants, SQLite reset/rollback/revision behavior, bridge decoding and resync, generation attribution, deferred creation, browser reuse, warm limits, shutdown requests, and the 200-tab workload.
 
-The environment-dependent native gate in `MACOS_CEF_SMOKE.md` must pass before calling the alpha complete. The password provider matrix is a separate manual/instrumented gate. A passing unit suite or a generated bundle is not proof that either native gate passed.
+The environment-dependent native gate in `MACOS_CEF_SMOKE.md` must pass before calling the alpha complete. The password provider matrix is a separate manual/instrumented gate with an early custom-chrome capability stop defined in `PASSWORD_EXTENSION_COMPATIBILITY.md`. A passing unit suite, preflight script, or generated bundle is not proof that either native gate passed.

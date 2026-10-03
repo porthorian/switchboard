@@ -5,10 +5,20 @@ repo_root=${0:A:h:h}
 cef_dist=${SWITCHBOARD_CEF_DIST:-}
 cef_stage=""
 build_smoke=${SWITCHBOARD_BUILD_SMOKE:-0}
+build_extension_qa=${SWITCHBOARD_BUILD_EXTENSION_QA:-0}
+
+if [[ ("$build_smoke" == "1" || "$build_smoke" == "true") && \
+      ("$build_extension_qa" == "1" || "$build_extension_qa" == "true") ]]; then
+  print -u2 "SWITCHBOARD_BUILD_SMOKE and SWITCHBOARD_BUILD_EXTENSION_QA are mutually exclusive"
+  exit 2
+fi
 
 if [[ "$build_smoke" == "1" || "$build_smoke" == "true" ]]; then
   app_name="Switchboard Smoke"
   bundle_id="dev.switchboard.browser.smoke"
+elif [[ "$build_extension_qa" == "1" || "$build_extension_qa" == "true" ]]; then
+  app_name="Switchboard Extension QA"
+  bundle_id="dev.switchboard.browser.extension-qa"
 else
   app_name="Switchboard Dev"
   bundle_id="dev.switchboard.browser"

@@ -1274,6 +1274,8 @@ use std::path::{Path, PathBuf};
 use std::slice;
 
 #[cfg(target_os = "macos")]
+use switchboard_cef_sys::generated::{CEF_API_VERSION, CEF_VERSION};
+#[cfg(target_os = "macos")]
 use switchboard_cef_sys::loader::{CefLibrary, CefSandboxContext};
 #[cfg(target_os = "macos")]
 use switchboard_cef_sys::raw::{
@@ -1348,7 +1350,7 @@ const ENV_CEF_AUTOPLAY_POLICY: &str = "SWITCHBOARD_CEF_AUTOPLAY_POLICY";
 #[cfg(target_os = "macos")]
 const DEFAULT_CEF_AUTOPLAY_POLICY: &str = "no-user-gesture-required";
 #[cfg(target_os = "macos")]
-const DEFAULT_CEF_API_VERSION: i32 = 14500;
+const DEFAULT_CEF_API_VERSION: i32 = CEF_API_VERSION;
 #[cfg(target_os = "macos")]
 const STYLE_TITLED: u64 = 1 << 0;
 #[cfg(target_os = "macos")]
@@ -1590,6 +1592,15 @@ struct CefRuntime {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppBundleFlavor {
+    Dev,
+    Smoke,
+    ExtensionQa,
+    Unknown,
+}
+
+#[cfg(target_os = "macos")]
 struct CefConfig {
     library_path: PathBuf,
     framework_dir_path: PathBuf,
@@ -1599,6 +1610,38 @@ struct CefConfig {
     root_cache_path: PathBuf,
     cache_path: PathBuf,
     temp_dir: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+fn app_bundle_flavor_for_executable(executable: &Path) -> AppBundleFlavor {
+    let Some(bundle) = main_app_bundle_for_executable(executable) else {
+        return AppBundleFlavor::Unknown;
+    };
+    match bundle.file_name().and_then(|name| name.to_str()) {
+        Some("Switchboard Dev.app") => AppBundleFlavor::Dev,
+        Some("Switchboard Smoke.app") => AppBundleFlavor::Smoke,
+        Some("Switchboard Extension QA.app") => AppBundleFlavor::ExtensionQa,
+        _ => AppBundleFlavor::Unknown,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn validate_password_storage_policy(
+    bundle_flavor: AppBundleFlavor,
+    mock_keychain_requested: bool,
+    password_store: Option<&str>,
+) -> Result<(), String> {
+    if mock_keychain_requested && bundle_flavor != AppBundleFlavor::Smoke {
+        return Err(format!(
+            "{ENV_CEF_USE_MOCK_KEYCHAIN} is restricted to the dedicated Switchboard Smoke.app bundle"
+        ));
+    }
+    if password_store.is_some() && bundle_flavor != AppBundleFlavor::Smoke {
+        return Err(format!(
+            "{ENV_CEF_PASSWORD_STORE} is restricted to Switchboard Smoke.app; development and provider QA require the real macOS Keychain"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -3350,6 +3393,12 @@ impl CefRuntime {
         config.validate_for_sandboxed_bundle()?;
         let config_summary = config.summary();
         let verbose_errors = env_flag(ENV_CEF_VERBOSE_ERRORS);
+        let executable = std::env::current_exe().map_err(|error| {
+            HostError::Native(format!(
+                "failed to resolve Switchboard bundle flavor: {error}"
+            ))
+        })?;
+        let bundle_flavor = app_bundle_flavor_for_executable(&executable);
 
         unsafe {
             let is_subprocess = std::env::args().any(|arg| arg.starts_with("--type="));
@@ -3418,26 +3467,31 @@ impl CefRuntime {
                     "switchboard-app: configured CEF API version={active_version} requested={requested_api_version} platform_hash={hash_string}"
                 );
             }
+            if bundle_flavor == AppBundleFlavor::ExtensionQa && !is_subprocess {
+                eprintln!(
+                    "switchboard-app: password-extension QA gate cef_version={CEF_VERSION} api={CEF_API_VERSION} content_runtime_style=alloy keychain=real product_controls=disabled"
+                );
+            }
 
             let mut cef_args: Vec<String> = std::env::args().collect();
             let mock_keychain_requested = env_flag(ENV_CEF_USE_MOCK_KEYCHAIN);
-            let smoke_bundle = std::env::current_exe()
+            let smoke_bundle = bundle_flavor == AppBundleFlavor::Smoke;
+            let password_store = std::env::var(ENV_CEF_PASSWORD_STORE)
                 .ok()
-                .is_some_and(|path| path.to_string_lossy().contains("Switchboard Smoke.app/"));
-            if mock_keychain_requested && !smoke_bundle {
-                return Err(HostError::Native(format!(
-                    "{ENV_CEF_USE_MOCK_KEYCHAIN} is restricted to the dedicated Switchboard Smoke.app bundle"
-                )));
-            }
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty());
+            validate_password_storage_policy(
+                bundle_flavor,
+                mock_keychain_requested,
+                password_store.as_deref(),
+            )
+            .map_err(HostError::Native)?;
             let use_mock_keychain = mock_keychain_requested && smoke_bundle;
             if use_mock_keychain {
                 upsert_cef_switch(&mut cef_args, "--use-mock-keychain");
             }
-            if let Ok(password_store) = std::env::var(ENV_CEF_PASSWORD_STORE) {
-                let trimmed = password_store.trim();
-                if !trimmed.is_empty() {
-                    upsert_cef_switch_with_value(&mut cef_args, "--password-store", trimmed);
-                }
+            if let Some(password_store) = password_store.as_deref() {
+                upsert_cef_switch_with_value(&mut cef_args, "--password-store", password_store);
             }
             let autoplay_policy = std::env::var(ENV_CEF_AUTOPLAY_POLICY)
                 .ok()
@@ -3449,7 +3503,7 @@ impl CefRuntime {
                 eprintln!(
                     "switchboard-app: CEF launch switches mock_keychain={} password_store={} autoplay_policy={}",
                     use_mock_keychain,
-                    std::env::var(ENV_CEF_PASSWORD_STORE).unwrap_or_else(|_| "unset".to_owned()),
+                    password_store.as_deref().unwrap_or("unset"),
                     autoplay_policy
                 );
             }
@@ -4069,8 +4123,9 @@ mod tests {
     use super::is_exact_ui_url;
     #[cfg(target_os = "macos")]
     use super::{
-        allocate_content_load_handler, browser_callback_action, main_app_bundle_for_executable,
-        profile_cache_path, BrowserCallbackAction, SwitchboardContentLoadHandler,
+        allocate_content_load_handler, app_bundle_flavor_for_executable, browser_callback_action,
+        main_app_bundle_for_executable, profile_cache_path, validate_password_storage_policy,
+        AppBundleFlavor, BrowserCallbackAction, SwitchboardContentLoadHandler,
     };
     #[cfg(target_os = "macos")]
     use std::path::Path;
@@ -4102,6 +4157,49 @@ mod tests {
         assert_eq!(
             main_app_bundle_for_executable(helper).as_deref(),
             Some(Path::new("/tmp/Switchboard Dev.app"))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bundle_flavor_is_stable_for_main_and_nested_helper_executables() {
+        let qa_main = Path::new("/tmp/Switchboard Extension QA.app/Contents/MacOS/switchboard-app");
+        assert_eq!(
+            app_bundle_flavor_for_executable(qa_main),
+            AppBundleFlavor::ExtensionQa
+        );
+
+        let smoke_helper = Path::new(
+            "/tmp/Switchboard Smoke.app/Contents/Frameworks/Switchboard Helper (Renderer).app/Contents/MacOS/Switchboard Helper (Renderer)",
+        );
+        assert_eq!(
+            app_bundle_flavor_for_executable(smoke_helper),
+            AppBundleFlavor::Smoke
+        );
+
+        let unknown = Path::new("/tmp/Other.app/Contents/MacOS/other");
+        assert_eq!(
+            app_bundle_flavor_for_executable(unknown),
+            AppBundleFlavor::Unknown
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_smoke_bundle_may_replace_real_keychain_storage() {
+        assert!(validate_password_storage_policy(AppBundleFlavor::Dev, true, None).is_err());
+        assert!(validate_password_storage_policy(
+            AppBundleFlavor::ExtensionQa,
+            false,
+            Some("basic")
+        )
+        .is_err());
+        assert!(
+            validate_password_storage_policy(AppBundleFlavor::Smoke, true, Some("basic")).is_ok()
+        );
+        assert!(validate_password_storage_policy(AppBundleFlavor::Dev, false, None).is_ok());
+        assert!(
+            validate_password_storage_policy(AppBundleFlavor::ExtensionQa, false, None).is_ok()
         );
     }
 

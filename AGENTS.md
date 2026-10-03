@@ -199,6 +199,8 @@ This section is intentionally left for project-specific constraints and evolving
 * No dynamic code execution features
 * No telemetry collection without explicit approval
 * No background network calls in UI context
+* Password-provider QA must use the dedicated extension-QA bundle, isolated state/cache paths, and the real macOS Keychain
+* No password or extension product controls may be added unless the complete Bitwarden, 1Password, and LastPass compatibility matrix passes under custom Switchboard chrome
 
 ---
 

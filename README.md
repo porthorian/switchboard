@@ -32,9 +32,19 @@ Optional overrides:
 - `SWITCHBOARD_CEF_TMPDIR`
 - `SWITCHBOARD_STATE_DB_PATH` (absolute development/smoke database path; defaults to Application Support)
 - `SWITCHBOARD_CEF_USE_MOCK_KEYCHAIN` (`1/true` only inside the dedicated `Switchboard Smoke.app`; rejected by normal development bundles)
-- `SWITCHBOARD_CEF_PASSWORD_STORE` (optional Chromium `--password-store=<value>`, e.g. `basic` for dev)
+- `SWITCHBOARD_CEF_PASSWORD_STORE` (automated smoke bundle only; ordinary development and provider QA require the real macOS Keychain)
 - `SWITCHBOARD_CEF_AUTOPLAY_POLICY` (optional Chromium `--autoplay-policy=<value>`, defaults to `no-user-gesture-required`)
 - `SWITCHBOARD_CEF_VERBOSE_ERRORS` (`1` to include raw loader details)
+
+For the fail-closed password-extension compatibility gate, build the dedicated real-Keychain QA bundle and use an isolated session:
+
+```bash
+SWITCHBOARD_BUILD_EXTENSION_QA=1 ./scripts/build_macos_dev_app.sh
+./scripts/check_password_extension_surface.sh target/cef-sdk-145
+./scripts/run_password_extension_qa.sh
+```
+
+The QA bundle adds diagnostics and isolation only. It does not add extension controls or perform background Web Store requests. Provider installation remains an explicitly approved, user-initiated manual step; see [the compatibility gate](docs/PASSWORD_EXTENSION_COMPATIBILITY.md).
 
 Media playback note:
 - YouTube Live and other livestreams often require H264/AAC support.

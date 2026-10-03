@@ -23,7 +23,7 @@ SWITCHBOARD_CEF_VERBOSE_ERRORS=1 \
 "target/dev-bundle/Switchboard Smoke.app/Contents/MacOS/switchboard-app"
 ```
 
-The mock-keychain switch is rejected by `Switchboard Dev.app`; ordinary development and manual password-provider verification continue to use the real macOS Keychain.
+The mock-keychain switch is rejected by `Switchboard Dev.app` and `Switchboard Extension QA.app`; ordinary development and manual password-provider verification use the real macOS Keychain. The provider gate has its own isolated bundle, launcher, and evidence procedure in `PASSWORD_EXTENSION_COMPATIBILITY.md`.
 
 Serve the deterministic fixture from a separate terminal:
 
