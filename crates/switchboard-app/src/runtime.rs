@@ -109,6 +109,7 @@ impl<H: CefHost + 'static> AppRuntime<H> {
         let workspace_id = ensure_bootstrap_state(&mut state);
         let initial_window_size = restored_window_size(&state);
         let mut engine = Engine::with_state(persistence, state, revision);
+        host.publish_favicons(&engine.state().favicons);
 
         let window_id = host
             .create_window("Switchboard", initial_window_size)
@@ -312,6 +313,7 @@ impl<H: CefHost + 'static> AppRuntime<H> {
 
         let patch = self.engine.dispatch(intent).map_err(RuntimeError::Engine)?;
         if !patch.ops.is_empty() {
+            self.host.publish_favicons(&self.engine.state().favicons);
             self.send_server_message(
                 None,
                 ServerMessage::Patch {
@@ -348,6 +350,7 @@ impl<H: CefHost + 'static> AppRuntime<H> {
             | ContentEvent::TitleChanged {
                 tab_id, generation, ..
             }
+            | ContentEvent::FaviconLoaded { tab_id, generation, .. }
             | ContentEvent::LoadingChanged {
                 tab_id, generation, ..
             }
@@ -383,6 +386,7 @@ impl<H: CefHost + 'static> AppRuntime<H> {
         }
 
         let intent = match event {
+            ContentEvent::FaviconLoaded { page_url, icon_url, png, .. } => Intent::ObserveTabFavicon { tab_id, page_url, icon_url, png },
             ContentEvent::UrlChanged { url, .. } => Intent::ObserveTabUrl { tab_id, url },
             ContentEvent::TitleChanged { title, .. } => Intent::ObserveTabTitle { tab_id, title },
             ContentEvent::LoadingChanged { is_loading, .. } => {
@@ -787,6 +791,7 @@ impl<H: CefHost + 'static> AppRuntime<H> {
                         0,
                         0,
                         SearchResult {
+                            favicon_id: None,
                             id: format!("command:{id}"),
                             kind: SearchResultKind::Command,
                             title: title.into(),
@@ -820,6 +825,7 @@ impl<H: CefHost + 'static> AppRuntime<H> {
                         0,
                         0,
                         SearchResult {
+                            favicon_id: tab.favicon_id,
                             id: format!("tab:{}", tab.id.0),
                             kind: SearchResultKind::OpenTab,
                             title: display_title(&tab.title, &tab.url),
@@ -853,6 +859,7 @@ impl<H: CefHost + 'static> AppRuntime<H> {
                         0,
                         completed,
                         SearchResult {
+                            favicon_id: tab.favicon_id,
                             id: format!("done:{}", tab.id.0),
                             kind: SearchResultKind::ArchivedTab,
                             title: display_title(&tab.title, &tab.url),
@@ -878,6 +885,7 @@ impl<H: CefHost + 'static> AppRuntime<H> {
                                 entry.visit_count,
                                 entry.last_visit_ms,
                                 SearchResult {
+                                    favicon_id: state.favicon_for_page(profile_id, &entry.url),
                                     id: format!("history:{}:{}", profile_id.0, entry.last_visit_ms),
                                     kind: SearchResultKind::History,
                                     title: display_title(&entry.title, &entry.url),
@@ -902,6 +910,7 @@ impl<H: CefHost + 'static> AppRuntime<H> {
                 0,
                 0,
                 SearchResult {
+                    favicon_id: None,
                     id: "web:fallback".into(),
                     kind: SearchResultKind::Web,
                     title: format!("Search the web for “{query}”"),
@@ -1700,6 +1709,31 @@ mod tests {
             .count();
         assert_eq!(content_create_count, 1);
         assert_eq!(content_navigate_count, 0);
+    }
+
+    #[test]
+    fn stale_favicon_generation_and_page_cannot_change_tab_or_restore_views() {
+        let mut runtime = AppRuntime::bootstrap(MockCefHost::default(), "0.1.0").unwrap();
+        let workspace_id = runtime.default_workspace_id();
+        runtime.handle_ui_command(UiCommand::NewTab { workspace_id: workspace_id.0, url: Some("https://one.example".into()), make_active: true }).unwrap();
+        commit_pending(&mut runtime);
+        let tab_id = runtime.active_tab_id(workspace_id).unwrap();
+        let generation = runtime.tab_bindings[&tab_id].content.generation;
+        let mut png = vec![0; 33];
+        png[..16].copy_from_slice(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"); png[19] = 16; png[23] = 16;
+        let revision = runtime.revision();
+        let creates = runtime.host().events().iter().filter(|event| matches!(event, HostEvent::ContentViewCreated { .. })).count();
+        for (generation, page_url) in [(generation + 1, "https://one.example"), (generation, "https://old.example")] {
+            let patch = runtime.handle_content_event(ContentEvent::FaviconLoaded { tab_id, generation, page_url: page_url.into(), icon_url: "https://one.example/icon.png".into(), png: png.clone() }).unwrap();
+            assert!(patch.ops.is_empty());
+        }
+        assert_eq!(runtime.revision(), revision);
+        runtime.handle_content_event(ContentEvent::FaviconLoaded { tab_id, generation, page_url: "https://one.example".into(), icon_url: "https://one.example/icon.png".into(), png }).unwrap();
+        assert!(runtime.engine.state().tabs[&tab_id].favicon_id.is_some());
+        assert_eq!(runtime.host().events().iter().filter(|event| matches!(event, HostEvent::ContentViewCreated { .. })).count(), creates);
+        let snapshot = runtime.ui_shell_state_json();
+        assert!(snapshot.contains("favicon_id"));
+        assert!(!snapshot.contains("png"));
     }
 
     #[test]

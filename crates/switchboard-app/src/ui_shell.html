@@ -9,22 +9,42 @@
   </style>
 </head>
 <body>
+  <svg class="icon-defs" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="m14 6-6 6 6 6"/></symbol>
+    <symbol id="i-forward" viewBox="0 0 24 24"><path d="m10 6 6 6-6 6"/></symbol>
+    <symbol id="i-reload" viewBox="0 0 24 24"><path d="M20 7v5h-5M20 12a8 8 0 1 0-2 5"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol>
+    <symbol id="i-split" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="M12 5v14"/></symbol>
+    <symbol id="i-focus" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+    <symbol id="i-page" viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9zM14 3v6h6"/></symbol>
+    <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 4v5h5M3 9a9 9 0 1 1 0 6M12 7v5l3 2"/></symbol>
+    <symbol id="i-archive" viewBox="0 0 24 24"><path d="M4 8h16v12H4zM3 4h18v4H3zM9 12h6"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  </defs></svg>
   <div class="topbar">
     <div class="topbar-inner">
       <div class="titlebar-pad"></div>
       <div class="nav-row">
-        <button id="nav-back" class="nav-btn" type="button" aria-label="Back">&lt;</button>
-        <button id="nav-forward" class="nav-btn" type="button" aria-label="Forward">&gt;</button>
-        <button id="nav-reload" class="nav-btn" type="button" aria-label="Reload">&#8635;</button>
-        <input id="url" class="uri-input" autocomplete="off" spellcheck="false">
+        <button id="nav-back" class="nav-btn" type="button" aria-label="Back" title="Back"><svg class="icon"><use href="#i-back"/></svg></button>
+        <button id="nav-forward" class="nav-btn" type="button" aria-label="Forward" title="Forward"><svg class="icon"><use href="#i-forward"/></svg></button>
+        <button id="nav-reload" class="nav-btn" type="button" aria-label="Reload" title="Reload"><svg class="icon"><use href="#i-reload"/></svg></button>
+        <div id="address-field" class="address-field">
+          <button id="address-title" class="address-title" type="button" aria-label="Edit address" title="Edit address · ⌘L"><span id="address-icon" class="site-icon"></span><span id="address-label">New Page</span></button>
+          <input id="url" class="uri-input" aria-label="Page address" autocomplete="off" spellcheck="false" hidden>
+        </div>
       </div>
       <div class="titlebar-tools">
         <span id="mode-indicator" class="mode-indicator" aria-live="polite">BROWSER</span>
-        <button id="split-toggle" class="devtools-toggle" type="button" title="Split · right-click to swap sides">Split</button>
+        <button id="split-toggle" class="devtools-toggle" type="button" aria-label="Split view" title="Split · right-click to swap sides"><svg class="icon"><use href="#i-split"/></svg></button>
         <input id="split-ratio" class="split-ratio" type="range" min="25" max="75" step="1" value="50" aria-label="Split divider position" hidden>
-        <button id="focus-toggle" class="devtools-toggle" type="button">Focus</button>
-        <button id="devtools-toggle" class="devtools-toggle" type="button">DevTools</button>
-        <button id="settings-toggle" class="settings-toggle" type="button" aria-haspopup="dialog" aria-expanded="false">Settings</button>
+        <button id="focus-toggle" class="devtools-toggle" type="button" aria-label="Focus mode" title="Focus mode"><svg class="icon"><use href="#i-focus"/></svg></button>
+        <button id="settings-toggle" class="settings-toggle" type="button" aria-label="Settings" title="Settings" aria-haspopup="dialog" aria-expanded="false"><svg class="icon"><use href="#i-settings"/></svg></button>
+        <div class="shell-menu">
+          <button id="toolbar-more" class="nav-btn" type="button" aria-label="More tools" title="More tools" aria-haspopup="menu" aria-expanded="false"><svg class="icon"><use href="#i-more"/></svg></button>
+          <div id="toolbar-menu" class="shell-popover" role="menu" hidden><button id="devtools-toggle" class="menu-action" role="menuitem" type="button">Developer Tools <kbd>⌘⇧I</kbd></button></div>
+        </div>
       </div>
     </div>
   </div>
@@ -78,38 +98,43 @@
           <span class="workspace-title-hint">Rename Workspace</span>
         </div>
         <div class="workspace-actions">
-          <button id="workspace-delete" class="workspace-action danger" type="button" title="Delete Workspace">Delete</button>
+          <div class="shell-menu">
+            <button id="workspace-more" class="workspace-action" type="button" aria-label="Workspace actions" title="Workspace actions" aria-haspopup="menu" aria-expanded="false"><svg class="icon"><use href="#i-more"/></svg></button>
+            <div id="workspace-menu" class="shell-popover" role="menu" hidden><button id="workspace-delete" class="menu-action danger" role="menuitem" type="button">Delete workspace</button></div>
+          </div>
         </div>
       </div>
       <div id="tab-list" class="tab-list"></div>
       <div class="tab-footer-actions">
-        <button id="archive-open" class="tab-footer-action" type="button">Archive</button>
-        <button id="tab-new" class="tab-new" type="button">+ New Tab</button>
+        <button id="tab-new" class="tab-new" type="button"><svg class="icon"><use href="#i-plus"/></svg>New Page</button>
+        <button id="archive-open" class="tab-footer-action" type="button" aria-label="Archive" title="Archive"><svg class="icon"><use href="#i-archive"/></svg></button>
       </div>
     </div>
   </div>
+  <div class="content-surround" aria-hidden="true"></div>
   <div id="restore-placeholder" class="restore-placeholder" hidden>
     <span class="restore-spinner" aria-hidden="true"></span>
     <span>Restoring tab…</span>
   </div>
   <div id="settings-backdrop" class="settings-backdrop" hidden></div>
   <div id="command-backdrop" class="command-backdrop" hidden></div>
-  <div id="command-panel" class="command-panel" role="dialog" aria-label="Lazy Search" hidden>
+  <div id="command-panel" class="command-panel" role="dialog" aria-modal="true" aria-label="Lazy Search" hidden>
     <form id="command-form" class="command-form">
-      <label class="command-label" for="command-input">Lazy Search</label>
+      <label class="command-label" for="command-input"><svg class="icon"><use href="#i-search"/></svg><span class="sr-only">Lazy Search</span></label>
       <input
         id="command-input"
         class="command-input"
         type="text"
         autocomplete="off"
         spellcheck="false"
-        placeholder="Search or enter address"
+        placeholder="Search tabs, history, or enter an address…"
+        role="combobox" aria-autocomplete="list" aria-controls="command-results" aria-expanded="true"
       >
       <div id="command-results" class="command-results" role="listbox"></div>
       <p class="command-hint">↑↓ select · Enter open · Esc close · &gt; commands · history: · done:</p>
     </form>
   </div>
-  <div id="settings-panel" class="settings-panel" role="dialog" aria-label="Browser Settings" hidden>
+  <div id="settings-panel" class="settings-panel" role="dialog" aria-modal="true" aria-label="Browser Settings" hidden>
     <div class="settings-panel-header">
       <div>
         <h2 class="settings-panel-title">Browser Settings</h2>

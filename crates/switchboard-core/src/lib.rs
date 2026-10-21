@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod favicon;
 pub mod ids;
 pub mod intent;
 pub mod patch;
@@ -7,6 +8,7 @@ pub mod state;
 
 pub use engine::{Engine, EngineError, NoopPersistence, Persistence};
 pub use ids::{ProfileId, TabId, WorkspaceId};
+pub use favicon::Favicon;
 pub use intent::{ClearHistoryScope, Intent};
 pub use patch::{Patch, PatchOp, Snapshot};
 pub use reducer::ReduceError;

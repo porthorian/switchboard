@@ -109,6 +109,8 @@ impl Error for HostError {}
 pub trait CefHost {
     type Error;
 
+    fn publish_favicons(&mut self, _icons: &std::collections::BTreeMap<u64, switchboard_core::Favicon>) {}
+
     fn create_window(&mut self, title: &str, size: WindowSize) -> Result<WindowId, Self::Error>;
 
     fn create_ui_view(&mut self, window_id: WindowId, url: &str) -> Result<UiViewId, Self::Error>;
@@ -173,6 +175,7 @@ pub type WindowEventHandler = Box<dyn FnMut(WindowEvent) + 'static>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentEvent {
+    FaviconLoaded { tab_id: TabId, generation: u64, page_url: String, icon_url: String, png: Vec<u8> },
     UrlChanged {
         tab_id: TabId,
         generation: u64,
@@ -1065,16 +1068,12 @@ fn apply_content_keybindings_border(container: ObjcId, active: bool) -> Result<(
         msg_send_void_bool(
             layer,
             selector("setMasksToBounds:")?,
-            if active { YES } else { NO },
+            YES,
         );
         msg_send_void_f64(
             layer,
             selector("setCornerRadius:")?,
-            if active {
-                WEBSITE_KEYBINDINGS_BORDER_RADIUS_PX
-            } else {
-                0.0
-            },
+            if NATIVE_FOCUS_MODE.with(Cell::get) { 0.0 } else { WEBSITE_KEYBINDINGS_BORDER_RADIUS_PX },
         );
         msg_send_void_f64(
             layer,
@@ -1087,7 +1086,7 @@ fn apply_content_keybindings_border(container: ObjcId, active: bool) -> Result<(
         );
         if active {
             let ns_color = objc_class("NSColor")?;
-            let border_color = msg_send_id(ns_color, selector("systemPinkColor")?);
+            let border_color = msg_send_id(ns_color, selector("systemPurpleColor")?);
             if border_color != NIL {
                 let cg_color = msg_send_id(border_color, selector("CGColor")?);
                 if cg_color != NIL {
@@ -1318,7 +1317,9 @@ fn is_exact_ui_url(url: &str) -> bool {
 #[cfg(target_os = "macos")]
 const UI_TOP_HEIGHT: f64 = 44.0;
 #[cfg(target_os = "macos")]
-const UI_LEFT_WIDTH: f64 = 320.0;
+const UI_LEFT_WIDTH: f64 = 240.0;
+#[cfg(target_os = "macos")]
+const CONTENT_GAP: f64 = 8.0;
 #[cfg(target_os = "macos")]
 const DEFAULT_BACKGROUND_COLOR: u32 = 0xFF_FF_FF_FF;
 #[cfg(target_os = "macos")]
@@ -1396,6 +1397,8 @@ static UI_SHELL_BODY_BYTES: OnceLock<Vec<u8>> = OnceLock::new();
 const WEBSITE_KEYBINDINGS_BORDER_WIDTH_PX: f64 = 2.0;
 #[cfg(target_os = "macos")]
 const WEBSITE_KEYBINDINGS_BORDER_RADIUS_PX: f64 = 10.0;
+#[cfg(target_os = "macos")]
+thread_local! { static NATIVE_FOCUS_MODE: Cell<bool> = const { Cell::new(false) }; }
 #[cfg(target_os = "macos")]
 const CEF_KEYEVENT_RAWKEYDOWN: c_int = 0;
 #[cfg(target_os = "macos")]
@@ -1667,6 +1670,208 @@ struct SwitchboardUiSchemeFactory {
 struct SwitchboardUiResourceHandler {
     handler: cef_resource_handler_t,
     offset: usize,
+    image: Option<std::sync::Arc<[u8]>>,
+    references: AtomicUsize,
+}
+
+#[cfg(target_os = "macos")]
+static FAVICON_CEF_API: OnceLock<switchboard_cef_sys::loader::CefApi> = OnceLock::new();
+#[cfg(target_os = "macos")]
+static FAVICON_DOWNLOAD_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "macos")]
+static FAVICON_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn favicon_asset_id(url: &str) -> Option<(ProfileId, u64)> {
+    let path = url.strip_prefix("app://ui/favicon/")?.strip_suffix(".png")?;
+    let (profile, id) = path.split_once('/')?;
+    if profile.is_empty() || id.is_empty() || !profile.bytes().all(|v| v.is_ascii_digit()) || !id.bytes().all(|v| v.is_ascii_digit()) { return None; }
+    let profile = profile.parse::<u64>().ok()?;
+    let id = id.parse::<u64>().ok()?;
+    (profile > 0 && id > 0).then_some((ProfileId(profile), id))
+}
+
+#[cfg(target_os = "macos")]
+fn favicon_assets() -> &'static Mutex<std::collections::BTreeMap<u64, switchboard_core::Favicon>> {
+    static ASSETS: OnceLock<Mutex<std::collections::BTreeMap<u64, switchboard_core::Favicon>>> = OnceLock::new();
+    ASSETS.get_or_init(Default::default)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct FaviconRequestState { page_url: String, icon_url: String, token: u64 }
+#[cfg(target_os = "macos")]
+fn favicon_requests() -> &'static Mutex<HashMap<(TabId, u64), FaviconRequestState>> {
+    static REQUESTS: OnceLock<Mutex<HashMap<(TabId, u64), FaviconRequestState>>> = OnceLock::new();
+    REQUESTS.get_or_init(Default::default)
+}
+#[cfg(target_os = "macos")]
+fn invalidate_favicon_request(tab_id: TabId, generation: u64, page_url: Option<String>) {
+    let mut requests = favicon_requests().lock().unwrap_or_else(|error| error.into_inner());
+    let state = requests.entry((tab_id, generation)).or_default();
+    state.token = FAVICON_TOKEN.fetch_add(1, Ordering::Relaxed);
+    state.icon_url.clear();
+    if let Some(url) = page_url { state.page_url = url; }
+}
+#[cfg(target_os = "macos")]
+fn favicon_request_current(tab_id: TabId, generation: u64, token: u64) -> bool {
+    favicon_requests().lock().unwrap_or_else(|error| error.into_inner()).get(&(tab_id, generation)).is_some_and(|state| state.token == token)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn request_string(request: *mut cef_request_t, method: bool) -> Option<String> {
+    use switchboard_cef_sys::favicon::CefRequestPrefix;
+    let api = FAVICON_CEF_API.get()?;
+    if request.is_null() { return None; }
+    let prefix = &*(request as *const CefRequestPrefix);
+    let value = if method { prefix.get_method?(request) } else { prefix.get_url?(request) };
+    if value.is_null() { return None; }
+    let result = ((*value).length <= 2048).then(|| cef_string_to_owned(value));
+    (api.cef_string_userfree_utf16_free)(value);
+    result
+}
+
+#[cfg(target_os = "macos")]
+macro_rules! owned_cef_callbacks {
+    ($ty:ty, $add:ident, $release:ident, $one:ident, $any:ident) => {
+        unsafe extern "C" fn $add(base: *mut cef_base_ref_counted_t) {
+            (*(base as *mut $ty)).references.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe extern "C" fn $release(base: *mut cef_base_ref_counted_t) -> c_int {
+            if (*(base as *mut $ty)).references.fetch_sub(1, Ordering::AcqRel) == 1 {
+                drop(Box::from_raw(base as *mut $ty)); 1
+            } else { 0 }
+        }
+        unsafe extern "C" fn $one(base: *mut cef_base_ref_counted_t) -> c_int { i32::from((*(base as *mut $ty)).references.load(Ordering::Acquire) == 1) }
+        unsafe extern "C" fn $any(base: *mut cef_base_ref_counted_t) -> c_int { i32::from((*(base as *mut $ty)).references.load(Ordering::Acquire) > 0) }
+    }
+}
+#[cfg(target_os = "macos")]
+owned_cef_callbacks!(SwitchboardUiResourceHandler, resource_add_ref, resource_release, resource_one_ref, resource_any_ref);
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct FaviconDownload {
+    callback: switchboard_cef_sys::favicon::cef_download_image_callback_t,
+    references: AtomicUsize,
+    completed: AtomicBool,
+    tab_id: TabId,
+    generation: u64,
+    token: u64,
+    page_url: String,
+    icon_url: String,
+}
+#[cfg(target_os = "macos")]
+impl Drop for FaviconDownload {
+    fn drop(&mut self) {
+        if !self.completed.swap(true, Ordering::AcqRel) { FAVICON_DOWNLOAD_COUNT.fetch_sub(1, Ordering::AcqRel); }
+    }
+}
+#[cfg(target_os = "macos")]
+owned_cef_callbacks!(FaviconDownload, favicon_add_ref, favicon_release, favicon_one_ref, favicon_any_ref);
+
+#[cfg(target_os = "macos")]
+struct DownloadedImage(*mut switchboard_cef_sys::favicon::cef_image_t);
+#[cfg(target_os = "macos")]
+impl Drop for DownloadedImage {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.0.is_null() {
+                if let Some(release) = (*self.0).base.release { release(&mut (*self.0).base); }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn deliver_favicon(context: *mut c_void) {
+    let (tab_id, generation, token, event) = *Box::from_raw(context as *mut (TabId, u64, u64, ContentEvent));
+    if favicon_request_current(tab_id, generation, token) { emit_content_event(event); }
+}
+#[cfg(target_os = "macos")]
+fn defer_favicon(tab_id: TabId, generation: u64, token: u64, page_url: String, icon_url: String, png: Vec<u8>) {
+    let event = ContentEvent::FaviconLoaded { tab_id, generation, page_url, icon_url, png };
+    let context = Box::into_raw(Box::new((tab_id, generation, token, event))).cast::<c_void>();
+    unsafe { dispatch_async_f(std::ptr::addr_of!(_dispatch_main_q).cast::<c_void>().cast_mut(), context, deliver_favicon); }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn favicon_download_finished(callback: *mut switchboard_cef_sys::favicon::cef_download_image_callback_t, _url: *const cef_string_t, status: c_int, image: *mut switchboard_cef_sys::favicon::cef_image_t) {
+    // The generated CEF wrapper transfers an image reference to this callback.
+    let _image_reference = DownloadedImage(image);
+    let this = &*(callback as *mut FaviconDownload);
+    if this.completed.swap(true, Ordering::AcqRel) { return; }
+    FAVICON_DOWNLOAD_COUNT.fetch_sub(1, Ordering::AcqRel);
+    if image.is_null() || !(200..300).contains(&status) || !favicon_request_current(this.tab_id, this.generation, this.token) { return; }
+    let Some(export) = (*image).get_as_png else { return; };
+    let (mut width, mut height) = (0, 0);
+    let binary = export(image, 2.0, 1, &mut width, &mut height);
+    if binary.is_null() { return; }
+    let mut png = Vec::new();
+    if (1..=64).contains(&width) && (1..=64).contains(&height) {
+        if let (Some(size), Some(read)) = ((*binary).get_size, (*binary).get_data) {
+            let length = size(binary);
+            if length > 0 && length <= switchboard_core::favicon::MAX_FAVICON_BYTES {
+                png.resize(length, 0);
+                if read(binary, png.as_mut_ptr().cast(), length, 0) != length { png.clear(); }
+            }
+        }
+    }
+    if let Some(release) = (*binary).base.release { release(&mut (*binary).base); }
+    if switchboard_core::favicon::valid_favicon_png(&png) {
+        defer_favicon(this.tab_id, this.generation, this.token, this.page_url.clone(), this.icon_url.clone(), png);
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn switchboard_content_on_favicon(handler: *mut cef_display_handler_t, browser: *mut cef_browser_t, urls: switchboard_cef_sys::raw::cef_string_list_t) {
+    if handler.is_null() || urls.is_null() { return; }
+    let this = &*(handler as *mut SwitchboardContentDisplayHandler);
+    if !remember_browser_for_tab(this.tab_id, this.generation, browser) { return; }
+    let Some(api) = FAVICON_CEF_API.get() else { return; };
+    let mut icon_url = None;
+    for index in 0..(api.cef_string_list_size)(urls).min(8) {
+        let mut value = cef_string_t { str_: std::ptr::null_mut(), length: 0, dtor: None };
+        if (api.cef_string_list_value)(urls, index, &mut value) != 0 && value.length <= 4096 {
+            let url = cef_string_to_owned(&value);
+            if url.starts_with("https://") || url.starts_with("http://") { icon_url = Some(url); }
+        }
+        (api.cef_string_utf16_clear)(&mut value);
+        if icon_url.is_some() { break; }
+    }
+    let Some(icon_url) = icon_url else { return; };
+    let (page_url, token) = {
+        let mut requests = favicon_requests().lock().unwrap_or_else(|error| error.into_inner());
+        let Some(state) = requests.get_mut(&(this.tab_id, this.generation)) else { return; };
+        if state.page_url.is_empty() || state.page_url.len() > 8192 || state.icon_url == icon_url { return; }
+        state.icon_url = icon_url.clone();
+        state.token = FAVICON_TOKEN.fetch_add(1, Ordering::Relaxed);
+        (state.page_url.clone(), state.token)
+    };
+    let cached = favicon_assets().lock().unwrap_or_else(|error| error.into_inner()).values().find(|icon| icon.profile_id == this.profile_id && icon.page_url == switchboard_core::favicon::page_key(&page_url) && icon.icon_url == icon_url).map(|icon| icon.png.clone());
+    if let Some(png) = cached {
+        defer_favicon(this.tab_id, this.generation, token, page_url, icon_url, png.to_vec()); return;
+    }
+    let Some(get_host) = (*browser).get_host else { return; };
+    let host = get_host(browser);
+    if host.is_null() { return; }
+    let Some(download) = (*host).download_image else {
+        if let Some(release) = (*host).base.release { release(&mut (*host).base); } return;
+    };
+    if FAVICON_DOWNLOAD_COUNT.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < 10).then_some(n + 1)).is_err() {
+        if let Some(release) = (*host).base.release { release(&mut (*host).base); } return;
+    }
+    let callback = Box::into_raw(Box::new(FaviconDownload {
+        callback: switchboard_cef_sys::favicon::cef_download_image_callback_t {
+            base: cef_base_ref_counted_t { size: size_of::<switchboard_cef_sys::favicon::cef_download_image_callback_t>(), add_ref: Some(favicon_add_ref), release: Some(favicon_release), has_one_ref: Some(favicon_one_ref), has_at_least_one_ref: Some(favicon_any_ref) },
+            on_download_image_finished: Some(favicon_download_finished),
+        },
+        references: AtomicUsize::new(1), completed: AtomicBool::new(false), tab_id: this.tab_id, generation: this.generation, token, page_url, icon_url: icon_url.clone(),
+    }));
+    // CToCpp::Wrap consumes a transfer reference in addition to our caller reference.
+    favicon_add_ref(&mut (*callback).callback.base);
+    with_stack_cef_string(&icon_url, |url| download(host, url, 1, 32, 0, &mut (*callback).callback));
+    favicon_release(&mut (*callback).callback.base);
+    if let Some(release) = (*host).base.release { release(&mut (*host).base); }
 }
 
 #[cfg(target_os = "macos")]
@@ -1690,6 +1895,7 @@ struct SwitchboardContentDisplayHandler {
     handler: cef_display_handler_t,
     tab_id: TabId,
     generation: u64,
+    profile_id: ProfileId,
 }
 
 #[cfg(target_os = "macos")]
@@ -2555,6 +2761,7 @@ unsafe extern "C" fn switchboard_browser_after_created(
     (*handler).before_close_seen.store(false, Ordering::Release);
     CEF_OPEN_BROWSER_COUNT.fetch_add(1, Ordering::AcqRel);
     if let Some(tab_id) = (*handler).tab_id {
+        favicon_requests().lock().unwrap_or_else(|error| error.into_inner()).remove(&(tab_id, (*handler).generation));
         remember_browser_for_tab(tab_id, (*handler).generation, browser);
     } else {
         remember_ui_shell_browser(browser);
@@ -2720,13 +2927,16 @@ unsafe extern "C" fn switchboard_resource_handler_process_request(
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" fn switchboard_resource_handler_get_response_headers(
-    _self_: *mut cef_resource_handler_t,
+    self_: *mut cef_resource_handler_t,
     response: *mut cef_response_t,
     response_length: *mut i64,
     _redirect_url: *mut cef_string_t,
 ) {
+    if self_.is_null() { return; }
+    let this = &*(self_ as *mut SwitchboardUiResourceHandler);
+    let image = this.image.is_some();
     if !response_length.is_null() {
-        *response_length = ui_shell_body().len() as i64;
+        *response_length = this.image.as_deref().unwrap_or_else(|| ui_shell_body()).len() as i64;
     }
     if response.is_null() {
         return;
@@ -2740,7 +2950,7 @@ unsafe extern "C" fn switchboard_resource_handler_get_response_headers(
         });
     }
     if let Some(set_mime_type) = (*response).set_mime_type {
-        with_stack_cef_string("text/html", |value| unsafe {
+        with_stack_cef_string(if image { "image/png" } else { "text/html" }, |value| unsafe {
             set_mime_type(response, value);
         });
     }
@@ -2770,7 +2980,7 @@ unsafe extern "C" fn switchboard_resource_handler_get_response_headers(
         });
         with_stack_cef_string("Content-Security-Policy", |name| {
             with_stack_cef_string(
-                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'",
+                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'",
                 |value| unsafe {
                     set_header_by_name(response, name, value, 1);
                 },
@@ -2801,7 +3011,7 @@ unsafe extern "C" fn switchboard_resource_handler_skip(
         }
         return 1;
     }
-    let total = ui_shell_body().len();
+    let total = (*this).image.as_deref().unwrap_or_else(|| ui_shell_body()).len();
     let remaining = total.saturating_sub((*this).offset);
     let to_skip = (bytes_to_skip as usize).min(remaining);
     (*this).offset += to_skip;
@@ -2826,7 +3036,7 @@ unsafe extern "C" fn switchboard_resource_handler_read(
         return 0;
     }
     let this = self_ as *mut SwitchboardUiResourceHandler;
-    let body = ui_shell_body();
+    let body = (*this).image.as_deref().unwrap_or_else(|| ui_shell_body());
     let remaining = body.len().saturating_sub((*this).offset);
     if remaining == 0 {
         if !bytes_read.is_null() {
@@ -2872,16 +3082,28 @@ unsafe extern "C" fn switchboard_resource_handler_cancel(_self_: *mut cef_resour
 unsafe extern "C" fn switchboard_scheme_factory_create(
     _self_: *mut cef_scheme_handler_factory_t,
     browser: *mut cef_browser_t,
-    _frame: *mut cef_frame_t,
+    frame: *mut cef_frame_t,
     _scheme_name: *const cef_string_t,
-    _request: *mut cef_request_t,
+    request: *mut cef_request_t,
 ) -> *mut cef_resource_handler_t {
     if browser.is_null() {
         return std::ptr::null_mut();
     }
+    let Some(url) = request_string(request, false) else { return std::ptr::null_mut(); };
+    if request_string(request, true).as_deref() != Some("GET") { return std::ptr::null_mut(); }
+    let image = if let Some((profile_id, id)) = favicon_asset_id(&url) {
+        if !ui_shell_browser_matches(browser) || !cef_frame_is_main(frame) { return std::ptr::null_mut(); }
+        let assets = favicon_assets().lock().unwrap_or_else(|error| error.into_inner());
+        let Some(icon) = assets.get(&id).filter(|icon| icon.profile_id == profile_id) else { return std::ptr::null_mut(); };
+        Some(icon.png.clone())
+    } else {
+        let document_url = url.split(['?', '#']).next().unwrap_or("");
+        if document_url != "app://ui" && document_url != "app://ui/" { return std::ptr::null_mut(); }
+        None
+    };
     let handler = Box::new(SwitchboardUiResourceHandler {
         handler: cef_resource_handler_t {
-            base: ref_counted_base::<cef_resource_handler_t>(),
+            base: cef_base_ref_counted_t { size: size_of::<cef_resource_handler_t>(), add_ref: Some(resource_add_ref), release: Some(resource_release), has_one_ref: Some(resource_one_ref), has_at_least_one_ref: Some(resource_any_ref) },
             open: Some(switchboard_resource_handler_open),
             process_request: Some(switchboard_resource_handler_process_request),
             get_response_headers: Some(switchboard_resource_handler_get_response_headers),
@@ -2891,6 +3113,8 @@ unsafe extern "C" fn switchboard_scheme_factory_create(
             cancel: Some(switchboard_resource_handler_cancel),
         },
         offset: 0,
+        image,
+        references: AtomicUsize::new(1),
     });
     let ptr = Box::into_raw(handler);
     &mut (*ptr).handler as *mut cef_resource_handler_t
@@ -2934,6 +3158,7 @@ unsafe extern "C" fn switchboard_content_on_address_change(
     if !remember_browser_for_tab(tab_id, generation, browser) {
         return;
     }
+    invalidate_favicon_request(tab_id, generation, Some(next.clone()));
     emit_content_event(ContentEvent::UrlChanged {
         tab_id,
         generation,
@@ -3020,6 +3245,7 @@ unsafe extern "C" fn switchboard_content_on_load_start(
         return;
     }
     (*handler).main_frame_failed.store(false, Ordering::Release);
+    invalidate_favicon_request((*handler).tab_id, (*handler).generation, None);
 }
 
 #[cfg(target_os = "macos")]
@@ -3195,13 +3421,13 @@ unsafe extern "C" fn switchboard_content_client_get_load_handler(
 }
 
 #[cfg(target_os = "macos")]
-fn allocate_content_display_handler(tab_id: TabId, generation: u64) -> *mut cef_display_handler_t {
+fn allocate_content_display_handler(profile_id: ProfileId, tab_id: TabId, generation: u64) -> *mut cef_display_handler_t {
     let handler = Box::new(SwitchboardContentDisplayHandler {
         handler: cef_display_handler_t {
             base: ref_counted_base::<cef_display_handler_t>(),
             on_address_change: Some(switchboard_content_on_address_change),
             on_title_change: Some(switchboard_content_on_title_change),
-            on_favicon_urlchange: None,
+            on_favicon_urlchange: Some(switchboard_content_on_favicon),
             on_fullscreen_mode_change: None,
             on_tooltip: None,
             on_status_message: None,
@@ -3215,6 +3441,7 @@ fn allocate_content_display_handler(tab_id: TabId, generation: u64) -> *mut cef_
         },
         tab_id,
         generation,
+        profile_id,
     });
     let ptr = Box::into_raw(handler);
     unsafe { &mut (*ptr).handler as *mut cef_display_handler_t }
@@ -3265,7 +3492,7 @@ fn allocate_content_cef_client(
     tab_id: TabId,
     generation: u64,
 ) -> *mut cef_client_t {
-    let display_handler = allocate_content_display_handler(tab_id, generation);
+    let display_handler = allocate_content_display_handler(profile_id, tab_id, generation);
     let keyboard_handler = allocate_content_keyboard_handler(tab_id, generation);
     let load_handler = allocate_content_load_handler(tab_id, generation);
     let life_span_handler = allocate_life_span_handler(Some(tab_id), generation);
@@ -3450,6 +3677,7 @@ impl CefRuntime {
                 ))
             })?;
             install_cef_quit_message_loop_hook(library.api.cef_quit_message_loop);
+            let _ = FAVICON_CEF_API.set(library.api);
             let app = allocate_cef_app();
             let requested_api_version =
                 env_i32(ENV_CEF_API_VERSION).unwrap_or(DEFAULT_CEF_API_VERSION);
@@ -4120,6 +4348,23 @@ impl NativeMacHost {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn navigation_tokens_invalidate_same_generation_favicon_callbacks() {
+        let tab = switchboard_core::TabId(u64::MAX);
+        super::invalidate_favicon_request(tab, 9, Some("https://one.example".into()));
+        let token = super::favicon_requests().lock().unwrap().get(&(tab, 9)).unwrap().token;
+        assert!(super::favicon_request_current(tab, 9, token));
+        super::invalidate_favicon_request(tab, 9, None);
+        assert!(!super::favicon_request_current(tab, 9, token));
+        assert!(!super::favicon_request_current(tab, 8, token));
+        super::favicon_requests().lock().unwrap().remove(&(tab, 9));
+    }
+    #[test]
+    fn favicon_route_accepts_only_exact_numeric_asset_paths() {
+        assert_eq!(super::favicon_asset_id("app://ui/favicon/1/9.png"), Some((switchboard_core::ProfileId(1), 9)));
+        for url in ["https://ui/favicon/1/9.png", "app://ui.evil/favicon/1/9.png", "app://ui/favicon/1/9.png?x=1", "app://ui/favicon/0/9.png", "app://ui/favicon/1/../9.png", "app://ui/favicon/1/%39.png"] { assert_eq!(super::favicon_asset_id(url), None); }
+    }
     use super::is_exact_ui_url;
     #[cfg(target_os = "macos")]
     use super::{
@@ -4256,6 +4501,10 @@ mod tests {
 impl CefHost for NativeMacHost {
     type Error = HostError;
 
+    fn publish_favicons(&mut self, icons: &std::collections::BTreeMap<u64, switchboard_core::Favicon>) {
+        *favicon_assets().lock().unwrap_or_else(|error| error.into_inner()) = icons.clone();
+    }
+
     fn create_window(&mut self, title: &str, size: WindowSize) -> Result<WindowId, Self::Error> {
         unsafe {
             let style = STYLE_TITLED
@@ -4383,6 +4632,7 @@ impl CefHost for NativeMacHost {
             msg_send_void_bool(root_view, selector("setAutoresizesSubviews:")?, YES);
             let frame = content_container_frame(root_view)?;
             let content_view = create_content_container(frame)?;
+            apply_content_keybindings_border(content_view, false)?;
             msg_send_void_u64(
                 content_view,
                 selector("setAutoresizingMask:")?,
@@ -4550,9 +4800,11 @@ impl CefHost for NativeMacHost {
             } else {
                 content_container_frame(root)?
             };
+            apply_content_keybindings_border(primary_container, WEBSITE_KEYBINDINGS_ACTIVE.with(Cell::get))?;
+            let split_gap = if self.focus_mode { 0.0 } else { CONTENT_GAP };
             if split_enabled {
                 let clamped = ratio.clamp(0.25, 0.75);
-                let primary_width = (full.size.width * clamped).max(1.0);
+                let primary_width = ((full.size.width - split_gap) * clamped).max(1.0);
                 msg_send_void_rect(
                     primary_container,
                     selector("setFrame:")?,
@@ -4576,14 +4828,15 @@ impl CefHost for NativeMacHost {
                 let secondary_container = match secondary_backend {
                     ContentBackend::WebKit(view) | ContentBackend::Cef(view) => view,
                 };
-                let primary_width = (full.size.width * ratio.clamp(0.25, 0.75)).max(1.0);
-                let secondary_width = (full.size.width - primary_width).max(1.0);
+                apply_content_keybindings_border(secondary_container, false)?;
+                let primary_width = ((full.size.width - split_gap) * ratio.clamp(0.25, 0.75)).max(1.0);
+                let secondary_width = (full.size.width - primary_width - split_gap).max(1.0);
                 msg_send_void_rect(
                     secondary_container,
                     selector("setFrame:")?,
                     NSRect {
                         origin: NSPoint {
-                            x: full.origin.x + primary_width,
+                            x: full.origin.x + primary_width + split_gap,
                             y: full.origin.y,
                         },
                         size: NSSize {
@@ -4601,6 +4854,7 @@ impl CefHost for NativeMacHost {
 
     fn set_focus_mode(&mut self, active: bool) -> Result<(), Self::Error> {
         self.focus_mode = active;
+        NATIVE_FOCUS_MODE.with(|mode| mode.set(active));
         set_ui_overlay_visible(!active)
     }
 
@@ -4874,12 +5128,12 @@ unsafe fn nsstring(value: &str) -> Result<ObjcId, HostError> {
 #[cfg(target_os = "macos")]
 unsafe fn content_container_frame(root_view: ObjcId) -> Result<NSRect, HostError> {
     let bounds = msg_send_rect(root_view, selector("bounds")?);
-    let width = (bounds.size.width - UI_LEFT_WIDTH).max(1.0);
-    let height = (bounds.size.height - UI_TOP_HEIGHT).max(1.0);
+    let width = (bounds.size.width - UI_LEFT_WIDTH - CONTENT_GAP * 2.0).max(1.0);
+    let height = (bounds.size.height - UI_TOP_HEIGHT - CONTENT_GAP * 2.0).max(1.0);
     Ok(NSRect {
         origin: NSPoint {
-            x: UI_LEFT_WIDTH,
-            y: 0.0,
+            x: UI_LEFT_WIDTH + CONTENT_GAP,
+            y: CONTENT_GAP,
         },
         size: NSSize { width, height },
     })

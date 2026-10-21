@@ -61,6 +61,9 @@ pub struct CefApi {
     pub cef_request_context_create_context: cef_request_context_create_context_fn,
     pub cef_string_utf16_set: cef_string_utf16_set_fn,
     pub cef_string_utf16_clear: cef_string_utf16_clear_fn,
+    pub cef_string_list_size: unsafe extern "C" fn(crate::raw::cef_string_list_t) -> usize,
+    pub cef_string_list_value: unsafe extern "C" fn(crate::raw::cef_string_list_t, usize, *mut crate::raw::cef_string_t) -> i32,
+    pub cef_string_userfree_utf16_free: unsafe extern "C" fn(crate::raw::cef_string_userfree_t),
 }
 
 pub struct CefLibrary {
@@ -171,6 +174,9 @@ impl CefLibrary {
             };
 
             let api = CefApi {
+                cef_string_list_size: load_symbol(&load, "cef_string_list_size")?,
+                cef_string_list_value: load_symbol(&load, "cef_string_list_value")?,
+                cef_string_userfree_utf16_free: load_symbol(&load, "cef_string_userfree_utf16_free")?,
                 cef_api_hash: load_symbol::<cef_api_hash_fn>(&load, "cef_api_hash")?,
                 cef_api_version: load_symbol::<cef_api_version_fn>(&load, "cef_api_version")?,
                 cef_execute_process: load_symbol::<cef_execute_process_fn>(

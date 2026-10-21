@@ -115,6 +115,8 @@ pub struct Tab {
     pub pinned: bool,
     pub locked: bool,
     pub muted: bool,
+    #[serde(default)]
+    pub favicon_id: Option<u64>,
     pub status: TabStatus,
     #[serde(default)]
     pub loading: bool,
@@ -167,6 +169,10 @@ pub struct BrowserState {
     /// History is queried through Rust and intentionally omitted from UI snapshots.
     #[serde(default, skip_serializing)]
     pub history: BTreeMap<ProfileId, Vec<HistoryEntry>>,
+    #[serde(skip)]
+    pub favicons: BTreeMap<u64, crate::favicon::Favicon>,
+    #[serde(skip)]
+    next_favicon_id: u64,
     /// Runtime-only warm-pool LRU per profile (oldest -> newest).
     #[serde(default, skip_serializing)]
     pub warm_lru: BTreeMap<ProfileId, Vec<TabId>>,
@@ -184,6 +190,8 @@ impl Default for BrowserState {
             tabs: BTreeMap::new(),
             settings: BTreeMap::new(),
             history: BTreeMap::new(),
+            favicons: BTreeMap::new(),
+            next_favicon_id: 1,
             warm_lru: BTreeMap::new(),
             active_profile_id: None,
             next_profile_id: 1,
@@ -301,6 +309,7 @@ impl BrowserState {
     }
 
     pub fn recompute_next_ids(&mut self) {
+        self.next_favicon_id = self.favicons.keys().next_back().copied().unwrap_or(0).saturating_add(1);
         self.next_profile_id = self
             .profiles
             .keys()
@@ -329,5 +338,11 @@ impl BrowserState {
             tab.can_go_forward = false;
             tab.runtime_state = TabRuntimeState::Discarded;
         }
+    }
+
+    pub(crate) fn allocate_favicon_id(&mut self) -> u64 {
+        let id = self.next_favicon_id.max(1);
+        self.next_favicon_id = id.saturating_add(1);
+        id
     }
 }

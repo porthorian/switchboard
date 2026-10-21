@@ -142,4 +142,19 @@ mod tests {
         assert_eq!((patch.from_revision, patch.to_revision), (7, 8));
         assert_eq!(engine.revision(), 8);
     }
+
+    #[test]
+    fn failed_favicon_commit_keeps_cache_and_revision_unchanged() {
+        let (mut initial, workspace) = seeded(NoopPersistence);
+        initial.dispatch(Intent::NewTab { workspace_id: workspace, url: Some("https://example.com".into()), make_active: true }).unwrap();
+        let tab_id = *initial.state().tabs.keys().next().unwrap();
+        let mut engine = Engine::with_state(FailingPersistence, initial.state().clone(), initial.revision());
+        let before = engine.state().clone();
+        let revision = engine.revision();
+        let mut png = vec![0; 33];
+        png[..16].copy_from_slice(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"); png[19] = 16; png[23] = 16;
+        assert!(matches!(engine.dispatch(Intent::ObserveTabFavicon { tab_id, page_url: "https://example.com".into(), icon_url: "https://example.com/icon.png".into(), png }), Err(EngineError::Persist(Fail))));
+        assert_eq!(engine.state(), &before);
+        assert_eq!(engine.revision(), revision);
+    }
 }

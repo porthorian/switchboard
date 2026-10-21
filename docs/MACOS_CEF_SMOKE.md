@@ -47,6 +47,14 @@ python3 -m http.server 18765 --bind 127.0.0.1 --directory docs/smoke-fixture
 - No Chrome toolbar, telemetry, UI polling, or background UI network traffic appears.
 - The run creates no new macOS crash report, logs no profile-context creation failure, and leaves no helper process behind after shutdown.
 
+## UI refresh and favicon evidence
+
+- At 1280×840 and 640×480, verify native gutters/rounding, search/settings fit, keyboard focus, workspace menus, and the 34px virtual list with 200 tabs. Primary and secondary selection must remain distinct.
+- Title-first navigation reveals/selects the full URL on click or ⌘L. Loading/title patches preserve a draft; Enter navigates, Escape/blur cancels, and switching tabs cancels the previous draft.
+- The local fixture's purple favicon appears in the tab, address title, and search results. Restart the same isolated session and confirm discarded tabs retain cached icons without eagerly restoring their views.
+- Rapid navigation/reload and profile switches must reject stale icon callbacks. Missing icons retain fallbacks; content cannot load the local favicon route or invoke privileged APIs.
+- Compile `scripts/check_cef_favicon_abi.c` against the pinned SDK with `clang -std=c11 -fsyntax-only -DCEF_API_VERSION=14500 -Itarget/cef-sdk-145` and run the workspace suite.
+
 ## Status
 
 The repository contains deterministic reducer, persistence, bridge, ABI-layout, and mock-host coverage for these invariants. Native smoke execution is environment-dependent and must not be recorded as passing until the generated CEF bundle is run and the evidence above is captured. Stop the fixture server, verify port `18765` is released, and remove only the `SMOKE_ROOT` directory created for the run.

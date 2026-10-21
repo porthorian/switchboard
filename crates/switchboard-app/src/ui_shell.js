@@ -2,6 +2,15 @@ const key = "switchboard.active_uri";
 const BRIDGE_PROTOCOL_VERSION = 1;
 
 const input = document.getElementById("url");
+const addressTitle = document.getElementById("address-title");
+const addressLabel = document.getElementById("address-label");
+const addressIcon = document.getElementById("address-icon");
+let addressEditing = false;
+let addressEditingTabId = null;
+const shellMenus = [
+  [document.getElementById("toolbar-more"), document.getElementById("toolbar-menu")],
+  [document.getElementById("workspace-more"), document.getElementById("workspace-menu")],
+];
 const backButton = document.getElementById("nav-back");
 const forwardButton = document.getElementById("nav-forward");
 const reloadButton = document.getElementById("nav-reload");
@@ -50,9 +59,9 @@ const settingsKeybindingCommand = document.getElementById("settings-keybinding-c
 const settingsKeybindingFocusNav = document.getElementById("settings-keybinding-focus-nav");
 const settingsKeybindingDevTools = document.getElementById("settings-keybinding-devtools");
 
-const TAB_ROW_HEIGHT = 56;
+const TAB_ROW_HEIGHT = 34;
 const TAB_OVERSCAN = 6;
-const TAB_LIST_PADDING_Y = 8;
+const TAB_LIST_PADDING_Y = 4;
 const SEARCH_ENGINE_SETTING_KEY = "search_engine";
 const HOMEPAGE_SETTING_KEY = "homepage";
 const NEW_TAB_BEHAVIOR_SETTING_KEY = "new_tab_behavior";
@@ -115,6 +124,7 @@ let profileEditorTargetId = null;
 let settingsPanelOpen = false;
 let commandPanelOpen = false;
 let commandSearchResults = [];
+let commandReturnFocus = null;
 let commandSelectedIndex = 0;
 const collapsedTabIds = new Set();
 let lazySearchCreatesTab = false;
@@ -420,10 +430,67 @@ function syncHostKeybindings(
 }
 
 function renderUri() {
-  input.value = activeUri;
   const activeTab = shellState ? deriveActiveContext(shellState).activeTab : null;
+  if (addressEditing && String(addressEditingTabId) !== String(activeTab?.id ?? null)) {
+    cancelAddressEditing();
+  }
+  if (!addressEditing) input.value = activeTab?.url || "";
+  addressLabel.textContent = activeTab ? tabLabel(activeTab) : "New Page";
+  addressTitle.title = `${activeTab?.url || "Search or enter an address"} · Edit address (⌘L)`;
+  renderSiteIcon(addressIcon, activeTab, "i-page");
   backButton.disabled = !activeTab?.can_go_back;
   forwardButton.disabled = !activeTab?.can_go_forward;
+}
+
+function renderSiteIcon(container, source, fallback = "i-page") {
+  const identity = source?.favicon_id ? `${source.profile_id}/${source.favicon_id}` : `${fallback}:${source?.title || source?.url || ""}`;
+  if (container.dataset.identity === identity) return;
+  container.dataset.identity = identity;
+  container.replaceChildren();
+  if (source?.favicon_id && source.profile_id) {
+    const image = document.createElement("img");
+    image.alt = "";
+    image.src = `app://ui/favicon/${Number(source.profile_id)}/${Number(source.favicon_id)}.png`;
+    image.addEventListener("error", () => {
+      if (container.dataset.identity !== identity) return;
+      container.textContent = siteInitial(source);
+    }, { once: true });
+    container.appendChild(image);
+  } else if (source?.url) {
+    container.textContent = siteInitial(source);
+  } else {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.classList.add("icon");
+    svg.setAttribute("aria-hidden", "true");
+    const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+    use.setAttribute("href", `#${fallback}`);
+    svg.appendChild(use);
+    container.appendChild(svg);
+  }
+}
+
+function siteInitial(source) {
+  let label = source?.title || "";
+  if (!label) {
+    try { label = new URL(source?.url || "").hostname.replace(/^www\./, ""); } catch (_) { label = "?"; }
+  }
+  return Array.from(label)[0]?.toUpperCase() || "?";
+}
+
+function cancelAddressEditing() {
+  addressEditing = false;
+  addressEditingTabId = null;
+  input.hidden = true;
+  addressTitle.hidden = false;
+  if (document.activeElement === input) input.blur();
+}
+
+function closeShellMenus() {
+  shellMenus.forEach(([toggle, menu]) => {
+    menu.hidden = true;
+    toggle.setAttribute("aria-expanded", "false");
+  });
+  syncUiOverlayVisibility();
 }
 
 function setActiveUri(next, pushHistory) {
@@ -732,7 +799,7 @@ function commitKeybindingSetting(inputElement, settingKey, fallback) {
 }
 
 function syncUiOverlayVisibility() {
-  const nextVisible = settingsPanelOpen || commandPanelOpen;
+  const nextVisible = settingsPanelOpen || commandPanelOpen || profileMenuOpen || shellMenus.some(([, menu]) => !menu.hidden);
   if (nextVisible === uiOverlayVisible) return;
   uiOverlayVisible = nextVisible;
   send(nextVisible ? "ui_overlay on" : "ui_overlay off");
@@ -768,6 +835,8 @@ function syncWebsiteKeybindingsActive() {
 
 function openSettingsPanel() {
   if (settingsPanelOpen) return;
+  closeShellMenus();
+  closeProfileMenu();
   settingsPanelOpen = true;
   settingsBackdrop.hidden = false;
   settingsPanel.hidden = false;
@@ -806,6 +875,7 @@ function renderSearchResults(results) {
     button.type = "button";
     button.className = `command-result${index === commandSelectedIndex ? " selected" : ""}`;
     button.dataset.index = String(index);
+    button.tabIndex = -1;
     button.setAttribute("role", "option");
     button.setAttribute("aria-selected", index === commandSelectedIndex ? "true" : "false");
     const title = document.createElement("span");
@@ -813,11 +883,15 @@ function renderSearchResults(results) {
     title.textContent = result.title || result.url || "Untitled";
     const kind = document.createElement("span");
     kind.className = "command-result-kind";
-    kind.textContent = String(result.kind || "").replaceAll("_", " ");
+    kind.textContent = ({ open_tab: "Open tab", history: "History", archived_tab: "Restore", command: "Command", web: "Search web" })[result.kind] || "";
     const subtitle = document.createElement("span");
     subtitle.className = "command-result-subtitle";
     subtitle.textContent = result.subtitle || "";
-    button.append(title, kind, subtitle);
+    const icon = document.createElement("span");
+    icon.className = "command-result-icon site-icon";
+    renderSiteIcon(icon, result, result.kind === "history" ? "i-history" : result.kind === "command" ? "i-more" : "i-page");
+    button.id = `search-result-${index}`;
+    button.append(icon, title, kind, subtitle);
     button.addEventListener("click", () => executeSearchResult(result));
     if (result.kind === "archived_tab" && result.tab_id) {
       button.title = "Click to restore · Right-click to permanently delete";
@@ -832,6 +906,16 @@ function renderSearchResults(results) {
     fragment.appendChild(button);
   });
   commandResults.replaceChildren(fragment);
+  if (commandSearchResults.length) {
+    commandInput.setAttribute("aria-activedescendant", `search-result-${commandSelectedIndex}`);
+    commandResults.children[commandSelectedIndex]?.scrollIntoView({ block: "nearest" });
+  } else {
+    commandInput.removeAttribute("aria-activedescendant");
+    const empty = document.createElement("p");
+    empty.className = "tab-empty";
+    empty.textContent = "No matching results.";
+    commandResults.appendChild(empty);
+  }
 }
 
 function executeSearchCommand(command) {
@@ -898,8 +982,10 @@ function executeSearchResult(result) {
 
 function openCommandPanel(options = {}) {
   if (commandPanelOpen) return;
+  commandReturnFocus = document.activeElement;
   if (settingsPanelOpen) closeSettingsPanel();
   closeProfileMenu();
+  closeShellMenus();
   lazySearchCreatesTab = Boolean(options.createsTab);
   lazySearchParentTabId = options.parentTabId || null;
   commandPanelOpen = true;
@@ -922,6 +1008,8 @@ function closeCommandPanel() {
   commandBackdrop.hidden = true;
   commandPanel.hidden = true;
   syncUiOverlayVisibility();
+  if (commandReturnFocus?.isConnected && commandReturnFocus !== document.body) commandReturnFocus.focus();
+  commandReturnFocus = null;
 }
 
 function navigateFromCommandPanel() {
@@ -951,6 +1039,13 @@ function navigateFromCommandPanel() {
 
 function focusTopNavigationInput() {
   closeCommandPanel();
+  closeShellMenus();
+  const activeTab = shellState ? deriveActiveContext(shellState).activeTab : null;
+  addressEditingTabId = activeTab?.id ?? null;
+  addressEditing = true;
+  input.value = activeTab?.url || "";
+  addressTitle.hidden = true;
+  input.hidden = false;
   input.focus();
   input.select();
   syncWebsiteKeybindingsActive();
@@ -1177,13 +1272,15 @@ function toggleTabCollapsed(tabId) {
 
 function createTabButton(tab, isActive) {
   const label = tabLabel(tab);
-  const button = document.createElement("button");
-  button.type = "button";
+  const button = document.createElement("div");
   button.className = "tab-item";
   button.dataset.tabId = String(tab.id);
   button.dataset.tabUrl = tab.url || "";
   button.draggable = true;
-  button.style.paddingLeft = `${8 + tabDepth(tab) * 16}px`;
+  button.style.paddingLeft = `${5 + Math.min(tabDepth(tab), 6) * 10}px`;
+  button.title = `${label}\n${tab.url || "about:blank"}`;
+  const { activeWorkspace } = deriveActiveContext(shellState || {});
+  button.classList.toggle("secondary", Boolean(activeWorkspace?.split_enabled && tab.id === activeWorkspace.secondary_tab_id));
   if (isActive) {
     button.classList.add("active");
   }
@@ -1195,7 +1292,11 @@ function createTabButton(tab, isActive) {
     (candidate) => String(candidate.parent_tab_id || "") === String(tab.id)
       && candidate.status?.kind === "open"
   );
-  const disclosure = document.createElement("span");
+  const disclosure = document.createElement("button");
+  disclosure.type = "button";
+  disclosure.setAttribute("aria-label", `Toggle children of ${label}`);
+  disclosure.setAttribute("aria-expanded", collapsedTabIds.has(String(tab.id)) ? "false" : "true");
+  disclosure.tabIndex = hasChildren ? 0 : -1;
   disclosure.className = `tab-disclosure${hasChildren ? "" : " empty"}`;
   disclosure.textContent = collapsedTabIds.has(String(tab.id)) ? "▸" : "▾";
   disclosure.addEventListener("click", (event) => {
@@ -1207,21 +1308,19 @@ function createTabButton(tab, isActive) {
 
   const icon = document.createElement("span");
   icon.className = "tab-icon";
-  icon.textContent = label.slice(0, 1).toUpperCase();
+  renderSiteIcon(icon, tab);
   button.appendChild(icon);
 
-  const content = document.createElement("span");
-  content.className = "tab-copy";
+  const content = document.createElement("button");
+  content.type = "button";
+  content.className = "tab-copy tab-select";
+  content.setAttribute("aria-label", `${label}${tab.pinned ? ", pinned" : ""}${tab.locked ? ", locked" : ""}`);
+  if (isActive) content.setAttribute("aria-current", "page");
 
   const title = document.createElement("span");
   title.className = "tab-title";
   title.textContent = `${tab.pinned ? "● " : ""}${tab.locked ? "🔒 " : ""}${label}`;
   content.appendChild(title);
-
-  const url = document.createElement("span");
-  url.className = "tab-url";
-  url.textContent = tab.url || "about:blank";
-  content.appendChild(url);
 
   button.appendChild(content);
 
@@ -1251,11 +1350,7 @@ function computeTabListHeight(totalRows) {
   if (!pane || !header) {
     return Math.min(totalRows * TAB_ROW_HEIGHT + TAB_LIST_PADDING_Y * 2, 320);
   }
-  const footerStyle = getComputedStyle(tabNew);
-  const footerMargins =
-    (Number.parseFloat(footerStyle.marginTop) || 0) +
-    (Number.parseFloat(footerStyle.marginBottom) || 0);
-  const footerHeight = tabNew.offsetHeight + footerMargins;
+  const footerHeight = pane.querySelector(".tab-footer-actions")?.offsetHeight || 0;
   const available = pane.clientHeight - header.offsetHeight - footerHeight;
   const minHeight = TAB_ROW_HEIGHT + TAB_LIST_PADDING_Y * 2;
   const maxHeight = Math.max(minHeight, available);
@@ -1370,6 +1465,7 @@ function renderShellState(state) {
   }
 
   renderProfileControls(orderedProfiles, activeProfile);
+  renderUri();
   renderWorkspaceRail(orderedWorkspaces, activeWorkspaceId);
   if (
     lastRenderedProfileId !== activeProfileId ||
@@ -1542,6 +1638,7 @@ function openProfileMenu() {
   profileMenuOpen = true;
   profileMenuPopover.hidden = false;
   profileMenuButton.setAttribute("aria-expanded", "true");
+  syncUiOverlayVisibility();
 }
 
 function openProfileMenuAndFocus(first) {
@@ -1563,6 +1660,7 @@ function closeProfileMenu() {
   profileMenuPopover.hidden = true;
   profileMenuButton.setAttribute("aria-expanded", "false");
   closeProfileEditor();
+  syncUiOverlayVisibility();
 }
 
 function toggleProfileMenu() {
@@ -1885,7 +1983,37 @@ input.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
     navigateFromInput();
+    cancelAddressEditing();
+    renderUri();
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    cancelAddressEditing();
+    renderUri();
+    addressTitle.focus();
   }
+});
+input.addEventListener("blur", () => { cancelAddressEditing(); renderUri(); });
+addressTitle.addEventListener("click", focusTopNavigationInput);
+shellMenus.forEach(([toggle, menu]) => {
+  toggle.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const opening = menu.hidden;
+    closeShellMenus();
+    closeProfileMenu();
+    menu.hidden = !opening;
+    toggle.setAttribute("aria-expanded", String(opening));
+    syncUiOverlayVisibility();
+    if (opening) menu.querySelector("button:not(:disabled)")?.focus();
+  });
+  menu.addEventListener("click", () => closeShellMenus());
+  menu.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") { closeShellMenus(); toggle.focus(); event.stopPropagation(); }
+    if (event.key === "Tab") { closeShellMenus(); toggle.focus(); }
+  });
+});
+document.addEventListener("pointerdown", (event) => {
+  if (!event.target.closest(".shell-menu")) closeShellMenus();
 });
 backButton.addEventListener("click", goBack);
 forwardButton.addEventListener("click", goForward);
@@ -1997,6 +2125,7 @@ commandInput.addEventListener("input", () => {
 });
 commandPanel.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
+    closeShellMenus();
     event.preventDefault();
     closeCommandPanel();
     return;
@@ -2191,7 +2320,18 @@ document.addEventListener("keydown", (event) => {
     return;
   }
 
-  if (commandPanelOpen || settingsPanelOpen) return;
+  if (commandPanelOpen || settingsPanelOpen) {
+    if (event.key === "Tab") {
+      const panel = commandPanelOpen ? commandPanel : settingsPanel;
+      const controls = Array.from(panel.querySelectorAll("button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex='0']")).filter((element) => element.tabIndex >= 0 && element.getClientRects().length > 0);
+      const index = controls.indexOf(document.activeElement);
+      if (controls.length) {
+        event.preventDefault();
+        controls[(index + (event.shiftKey ? -1 : 1) + controls.length) % controls.length].focus();
+      }
+    }
+    return;
+  }
   if (handleShortcutCommandPalette(event)) return;
   if (handleShortcutFocusNavigation(event)) return;
   if (handleShortcutCloseTab(event)) return;

@@ -375,10 +375,7 @@ pub struct cef_run_file_dialog_callback_t {
     pub _private: [u8; 0],
 }
 
-#[repr(C)]
-pub struct cef_download_image_callback_t {
-    pub _private: [u8; 0],
-}
+pub use crate::favicon::cef_download_image_callback_t;
 
 #[repr(C)]
 pub struct cef_pdf_print_settings_t {

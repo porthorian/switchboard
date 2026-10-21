@@ -75,6 +75,8 @@ pub enum SearchResultKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchResult {
+    #[serde(default)]
+    pub favicon_id: Option<u64>,
     pub id: String,
     pub kind: SearchResultKind,
     pub title: String,

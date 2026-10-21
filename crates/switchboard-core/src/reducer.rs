@@ -60,6 +60,9 @@ pub fn apply_intent(state: &mut BrowserState, intent: Intent) -> Result<Vec<Patc
     let mut enforce = false;
 
     match intent {
+        Intent::ObserveTabFavicon { tab_id, page_url, icon_url, png } => {
+            state.observe_favicon(tab_id, page_url, icon_url, png, &mut ops);
+        }
         Intent::UiReady { .. } => enforce = true,
         Intent::FrameCommitted { .. } => {}
         Intent::TabFrameCommitted { tab_id, .. } => {
@@ -136,6 +139,7 @@ pub fn apply_intent(state: &mut BrowserState, intent: Intent) -> Result<Vec<Patc
             }
             state.profiles.remove(&profile_id);
             state.history.remove(&profile_id);
+            state.favicons.retain(|_, icon| icon.profile_id != profile_id);
             state.warm_lru.remove(&profile_id);
             ops.push(PatchOp::RemoveProfile { profile_id });
             if state.active_profile_id == Some(profile_id) {
@@ -301,9 +305,12 @@ pub fn apply_intent(state: &mut BrowserState, intent: Intent) -> Result<Vec<Patc
             enforce = true;
         }
         Intent::Navigate { tab_id, url } | Intent::ObserveTabUrl { tab_id, url } => {
+            let profile = state.tabs.get(&tab_id).ok_or(ReduceError::TabNotFound(tab_id))?.profile_id;
+            let favicon_id = state.favicon_for_page(profile, &url);
             let tab = open_tab_mut(state, tab_id)?;
             if tab.url != url {
                 tab.url = url;
+                tab.favicon_id = favicon_id;
                 ops.push(PatchOp::UpsertTab(tab.clone()));
             }
         }
@@ -616,6 +623,7 @@ pub fn apply_intent(state: &mut BrowserState, intent: Intent) -> Result<Vec<Patc
                 }
             };
             ops.push(PatchOp::HistoryChanged { profile_id });
+            state.clear_unused_favicons(profile_id);
         }
         Intent::SettingSet { key, value } => {
             if key.starts_with("keybinding_") {
@@ -661,6 +669,7 @@ fn create_tab(
         validate_parent(state, workspace_id, parent_id, None)?;
     }
     let tab_id = state.allocate_tab_id();
+    let favicon_id = state.favicon_for_page(profile_id, &url);
     state.tabs.insert(
         tab_id,
         Tab {
@@ -675,6 +684,7 @@ fn create_tab(
             pinned: false,
             locked: false,
             muted: false,
+            favicon_id,
             status: TabStatus::Open,
             loading: false,
             can_go_back: false,

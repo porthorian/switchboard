@@ -108,11 +108,11 @@ Every UI and content client installs a life-span handler. Window close requests 
 
 Content loading state and Chromium back/forward capability come only from `CefLoadHandler::OnLoadingStateChange`; display progress callbacks never query browser lifecycle methods. Main-frame `OnLoadEnd` emits the successful-load signal used for history, while `OnLoadError` emits bounded diagnostics and suppresses history. Retained browser wrappers are attributed to `(tab_id, browser_generation)` and may be refreshed only when CEF confirms they represent the same underlying browser.
 
-## Persistence schema v2
+## Persistence schema v3
 
-`rusqlite` uses the system SQLite library. Schema v2 contains normalized `meta`, `profiles`, `workspaces`, `tabs`, `settings`, and `history` tables with foreign keys and transactional replacement.
+`rusqlite` uses the system SQLite library. Schema v3 contains normalized `meta`, `profiles`, `workspaces`, `tabs`, `settings`, `history`, and `favicons` tables. Tabs retain an optional favicon ID. The v2-to-v3 migration adds the image cache and reference column in one transaction, preserving all existing domain data and its revision. A migration error rolls back and prevents startup. A database from a newer version is rejected without modification.
 
-Persisted fields are domain state and the committed revision. Loading flags, native handles, generations, warm order, and runtime residency are reconstructed. If a database is not schema v2, it and any WAL/SHM companions are renamed to a timestamped versioned backup before an empty v2 database is created. Nothing is silently deleted.
+Persisted fields are domain state and the committed revision. Loading flags, native handles, generations, warm order, and runtime residency are reconstructed. Unsupported pre-v2 databases retain the existing timestamped backup/reset path, including WAL/SHM companions. A supported v2 database always takes the preserving migration path.
 
 History is per profile. A successful HTTP(S) main-frame completion records a visit. Consecutive normalized URLs coalesce while increasing visit count and updating last-visit time. History has no automatic retention and is removed only by clear-current-profile or clear-all.
 
@@ -135,6 +135,16 @@ Browser and Insert are explicit modes with a persistent UI indicator. Switching 
 ## UI performance
 
 The UI flattens only expanded tree nodes and virtualizes that visible list. Expansion, hover, scroll, drag affordances, panels, and presentation layout stay local. A drop produces one authoritative move intent. Rust does not stream layout micro-events or expose the complete history database.
+
+### Warm-dark shell and favicons
+
+The shell uses a 44px toolbar, a 240px sidebar (48px workspace rail), and 34px virtualized tab rows. Native content has 8px gutters and a split gap, with 10px corner clipping; focus mode removes gutters and rounding. CSS and native geometry must change together. The address title derives from Rust tab state; focusing the field reveals the URL, with an editing draft kept local until a navigation intent is submitted.
+
+Favicon discovery originates only from the already-live content browser's CEF display callback. Native downloads use `is_favicon=true`, Chromium's cache, and a 32-DIP maximum; favicon requests do not send or accept cookies. Only announced HTTP(S) icon URLs are accepted, with at most ten concurrent native downloads. Browser generation and a navigation/request token reject obsolete callbacks, including same-browser reloads. Completion is deferred to a main-queue turn before entering the reducer.
+
+CEF decodes images and exports PNGs with a 64px physical-size and 32KiB encoded-size limit. The Rust cache is scoped by profile and visited page (excluding fragments), capped at 8MiB per profile and 32MiB globally. Old unreferenced entries are evicted first; capacity exhaustion keeps fallbacks without evicting referenced icons. Immutable image buffers are shared when candidate state is cloned and are excluded from all serialized UI state. SQLite stores new image IDs and tab references atomically; ordinary domain replacement does not rewrite cached PNGs. Profile deletion removes its cache; history clearing removes unreferenced icons in the affected profiles.
+
+Snapshots, tab patches, and search results carry only optional favicon IDs. A derived native asset registry serves immutable PNG buffers at `app://ui/favicon/<profile>/<id>.png` exclusively to the privileged UI browser's main frame. It never fetches remote assets. The UI CSP allows same-origin images while keeping `connect-src 'none'`; unknown resource paths, wrong profiles, and content-browser requests are rejected. Resource handlers and download callbacks own explicit reference counts and release their image buffers on destruction. Missing, rejected, or unavailable icons fall back to initials.
 
 ## Security and release gates
 

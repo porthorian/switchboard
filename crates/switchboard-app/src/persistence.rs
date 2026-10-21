@@ -10,7 +10,7 @@ use switchboard_core::{
     Tab, TabId, TabRuntimeState, TabStatus, Workspace, WorkspaceId,
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const META_SCHEMA_VERSION: &str = "schema_version";
 const META_REVISION: &str = "revision";
 const META_ACTIVE_PROFILE_ID: &str = "active_profile_id";
@@ -64,7 +64,7 @@ impl AppPersistence {
         backup_incompatible_database(path)?;
         let connection = Connection::open(path)?;
         configure_connection(&connection, true)?;
-        migrate_v2(&connection)?;
+        migrate(&connection)?;
         Ok(Self { connection })
     }
 
@@ -72,7 +72,7 @@ impl AppPersistence {
     pub fn open_in_memory() -> Result<Self, AppPersistenceError> {
         let connection = Connection::open_in_memory()?;
         configure_connection(&connection, false)?;
-        migrate_v2(&connection)?;
+        migrate(&connection)?;
         Ok(Self { connection })
     }
 
@@ -156,7 +156,7 @@ impl AppPersistence {
             let mut statement = self.connection.prepare(
                 "SELECT id, profile_id, workspace_id, parent_tab_id, url, observed_title,
                         custom_title, pinned, locked, muted, status, status_time_ms,
-                        restore_parent_tab_id, restore_sibling_index, position
+                        restore_parent_tab_id, restore_sibling_index, position, favicon_id
                  FROM tabs ORDER BY workspace_id, CASE WHEN position IS NULL THEN 1 ELSE 0 END, position, id",
             )?;
             let rows = statement.query_map([], load_tab)?;
@@ -245,6 +245,28 @@ impl AppPersistence {
             .is_some_and(|id| !state.profiles.contains_key(&id))
         {
             state.active_profile_id = state.profiles.keys().next().copied();
+        }
+        {
+            let mut statement = self.connection.prepare("SELECT id, profile_id, page_url, icon_url, png FROM favicons WHERE length(png) <= 32768 ORDER BY id DESC")?;
+            let rows = statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Vec<u8>>(4)?)))?;
+            let mut total = 0usize;
+            let mut profile_sizes = std::collections::BTreeMap::<ProfileId, usize>::new();
+            for row in rows {
+                let (id, profile, page_url, icon_url, png) = row?;
+                let profile_id = ProfileId(as_u64(profile, "favicons.profile_id")?);
+                let bytes = profile_sizes.entry(profile_id).or_default();
+                if !state.profiles.contains_key(&profile_id) || !switchboard_core::favicon::valid_favicon_png(&png)
+                    || total + png.len() > switchboard_core::favicon::GLOBAL_FAVICON_BUDGET
+                    || *bytes + png.len() > switchboard_core::favicon::PROFILE_FAVICON_BUDGET { continue; }
+                *bytes += png.len(); total += png.len();
+                let id = as_u64(id, "favicons.id")?;
+                state.favicons.insert(id, switchboard_core::Favicon { id, profile_id, page_url, icon_url, png: png.into() });
+            }
+            for tab in state.tabs.values_mut() {
+                if !tab.favicon_id.is_some_and(|id| state.favicons.get(&id).is_some_and(|icon| icon.profile_id == tab.profile_id && icon.page_url == switchboard_core::favicon::page_key(&tab.url))) {
+                    tab.favicon_id = None;
+                }
+            }
         }
         state.recompute_next_ids();
         state.reset_runtime_state();
@@ -345,6 +367,26 @@ fn migrate_v2(connection: &Connection) -> Result<(), AppPersistenceError> {
     Ok(())
 }
 
+fn migrate(connection: &Connection) -> Result<(), AppPersistenceError> {
+    let has_meta: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta')", [], |row| row.get(0))?;
+    if !has_meta { migrate_v2(connection)?; }
+    let version = meta_value(connection, META_SCHEMA_VERSION)?.unwrap_or_default();
+    if version == "3" { return Ok(()); }
+    if version != "2" { return Err(AppPersistenceError::InvalidData(format!("unsupported schema {version}"))); }
+    let result = connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE tabs ADD COLUMN favicon_id INTEGER;
+         CREATE TABLE favicons (id INTEGER PRIMARY KEY, profile_id INTEGER NOT NULL,
+             page_url TEXT NOT NULL, icon_url TEXT NOT NULL, png BLOB NOT NULL CHECK(length(png) <= 32768));
+         CREATE INDEX favicons_profile_page ON favicons(profile_id, page_url);
+         UPDATE meta SET value='3' WHERE key='schema_version';
+         COMMIT;"
+    );
+    if result.is_err() { let _ = connection.execute_batch("ROLLBACK;"); }
+    result?;
+    Ok(())
+}
+
 fn save_state(
     transaction: &Transaction<'_>,
     state: &BrowserState,
@@ -430,8 +472,8 @@ fn save_state(
         transaction.execute(
             "INSERT INTO tabs(id, profile_id, workspace_id, parent_tab_id, url, observed_title,
                               custom_title, pinned, locked, muted, status, status_time_ms,
-                              restore_parent_tab_id, restore_sibling_index, position)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                              restore_parent_tab_id, restore_sibling_index, position, favicon_id)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 to_i64(tab.id.0)?,
                 to_i64(tab.profile_id.0)?,
@@ -448,10 +490,24 @@ fn save_state(
                 restore_parent,
                 restore_index,
                 position,
+                tab.favicon_id.map(to_i64).transpose()?,
             ],
         )?;
     }
 
+    // Images have immutable IDs and are independent of the replacement of domain tables.
+    // Do not bind or rewrite every image on every navigation/loading-state commit.
+    let stored_ids: std::collections::BTreeSet<u64> = {
+        let mut statement = transaction.prepare("SELECT id FROM favicons")?;
+        let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+        rows.map(|row| row.and_then(|id| as_u64(id, "favicons.id"))).collect::<Result<_, _>>()?
+    };
+    for id in &stored_ids {
+        if !state.favicons.contains_key(id) { transaction.execute("DELETE FROM favicons WHERE id=?1", [to_i64(*id)?])?; }
+    }
+    for icon in state.favicons.values().filter(|icon| !stored_ids.contains(&icon.id)) {
+        transaction.execute("INSERT INTO favicons(id, profile_id, page_url, icon_url, png) VALUES(?1, ?2, ?3, ?4, ?5)", params![to_i64(icon.id)?, to_i64(icon.profile_id.0)?, icon.page_url, icon.icon_url, icon.png.as_ref()])?;
+    }
     for (key, value) in &state.settings {
         let (kind, bool_value, int_value, text_value): (
             &str,
@@ -558,6 +614,7 @@ fn load_tab(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Tab, Option<i64>)> {
             pinned: row.get::<_, i64>(7)? != 0,
             locked: row.get::<_, i64>(8)? != 0,
             muted: row.get::<_, i64>(9)? != 0,
+            favicon_id: row.get::<_, Option<i64>>(15)?.map(|id| as_u64(id, "tabs.favicon_id")).transpose()?,
             status,
             loading: false,
             can_go_back: false,
@@ -599,8 +656,11 @@ fn backup_incompatible_database(path: &Path) -> Result<Option<PathBuf>, AppPersi
         None
     };
     drop(connection);
-    if version == Some(SCHEMA_VERSION) {
+    if version == Some(SCHEMA_VERSION) || version == Some(2) {
         return Ok(None);
+    }
+    if version.is_some_and(|version| version > SCHEMA_VERSION) {
+        return Err(AppPersistenceError::InvalidData("database was created by a newer Switchboard version".into()));
     }
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -684,6 +744,60 @@ impl Error for InvalidValue {}
 mod tests {
     use super::*;
     use switchboard_core::{Intent, NoopPersistence};
+    #[test]
+    fn migration_preserves_v2_data_and_revision() {
+        let connection = Connection::open_in_memory().unwrap();
+        configure_connection(&connection, false).unwrap();
+        migrate_v2(&connection).unwrap();
+        connection.execute_batch("INSERT INTO profiles VALUES(1, 'Existing', 1, 0);
+            INSERT INTO workspaces VALUES(1, 1, 'Work', 1, NULL, 0, 0.5, 0);
+            INSERT INTO tabs VALUES(1, 1, 1, NULL, 'https://example.com', 'Observed', 'Custom', 1, 0, 0, 'open', NULL, NULL, NULL, 0);
+            INSERT INTO history(profile_id,url,title,visit_count,last_visit_ms) VALUES(1,'https://example.com','Example',7,123);
+            INSERT INTO settings VALUES('search_engine','text',NULL,NULL,'kagi');
+            INSERT OR REPLACE INTO meta VALUES('revision','42');
+            INSERT OR REPLACE INTO meta VALUES('active_profile_id','1');").unwrap();
+        migrate(&connection).unwrap();
+        migrate(&connection).unwrap();
+        let persistence = AppPersistence { connection };
+        let (state, revision) = persistence.load().unwrap().unwrap();
+        assert_eq!(revision, 42);
+        assert_eq!(state.profiles[&ProfileId(1)].name, "Existing");
+        assert_eq!(state.tabs[&TabId(1)].title, "Custom");
+        assert!(state.tabs[&TabId(1)].pinned);
+        assert_eq!(state.history[&ProfileId(1)][0].visit_count, 7);
+        assert_eq!(state.settings["search_engine"], SettingValue::Text("kagi".into()));
+        assert_eq!(meta_value(&persistence.connection, META_SCHEMA_VERSION).unwrap().as_deref(), Some("3"));
+    }
+    #[test]
+    fn failed_migration_rolls_back_added_column_and_version() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_v2(&connection).unwrap();
+        connection.execute("CREATE TABLE favicons (sentinel INTEGER)", []).unwrap();
+        assert!(migrate(&connection).is_err());
+        assert_eq!(meta_value(&connection, META_SCHEMA_VERSION).unwrap().as_deref(), Some("2"));
+        assert!(connection.prepare("SELECT favicon_id FROM tabs").is_err());
+    }
+    #[test]
+    fn favicon_survives_domain_replacement_and_restart_without_bridge_bytes() {
+        let mut state = seeded_state();
+        let tab_id = *state.tabs.keys().next().unwrap();
+        let mut png = vec![0; 33];
+        png[..16].copy_from_slice(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"); png[19] = 32; png[23] = 32;
+        switchboard_core::reducer::apply_intent(&mut state, Intent::ObserveTabFavicon { tab_id, page_url: "https://example.com".into(), icon_url: "https://example.com/icon.png".into(), png }).unwrap();
+        let id = state.tabs[&tab_id].favicon_id.unwrap();
+        let mut persistence = AppPersistence::open_in_memory().unwrap();
+        persistence.commit(&state, 8).unwrap();
+        persistence.connection.execute_batch("CREATE TRIGGER immutable_image BEFORE UPDATE ON favicons BEGIN SELECT RAISE(ABORT, 'image rewritten'); END;").unwrap();
+        persistence.commit(&state, 9).unwrap();
+        let (loaded, revision) = persistence.load().unwrap().unwrap();
+        assert_eq!(revision, 9);
+        assert_eq!(loaded.tabs[&tab_id].favicon_id, Some(id));
+        assert_eq!(loaded.favicons[&id], state.favicons[&id]);
+        assert_eq!(loaded.tabs[&tab_id].runtime_state, TabRuntimeState::Discarded);
+        let serialized = serde_json::to_string(&loaded).unwrap();
+        assert!(!serialized.contains("png"));
+        assert!(!serialized.contains("icon_url"));
+    }
 
     fn temporary_database_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

@@ -13,6 +13,8 @@ pub enum ClearHistoryScope {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Intent {
+    #[serde(skip)]
+    ObserveTabFavicon { tab_id: TabId, page_url: String, icon_url: String, png: Vec<u8> },
     UiReady {
         ui_version: String,
     },
